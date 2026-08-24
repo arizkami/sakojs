@@ -398,6 +398,34 @@ struct HttpConnection {
     close_after_write: bool,
 }
 
+/// Per-server work counters. Every field is a plain count kept on paths that
+/// already run per tick or per request, so reading them costs nothing and
+/// keeping them costs one increment. `sako --memory-stats` prints them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HttpServerCounters {
+    /// Calls into `tick_with_body`.
+    pub ticks: u64,
+    /// Ticks that dispatched no request at all.
+    pub idle_ticks: u64,
+    /// Requests handed to the handler.
+    pub requests: u64,
+    /// Connections examined across all ticks. Divided by `ticks` this is the
+    /// average per-tick walk, and divided by `requests` it is how many
+    /// connections were touched to deliver one request.
+    pub connection_visits: u64,
+    /// Connections that had buffered input or an unflushed response when
+    /// visited, so the visit did real work.
+    pub connection_visits_with_work: u64,
+    /// Overlapped receives handed to the kernel.
+    pub receives_submitted: u64,
+    /// Overlapped sends handed to the kernel.
+    pub sends_submitted: u64,
+    /// Completions dequeued from the port.
+    pub completions: u64,
+    /// GetQueuedCompletionStatusEx calls that returned at least one entry.
+    pub completion_dequeues: u64,
+}
+
 pub struct HttpServer {
     tcp: TcpAcceptor,
     connections: BTreeMap<ConnectionId, HttpConnection>,
@@ -410,6 +438,7 @@ pub struct HttpServer {
     closing: Vec<ConnectionId>,
     tls_scratch: Vec<u8>,
     header_scratch: Vec<HeaderRange>,
+    counters: HttpServerCounters,
 }
 
 /// Requests dispatched for one connection in a single tick before the server
@@ -438,6 +467,7 @@ impl HttpServer {
             closing: Vec::new(),
             tls_scratch: Vec::new(),
             header_scratch: Vec::new(),
+            counters: HttpServerCounters::default(),
         })
     }
 
@@ -482,6 +512,18 @@ impl HttpServer {
 
     pub fn rejected_connections(&self) -> u64 {
         self.tcp.rejected_connections()
+    }
+
+    /// Work counters for this server, including the transport's own.
+    pub fn counters(&self) -> HttpServerCounters {
+        let transport = self.tcp.counters();
+        HttpServerCounters {
+            receives_submitted: transport.receives_submitted,
+            sends_submitted: transport.sends_submitted,
+            completions: transport.completions,
+            completion_dequeues: transport.completion_dequeues,
+            ..self.counters
+        }
     }
 
     pub fn close(&mut self) {
@@ -532,6 +574,7 @@ impl HttpServer {
         }
 
         let config = self.config;
+        self.counters.ticks += 1;
         let mut handled = 0;
         let mut closing = std::mem::take(&mut self.closing);
         let mut active = std::mem::take(&mut self.active);
@@ -541,10 +584,16 @@ impl HttpServer {
         active.clear();
         active.extend(self.connections.keys().copied());
 
+        self.counters.connection_visits += active.len() as u64;
         for id in active.iter().copied() {
             let Some(connection) = self.connections.get_mut(&id) else {
                 continue;
             };
+            if connection.consumed < connection.input.len()
+                || connection.written < connection.output.len()
+            {
+                self.counters.connection_visits_with_work += 1;
+            }
             if connection.tls.is_some()
                 && connection.wire_output.is_empty()
                 && !connection.output.is_empty()
@@ -784,6 +833,10 @@ impl HttpServer {
             self.tcp.close(id);
         }
         self.closing = closing;
+        self.counters.requests += handled as u64;
+        if handled == 0 {
+            self.counters.idle_ticks += 1;
+        }
         Ok(handled)
     }
 }

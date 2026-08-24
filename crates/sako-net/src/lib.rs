@@ -53,6 +53,17 @@ struct TcpConnection {
     closing: bool,
 }
 
+/// Transport work counters. Each field counts an operation the acceptor
+/// already performs, so keeping them costs one increment on a path that just
+/// made a system call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TcpAcceptorCounters {
+    pub receives_submitted: u64,
+    pub sends_submitted: u64,
+    pub completions: u64,
+    pub completion_dequeues: u64,
+}
+
 pub struct TcpAcceptor {
     // The reactor is declared first so it is dropped first: draining its
     // in-flight operations requires the connection sockets to still be open.
@@ -64,6 +75,7 @@ pub struct TcpAcceptor {
     maximum_accepts_per_tick: usize,
     rejected_connections: u64,
     accepting: bool,
+    counters: TcpAcceptorCounters,
 }
 
 impl TcpAcceptor {
@@ -92,6 +104,7 @@ impl TcpAcceptor {
             maximum_accepts_per_tick: config.maximum_accepts_per_tick,
             rejected_connections: 0,
             accepting: true,
+            counters: TcpAcceptorCounters::default(),
         })
     }
 
@@ -155,6 +168,10 @@ impl TcpAcceptor {
 
     pub fn rejected_connections(&self) -> u64 {
         self.rejected_connections
+    }
+
+    pub fn counters(&self) -> TcpAcceptorCounters {
+        self.counters
     }
 
     pub fn peer_addr(&self, id: ConnectionId) -> Option<SocketAddr> {
@@ -251,6 +268,7 @@ impl TcpAcceptor {
         .map_err(post_error)?;
         self.connections.get_mut(id).unwrap().pending_read = Some(operation);
         self.operation_owners.insert(operation, id);
+        self.counters.receives_submitted += 1;
         Ok(())
     }
 
@@ -287,6 +305,7 @@ impl TcpAcceptor {
         .map_err(post_error)?;
         self.connections.get_mut(id).unwrap().pending_write = Some(operation);
         self.operation_owners.insert(operation, id);
+        self.counters.sends_submitted += 1;
         Err(io::ErrorKind::WouldBlock.into())
     }
 
@@ -325,6 +344,10 @@ impl TcpAcceptor {
         let result = self
             .reactor
             .poll_operations(timeout, self.reactor.capacity(), &mut completed);
+        if !completed.is_empty() {
+            self.counters.completion_dequeues += 1;
+            self.counters.completions += completed.len() as u64;
+        }
         let mut applied = 0;
         for operation in completed.drain(..) {
             let Some(id) = self.operation_owners.remove(&operation) else {
