@@ -998,6 +998,31 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     fn sako_v8_runtime_delete(runtime: *mut c_void);
+    fn sako_perf_enable();
+    fn sako_perf_mark(name: *const c_char);
+    fn sako_perf_report();
+}
+
+/// Starts recording startup phase timings for `--perf-breakdown`.
+///
+/// Recording stays off until this is called, so a normal run pays only one
+/// branch on a process-wide flag at each phase boundary.
+pub fn perf_enable() {
+    // SAFETY: the bridge only touches its own process-wide recording state.
+    unsafe { sako_perf_enable() };
+}
+
+/// Records one startup phase boundary. `name` must be a static C string.
+pub fn perf_mark(name: &'static CStr) {
+    // SAFETY: the pointer is a live static C string and the bridge only reads
+    // it while recording, which ends before the process exits.
+    unsafe { sako_perf_mark(name.as_ptr()) };
+}
+
+/// Writes the recorded startup breakdown to stderr. A no-op when disabled.
+pub fn perf_report() {
+    // SAFETY: the bridge writes its own recorded state to the error handle.
+    unsafe { sako_perf_report() };
 }
 
 #[derive(Debug)]

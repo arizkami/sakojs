@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
@@ -12,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -24,6 +27,119 @@
 #include "libplatform/libplatform.h"
 #include "v8.h"
 #include "bootstrap.generated.h"
+
+// --- Startup phase instrumentation -----------------------------------------
+//
+// `sako --perf-breakdown script.js` records one high-resolution timestamp per
+// startup phase and prints the deltas to stderr when the process finishes.
+// Recording is off unless the CLI enables it, so a normal run pays one
+// predictable branch on a process-wide flag per phase boundary and touches no
+// timer, no allocation, and no output handle.
+
+extern "C" {
+void sako_perf_enable(void);
+void sako_perf_mark(const char* name);
+void sako_perf_report(void);
+int sako_perf_enabled(void);
+}
+
+namespace sako_perf {
+
+constexpr size_t kMaximumMarks = 96;
+
+struct Mark {
+  const char* name;
+  int64_t counter;
+};
+
+bool g_enabled = false;
+size_t g_count = 0;
+Mark g_marks[kMaximumMarks];
+int64_t g_frequency = 1;
+int64_t g_process_start_offset_100ns = 0;
+
+inline int64_t Counter() {
+  LARGE_INTEGER value;
+  QueryPerformanceCounter(&value);
+  return value.QuadPart;
+}
+
+inline void Record(const char* name) {
+  if (!g_enabled || g_count >= kMaximumMarks) return;
+  g_marks[g_count].name = name;
+  g_marks[g_count].counter = Counter();
+  ++g_count;
+}
+
+}  // namespace sako_perf
+
+// Records phase marks from C++ hot-path-free startup code.
+#define SAKO_PERF_MARK(name)                         do {                                                 if (sako_perf::g_enabled) sako_perf::Record(name);   } while (false)
+
+extern "C" {
+
+void sako_perf_enable(void) {
+  LARGE_INTEGER frequency;
+  QueryPerformanceFrequency(&frequency);
+  sako_perf::g_frequency = frequency.QuadPart == 0 ? 1 : frequency.QuadPart;
+
+  // Charge image load, CRT startup, and dynamic linking to the run by
+  // measuring from the kernel's process creation time to this call.
+  FILETIME creation = {};
+  FILETIME exited = {};
+  FILETIME kernel = {};
+  FILETIME user = {};
+  FILETIME now = {};
+  if (GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel,
+                      &user)) {
+    GetSystemTimeAsFileTime(&now);
+    const int64_t created = (static_cast<int64_t>(creation.dwHighDateTime)
+                             << 32) |
+                            creation.dwLowDateTime;
+    const int64_t current =
+        (static_cast<int64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    sako_perf::g_process_start_offset_100ns = current - created;
+  }
+  sako_perf::g_enabled = true;
+  sako_perf::Record("cli.enter");
+}
+
+void sako_perf_mark(const char* name) { SAKO_PERF_MARK(name); }
+
+int sako_perf_enabled(void) { return sako_perf::g_enabled ? 1 : 0; }
+
+void sako_perf_report(void) {
+  if (!sako_perf::g_enabled || sako_perf::g_count == 0) return;
+  const double scale = 1000.0 / static_cast<double>(sako_perf::g_frequency);
+  const double before_main =
+      static_cast<double>(sako_perf::g_process_start_offset_100ns) / 10000.0;
+  std::string report = "sako perf breakdown (milliseconds)\n";
+  char line[256];
+  snprintf(line, sizeof(line), "  %-28s %9.3f %9.3f\n", "process.image-load",
+           before_main, before_main);
+  report += line;
+  const int64_t origin = sako_perf::g_marks[0].counter;
+  for (size_t index = 1; index < sako_perf::g_count; ++index) {
+    const double delta =
+        static_cast<double>(sako_perf::g_marks[index].counter -
+                            sako_perf::g_marks[index - 1].counter) *
+        scale;
+    const double total =
+        before_main +
+        static_cast<double>(sako_perf::g_marks[index].counter - origin) * scale;
+    snprintf(line, sizeof(line), "  %-28s %9.3f %9.3f\n",
+             sako_perf::g_marks[index].name, delta, total);
+    report += line;
+  }
+  const HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
+  if (error_handle != INVALID_HANDLE_VALUE && error_handle != nullptr) {
+    DWORD written = 0;
+    WriteFile(error_handle, report.data(),
+              static_cast<DWORD>(report.size()), &written, nullptr);
+  }
+}
+
+}  // extern "C"
 
 extern "C" {
 struct SakoNativeBytes {
@@ -228,6 +344,93 @@ bool ReadFileBytes(HANDLE file, void* destination, uint64_t size) {
   return offset == size;
 }
 
+// Reads one byte range of an already-sized file through a private handle.
+//
+// The caller owns `destination` and guarantees the range [offset, offset+size)
+// stays inside it for the whole call. Each worker opens its own handle so the
+// reads do not serialize on one file object's lock, and every read carries an
+// explicit offset so no worker depends on another's file pointer.
+bool ReadFileRange(const std::wstring& path, uint8_t* destination,
+                   uint64_t offset, uint64_t size) {
+  const HANDLE file = CreateFileW(
+      path.c_str(), GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  constexpr DWORD kMaximumChunk = 1u << 24;
+  uint64_t done = 0;
+  while (done < size) {
+    const uint64_t remaining = size - done;
+    const DWORD chunk = remaining > kMaximumChunk
+                            ? kMaximumChunk
+                            : static_cast<DWORD>(remaining);
+    const uint64_t position = offset + done;
+    OVERLAPPED overlapped = {};
+    overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFFull);
+    overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
+    DWORD read = 0;
+    if (!::ReadFile(file, destination + done, chunk, &read, &overlapped) ||
+        read == 0) {
+      CloseHandle(file);
+      return false;
+    }
+    done += read;
+  }
+  CloseHandle(file);
+  return true;
+}
+
+// A warm cached read costs one page-by-page copy out of the Windows cache
+// manager, which saturates a single core near 2 GiB/s no matter how the read is
+// chunked. Splitting a large file across a few threads scales that copy with
+// cores. Small reads stay on the calling thread, where thread dispatch would
+// cost more than the copy it parallelizes.
+constexpr uint64_t kParallelReadThresholdBytes = 4ull << 20;
+constexpr size_t kParallelReadWorkers = 4;
+
+// Fills `destination` with the whole file, splitting the copy across worker
+// threads. `destination` must have room for `size` bytes and must stay alive
+// until this returns; every worker is joined before that happens, and the
+// workers write disjoint ranges, so no byte is written twice and nothing
+// outlives the buffer.
+bool ReadFileParallel(const std::filesystem::path& path, uint8_t* destination,
+                      uint64_t size) {
+  const std::wstring native = ExtendedPath(path).native();
+  const uint64_t span = (size + kParallelReadWorkers - 1) / kParallelReadWorkers;
+  std::atomic<bool> failed(false);
+  std::vector<std::thread> workers;
+  workers.reserve(kParallelReadWorkers - 1);
+  for (size_t index = 1; index < kParallelReadWorkers; ++index) {
+    const uint64_t offset = span * index;
+    if (offset >= size) break;
+    const uint64_t length = std::min(span, size - offset);
+    workers.emplace_back([&native, destination, offset, length, &failed]() {
+      if (!ReadFileRange(native, destination + offset, offset, length)) {
+        failed.store(true, std::memory_order_relaxed);
+      }
+    });
+  }
+  if (!ReadFileRange(native, destination, 0, std::min(span, size))) {
+    failed.store(true, std::memory_order_relaxed);
+  }
+  for (std::thread& worker : workers) worker.join();
+  return !failed.load(std::memory_order_relaxed);
+}
+
+// Fills `destination` with the first `size` bytes of `file`. Large reads are
+// split across worker threads; anything smaller stays on the calling thread.
+// The caller keeps ownership of `file`, which the serial path reads from its
+// current position.
+bool ReadWholeFile(HANDLE file, const std::filesystem::path& path,
+                   void* destination, uint64_t size) {
+  if (size == 0) return true;
+  if (size >= kParallelReadThresholdBytes &&
+      ReadFileParallel(path, static_cast<uint8_t*>(destination), size)) {
+    return true;
+  }
+  return ReadFileBytes(file, destination, size);
+}
+
 bool ReadFile(const std::filesystem::path& path, std::string* source) {
   uint64_t size = 0;
   const HANDLE file = OpenFileForRead(path, &size);
@@ -237,7 +440,7 @@ bool ReadFile(const std::filesystem::path& path, std::string* source) {
     return false;
   }
   source->resize(static_cast<size_t>(size));
-  const bool read = size == 0 || ReadFileBytes(file, source->data(), size);
+  const bool read = ReadWholeFile(file, path, source->data(), size);
   CloseHandle(file);
   return read;
 }
@@ -772,7 +975,7 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
   if (text) {
     std::string bytes;
     bytes.resize(length);
-    const bool read = length == 0 || ReadFileBytes(file, bytes.data(), length);
+    const bool read = ReadWholeFile(file, path, bytes.data(), length);
     CloseHandle(file);
     if (!read || length > static_cast<size_t>(std::numeric_limits<int>::max())) {
       ThrowFileError(isolate, "read", path);
@@ -792,7 +995,7 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
   std::unique_ptr<v8::BackingStore> backing =
       v8::ArrayBuffer::NewBackingStore(
           isolate, length, v8::BackingStoreInitializationMode::kUninitialized);
-  const bool read = length == 0 || ReadFileBytes(file, backing->Data(), length);
+  const bool read = ReadWholeFile(file, path, backing->Data(), length);
   CloseHandle(file);
   if (!read) {
     ThrowFileError(isolate, "read", path);
@@ -1257,15 +1460,18 @@ class Engine {
       v8::V8::SetFlagsFromString(override_flags);
       free(override_flags);
     }
+    SAKO_PERF_MARK("v8.flags");
     if (!v8::V8::InitializeICUDefaultLocation(executable_path, icu_data_path)) {
       *error = std::string("failed to initialize ICU from ") + icu_data_path;
       return false;
     }
+    SAKO_PERF_MARK("v8.icu-data");
     platform_ = v8::platform::NewDefaultPlatform();
     if (!platform_) {
       *error = "failed to create the V8 platform";
       return false;
     }
+    SAKO_PERF_MARK("v8.platform");
     v8::V8::InitializePlatform(platform_.get());
     if (!v8::V8::Initialize()) {
       *error = "failed to initialize V8";
@@ -1273,6 +1479,7 @@ class Engine {
       platform_.reset();
       return false;
     }
+    SAKO_PERF_MARK("v8.initialize");
     initialized_ = true;
     return true;
   }
@@ -1317,6 +1524,7 @@ class Runtime {
     runtime->allocator_ =
         std::make_unique<PooledArrayBufferAllocator>(std::move(base_allocator));
 
+    SAKO_PERF_MARK("v8.allocator");
     v8::Isolate::CreateParams params;
     params.array_buffer_allocator = runtime->allocator_.get();
     runtime->isolate_ = v8::Isolate::New(params);
@@ -1324,11 +1532,13 @@ class Runtime {
       *error = "failed to create a V8 isolate";
       return nullptr;
     }
+    SAKO_PERF_MARK("v8.isolate");
     runtime->isolate_->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
     runtime->isolate_->SetData(0, runtime.get());
     runtime->isolate_->SetHostImportModuleDynamicallyCallback(
         ImportModuleDynamically);
     if (!runtime->InitializeContext(error)) return nullptr;
+    SAKO_PERF_MARK("runtime.ready");
     return runtime;
   }
 
@@ -1451,6 +1661,7 @@ class Runtime {
       return false;
     }
 
+    SAKO_PERF_MARK("runtime.process-globals");
     const std::string path_text(reinterpret_cast<const char*>(path_bytes),
                                 path_length);
     const std::wstring wide_path = Utf8ToWide(path_text);
@@ -1475,14 +1686,17 @@ class Runtime {
       *error = FormatException(isolate_, context, try_catch);
       return false;
     }
+    SAKO_PERF_MARK("module.instantiate");
 
     v8::Local<v8::Value> evaluation;
     if (!module->Evaluate(context).ToLocal(&evaluation)) {
       *error = FormatException(isolate_, context, try_catch);
       return false;
     }
+    SAKO_PERF_MARK("module.evaluate");
     isolate_->PerformMicrotaskCheckpoint();
     if (!DrainEventLoop(context, error)) return false;
+    SAKO_PERF_MARK("event-loop.drain");
 
     if (evaluation->IsPromise()) {
       v8::Local<v8::Promise> promise = evaluation.As<v8::Promise>();
@@ -1509,6 +1723,7 @@ class Runtime {
       *error = "failed to install process globals";
       return false;
     }
+    SAKO_PERF_MARK("runtime.process-globals");
     const std::string path_text(reinterpret_cast<const char*>(path_bytes),
                                 path_length);
     const std::wstring wide_path = Utf8ToWide(path_text);
@@ -1525,8 +1740,11 @@ class Runtime {
       if (try_catch.HasCaught()) *error = FormatException(isolate_, context, try_catch);
       return false;
     }
+    SAKO_PERF_MARK("module.evaluate");
     isolate_->PerformMicrotaskCheckpoint();
-    return DrainEventLoop(context, error);
+    const bool drained = DrainEventLoop(context, error);
+    SAKO_PERF_MARK("event-loop.drain");
+    return drained;
   }
 
   void MemoryStats(uint64_t* heap_used, uint64_t* heap_committed,
@@ -1637,6 +1855,7 @@ class Runtime {
     v8::HandleScope handle_scope(isolate_);
     v8::Local<v8::Context> context = v8::Context::New(isolate_);
     v8::Context::Scope context_scope(context);
+    SAKO_PERF_MARK("v8.context");
 
     v8::Local<v8::Object> console = v8::Object::New(isolate_);
     v8::Local<v8::Function> log;
@@ -1704,6 +1923,7 @@ class Runtime {
       return false;
     }
 
+    SAKO_PERF_MARK("runtime.builtins");
     const DWORD cwd_length = GetCurrentDirectoryW(0, nullptr);
     std::wstring cwd(cwd_length, L'\0');
     const DWORD cwd_written =
@@ -1741,11 +1961,16 @@ class Runtime {
     v8::ScriptOrigin origin(name);
     v8::Local<v8::Script> script;
     v8::Local<v8::Value> ignored;
-    if (!v8::Script::Compile(context, source, &origin).ToLocal(&script) ||
-        !script->Run(context).ToLocal(&ignored)) {
+    if (!v8::Script::Compile(context, source, &origin).ToLocal(&script)) {
       *error = FormatException(isolate_, context, try_catch);
       return false;
     }
+    SAKO_PERF_MARK("bootstrap.compile");
+    if (!script->Run(context).ToLocal(&ignored)) {
+      *error = FormatException(isolate_, context, try_catch);
+      return false;
+    }
+    SAKO_PERF_MARK("bootstrap.run");
     return true;
   }
 
@@ -1768,7 +1993,9 @@ class Runtime {
       *error = "cannot read module: " + canonical_path;
       return false;
     }
+    SAKO_PERF_MARK("module.read");
     if (!TranspileTypeScript(path, false, &source_text, error)) return false;
+    SAKO_PERF_MARK("module.transpile");
     if (module_source_bytes_ + source_text.size() > kMaximumModuleBytes) {
       *error = "module source cache byte limit exceeded";
       return false;
@@ -1798,6 +2025,7 @@ class Runtime {
       return false;
     }
 
+    SAKO_PERF_MARK("module.compile");
     modules_.emplace(canonical_path, v8::Global<v8::Module>(isolate_, module));
     module_source_bytes_ += source_text.size();
     *output = module;
@@ -2480,7 +2708,9 @@ class Runtime {
       *error = "cannot read CommonJS module: " + canonical_path;
       return false;
     }
+    SAKO_PERF_MARK("module.read");
     if (!TranspileTypeScript(path, true, &source_text, error)) return false;
+    SAKO_PERF_MARK("module.transpile");
     if (module_source_bytes_ + source_text.size() > kMaximumModuleBytes) {
       *error = "module source cache byte limit exceeded";
       return false;
@@ -2549,6 +2779,7 @@ class Runtime {
       commonjs_modules_.erase(canonical_path);
       return false;
     }
+    SAKO_PERF_MARK("module.compile");
 
     v8::Local<v8::Function> require;
     if (!CreateRequire(context, canonical_path, &require)) {
@@ -2568,6 +2799,7 @@ class Runtime {
             .ToLocalChecked(),
     };
     v8::Local<v8::Value> ignored;
+    SAKO_PERF_MARK("module.instantiate");
     if (!wrapper_value.As<v8::Function>()
              ->Call(context, exports, 5, arguments)
              .ToLocal(&ignored) ||

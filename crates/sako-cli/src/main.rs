@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use sako_package::{PackageManager, PackageManagerOptions};
 use sako_process::spawn_native_with_bounded_output;
-use sako_v8::{MemoryStats, Runtime};
+use sako_v8::{MemoryStats, Runtime, perf_enable, perf_mark, perf_report};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAXIMUM_SCRIPT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -21,17 +21,22 @@ struct DiagnosticsOptions {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let status = match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("sako: {error}");
             ExitCode::FAILURE
         }
-    }
+    };
+    perf_report();
+    status
 }
 
 fn run() -> Result<(), String> {
     let mut arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if take_flag(&mut arguments, "--perf-breakdown") {
+        perf_enable();
+    }
     let diagnostics = DiagnosticsOptions {
         print_memory: take_flag(&mut arguments, "--memory-stats"),
         detect_leaks: take_flag(&mut arguments, "--detect-leaks"),
@@ -283,6 +288,7 @@ fn execute_file(
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned()),
     );
+    perf_mark(c"cli.entry-resolved");
     let mut runtime = Runtime::new().map_err(|error| error.to_string())?;
     if is_es_module(&path) {
         runtime
@@ -293,6 +299,7 @@ fn execute_file(
             .execute_commonjs_with_args(&resource_name, &process_arguments)
             .map_err(|error| error.to_string())?;
     }
+    perf_mark(c"cli.complete");
     finish_diagnostics(&runtime, diagnostics)
 }
 
@@ -470,5 +477,5 @@ fn finish_diagnostics(runtime: &Runtime, options: DiagnosticsOptions) -> Result<
 }
 
 fn usage() -> String {
-    "usage: sako [--memory-stats] [--detect-leaks] [--workers=N|auto] <script.js|script.ts> [args...] | run <script|name> | eval <source> | repl | install | add <package> | remove <package> | update | --version".into()
+    "usage: sako [--memory-stats] [--detect-leaks] [--perf-breakdown] [--workers=N|auto] <script.js|script.ts> [args...] | run <script|name> | eval <source> | repl | install | add <package> | remove <package> | update | --version".into()
 }
