@@ -48,6 +48,13 @@ fn main() -> std::io::Result<()> {
                 counters.completions as f64 / requests,
                 counters.completions as f64 / counters.completion_dequeues.max(1) as f64,
             );
+            eprintln!(
+                "recv_inline={} recv_pending={} send_inline={} send_pending={}",
+                counters.receives_inline,
+                counters.receives_pending,
+                counters.sends_inline,
+                counters.sends_pending,
+            );
             return Ok(());
         }
     }

@@ -424,6 +424,11 @@ pub struct HttpServerCounters {
     pub completions: u64,
     /// GetQueuedCompletionStatusEx calls that returned at least one entry.
     pub completion_dequeues: u64,
+    /// Receives and sends Winsock satisfied inline instead of leaving pending.
+    pub receives_inline: u64,
+    pub receives_pending: u64,
+    pub sends_inline: u64,
+    pub sends_pending: u64,
 }
 
 pub struct HttpServer {
@@ -522,6 +527,10 @@ impl HttpServer {
             sends_submitted: transport.sends_submitted,
             completions: transport.completions,
             completion_dequeues: transport.completion_dequeues,
+            receives_inline: transport.receives_inline,
+            receives_pending: transport.receives_pending,
+            sends_inline: transport.sends_inline,
+            sends_pending: transport.sends_pending,
             ..self.counters
         }
     }

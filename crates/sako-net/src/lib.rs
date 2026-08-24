@@ -51,6 +51,11 @@ struct TcpConnection {
     read_closed: bool,
     failed: bool,
     closing: bool,
+    /// Whether the kernel agreed to skip a completion packet for calls on this
+    /// socket that succeed inline. Recorded when the socket was associated,
+    /// because a provider may refuse and the submit path must not then assume
+    /// a completion it will never receive.
+    inline_completions: bool,
 }
 
 /// Transport work counters. Each field counts an operation the acceptor
@@ -62,6 +67,10 @@ pub struct TcpAcceptorCounters {
     pub sends_submitted: u64,
     pub completions: u64,
     pub completion_dequeues: u64,
+    pub receives_inline: u64,
+    pub receives_pending: u64,
+    pub sends_inline: u64,
+    pub sends_pending: u64,
 }
 
 pub struct TcpAcceptor {
@@ -138,6 +147,7 @@ impl TcpAcceptor {
                 read_closed: false,
                 failed: false,
                 closing: false,
+                inline_completions: false,
             }) {
                 Ok(id) => id,
                 Err(_) => {
@@ -146,9 +156,14 @@ impl TcpAcceptor {
                 }
             };
             let socket = self.connections.get(id).unwrap().stream.as_socket();
-            if let Err(error) = self.reactor.associate_socket(socket, id.completion_key()) {
-                self.connections.remove(id);
-                return Err(error);
+            match self.reactor.associate_socket(socket, id.completion_key()) {
+                Ok(inline_completions) => {
+                    self.connections.get_mut(id).unwrap().inline_completions = inline_completions;
+                }
+                Err(error) => {
+                    self.connections.remove(id);
+                    return Err(error);
+                }
             }
             accepted.push(id);
         }
@@ -171,7 +186,14 @@ impl TcpAcceptor {
     }
 
     pub fn counters(&self) -> TcpAcceptorCounters {
-        self.counters
+        let reactor = self.reactor.counters();
+        TcpAcceptorCounters {
+            receives_inline: reactor.receives_inline,
+            receives_pending: reactor.receives_pending,
+            sends_inline: reactor.sends_inline,
+            sends_pending: reactor.sends_pending,
+            ..self.counters
+        }
     }
 
     pub fn peer_addr(&self, id: ConnectionId) -> Option<SocketAddr> {
@@ -254,6 +276,7 @@ impl TcpAcceptor {
             return Ok(());
         }
         let socket = connection.stream.as_raw_socket();
+        let inline_completions = connection.inline_completions;
         let length = u32::try_from(length).unwrap_or(u32::MAX);
         // SAFETY: accept_ready associated this connection's socket file object
         // with this reactor, and the connection owns that socket until every
@@ -263,6 +286,7 @@ impl TcpAcceptor {
                 BorrowedSocket::borrow_raw(socket),
                 id.completion_key(),
                 length,
+                inline_completions,
             )
         }
         .map_err(post_error)?;
@@ -290,6 +314,7 @@ impl TcpAcceptor {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         let socket = connection.stream.as_raw_socket();
+        let inline_completions = connection.inline_completions;
         let mut payload = self.reactor.acquire_buffer(buffer.len());
         payload.copy_from_slice(buffer);
         // SAFETY: accept_ready associated this connection's socket file object
@@ -300,6 +325,7 @@ impl TcpAcceptor {
                 BorrowedSocket::borrow_raw(socket),
                 id.completion_key(),
                 payload,
+                inline_completions,
             )
         }
         .map_err(post_error)?;

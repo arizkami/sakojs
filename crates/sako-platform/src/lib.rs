@@ -19,6 +19,12 @@ use std::time::Duration;
 
 const WAIT_TIMEOUT: i32 = 258;
 const ERROR_IO_PENDING: i32 = 997;
+/// Tells the kernel not to queue a completion packet when an overlapped call
+/// on this handle succeeds inline, and not to signal the handle's event. Both
+/// only remove work the reactor does not use: it never waits on the handle,
+/// and an inline success already carries its byte count.
+const FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: u8 = 0x1;
+const FILE_SKIP_SET_EVENT_ON_HANDLE: u8 = 0x2;
 const SOCKET_ERROR: i32 = -1;
 const STATUS_CANCELLED: usize = 0xC000_0120;
 
@@ -48,6 +54,7 @@ struct OverlappedEntry {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn SetFileCompletionNotificationModes(handle: *mut c_void, flags: u8) -> i32;
     fn CreateIoCompletionPort(
         file_handle: *mut c_void,
         existing_port: *mut c_void,
@@ -193,7 +200,23 @@ const MAXIMUM_POLL_ENTRIES: usize = 256;
 /// Receive and send buffers retained for reuse between operations.
 const MAXIMUM_POOLED_BUFFERS: usize = 512;
 
+/// Counts how each submitted operation finished. Winsock can satisfy an
+/// overlapped call inline, and a socket set to skip completion packets on
+/// inline success would need no completion at all; these counts say how often
+/// that would apply before the machinery for it is worth building.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IocpCounters {
+    pub receives_inline: u64,
+    pub receives_pending: u64,
+    pub sends_inline: u64,
+    pub sends_pending: u64,
+}
+
 pub struct IocpReactor {
+    counters: IocpCounters,
+    /// Operations that finished inline and therefore have no completion packet
+    /// to wait for. poll_operations reports these alongside the port's own.
+    inline_completed: Vec<u64>,
     port: OwnedHandle,
     capacity: usize,
     pending_posts: usize,
@@ -256,6 +279,8 @@ impl IocpReactor {
         let port = unsafe { OwnedHandle::from_raw_handle(raw) };
         let entry_capacity = capacity.min(MAXIMUM_POLL_ENTRIES);
         Ok(Self {
+            counters: IocpCounters::default(),
+            inline_completed: Vec::new(),
             port,
             capacity,
             pending_posts: 0,
@@ -307,7 +332,18 @@ impl IocpReactor {
         }
     }
 
-    pub fn associate_socket(&self, socket: BorrowedSocket<'_>, key: usize) -> io::Result<()> {
+    /// Associates a socket with this port and asks the kernel to stop queuing a
+    /// completion packet for calls that succeed inline.
+    ///
+    /// Returns whether that request was granted. A layered service provider can
+    /// refuse it, and a caller that submits against such a socket must keep
+    /// waiting for every completion, so the answer has to travel with the
+    /// socket rather than being assumed.
+    pub fn associate_socket(
+        &self,
+        socket: BorrowedSocket<'_>,
+        key: usize,
+    ) -> io::Result<bool> {
         // SAFETY: Winsock SOCKET values are valid handles for IOCP association.
         // The borrowed socket and completion port are live for this call, and
         // association transfers ownership of neither resource.
@@ -320,10 +356,16 @@ impl IocpReactor {
             )
         };
         if result.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+            return Err(io::Error::last_os_error());
         }
+        // SAFETY: the socket is live and associated with this port.
+        let modes = unsafe {
+            SetFileCompletionNotificationModes(
+                socket.as_raw_socket() as *mut c_void,
+                FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE,
+            )
+        };
+        Ok(modes != 0)
     }
 
     pub fn post(
@@ -515,7 +557,7 @@ impl IocpReactor {
         key: usize,
         length: u32,
     ) -> Result<u64, PostError> {
-        self.submit_socket_receive_inner(OperationOwner::Socket(socket), key, length, true)
+        self.submit_socket_receive_inner(OperationOwner::Socket(socket), key, length, true, false)
     }
 
     /// Submits a receive on a socket file object already associated with this IOCP.
@@ -524,17 +566,24 @@ impl IocpReactor {
     ///
     /// `socket` must be the associated socket or a duplicate of that socket. If
     /// it belongs to another completion port, completion cannot be drained here.
+    ///
+    /// `inline_completions` must be the value `associate_socket` returned for
+    /// this socket. Passing true for a socket the kernel did not grant the
+    /// skip mode would lose a completion; passing false is always safe and
+    /// only costs the packet.
     pub unsafe fn submit_associated_socket_receive(
         &mut self,
         socket: BorrowedSocket<'_>,
         key: usize,
         length: u32,
+        inline_completions: bool,
     ) -> Result<u64, PostError> {
         self.submit_socket_receive_inner(
             OperationOwner::BorrowedSocket(socket.as_raw_socket() as usize),
             key,
             length,
             false,
+            inline_completions,
         )
     }
 
@@ -544,6 +593,7 @@ impl IocpReactor {
         key: usize,
         length: u32,
         associate: bool,
+        inline_completions: bool,
     ) -> Result<u64, PostError> {
         self.reserve_operation()?;
         if associate {
@@ -587,8 +637,38 @@ impl IocpReactor {
             if error != ERROR_IO_PENDING {
                 return Err(PostError::System(io::Error::from_raw_os_error(error)));
             }
+            self.counters.receives_pending += 1;
+            return Ok(self.register_operation(operation));
+        }
+        self.counters.receives_inline += 1;
+        if inline_completions {
+            return Ok(self.complete_inline(operation, immediate));
         }
         Ok(self.register_operation(operation))
+    }
+
+    /// Files an operation that Winsock already finished, so the caller sees it
+    /// on the next poll exactly as it would see a packet from the port.
+    ///
+    /// Only correct for a socket the kernel granted
+    /// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: without it the packet still
+    /// arrives and the operation would be reported twice.
+    fn complete_inline(&mut self, operation: PendingOperation, transferred: u32) -> u64 {
+        let id = operation.id;
+        self.recycle_overlapped(operation.overlapped);
+        self.completed_operations.insert(
+            id,
+            OperationCompletion {
+                id,
+                key: operation.key,
+                kind: operation.kind,
+                bytes_transferred: transferred,
+                status: 0,
+                buffer: operation.buffer,
+            },
+        );
+        self.inline_completed.push(id);
+        id
     }
 
     pub fn submit_socket_send(
@@ -597,7 +677,7 @@ impl IocpReactor {
         key: usize,
         buffer: Vec<u8>,
     ) -> Result<u64, PostError> {
-        self.submit_socket_send_inner(OperationOwner::Socket(socket), key, buffer, true)
+        self.submit_socket_send_inner(OperationOwner::Socket(socket), key, buffer, true, false)
     }
 
     /// Submits a send on a socket file object already associated with this IOCP.
@@ -606,17 +686,22 @@ impl IocpReactor {
     ///
     /// `socket` must be the associated socket or a duplicate of that socket. If
     /// it belongs to another completion port, completion cannot be drained here.
+    ///
+    /// `inline_completions` must be the value `associate_socket` returned for
+    /// this socket.
     pub unsafe fn submit_associated_socket_send(
         &mut self,
         socket: BorrowedSocket<'_>,
         key: usize,
         buffer: Vec<u8>,
+        inline_completions: bool,
     ) -> Result<u64, PostError> {
         self.submit_socket_send_inner(
             OperationOwner::BorrowedSocket(socket.as_raw_socket() as usize),
             key,
             buffer,
             false,
+            inline_completions,
         )
     }
 
@@ -626,6 +711,7 @@ impl IocpReactor {
         key: usize,
         buffer: Vec<u8>,
         associate: bool,
+        inline_completions: bool,
     ) -> Result<u64, PostError> {
         self.reserve_operation()?;
         let length = u32::try_from(buffer.len()).map_err(|_| {
@@ -673,8 +759,18 @@ impl IocpReactor {
             if error != ERROR_IO_PENDING {
                 return Err(PostError::System(io::Error::from_raw_os_error(error)));
             }
+            self.counters.sends_pending += 1;
+            return Ok(self.register_operation(operation));
+        }
+        self.counters.sends_inline += 1;
+        if inline_completions {
+            return Ok(self.complete_inline(operation, immediate));
         }
         Ok(self.register_operation(operation))
+    }
+
+    pub fn counters(&self) -> IocpCounters {
+        self.counters
     }
 
     pub fn cancel_operation(&self, id: u64) -> io::Result<bool> {
@@ -720,6 +816,15 @@ impl IocpReactor {
         maximum: usize,
         completed: &mut Vec<u64>,
     ) -> io::Result<usize> {
+        // Work that finished inline is already available, so reporting it first
+        // and then polling the port without blocking keeps a caller that asked
+        // to wait from sleeping on results it could already act on.
+        let inline = self.inline_completed.len();
+        if inline != 0 {
+            completed.append(&mut self.inline_completed);
+            let drained = self.drain_port(Duration::ZERO, maximum, None, Some(completed))?;
+            return Ok(inline + drained);
+        }
         self.drain_port(timeout, maximum, None, Some(completed))
     }
 
