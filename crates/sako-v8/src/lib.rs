@@ -28,6 +28,37 @@ unsafe extern "C" {
         source_len: usize,
         resource_name: *const u8,
         resource_name_len: usize,
+        argument_bytes: *const *const u8,
+        argument_lengths: *const usize,
+        argument_count: usize,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn sako_v8_runtime_memory_stats(
+        runtime: *mut c_void,
+        heap_used: *mut u64,
+        heap_committed: *mut u64,
+        heap_limit: *mut u64,
+        persistent_handles: *mut u64,
+        timers: *mut u64,
+    ) -> c_int;
+    fn sako_v8_runtime_execute_module(
+        runtime: *mut c_void,
+        path: *const u8,
+        path_length: usize,
+        argument_bytes: *const *const u8,
+        argument_lengths: *const usize,
+        argument_count: usize,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> c_int;
+    fn sako_v8_runtime_execute_commonjs(
+        runtime: *mut c_void,
+        path: *const u8,
+        path_length: usize,
+        argument_bytes: *const *const u8,
+        argument_lengths: *const usize,
+        argument_count: usize,
         error: *mut c_char,
         error_capacity: usize,
     ) -> c_int;
@@ -49,6 +80,15 @@ pub struct Runtime {
     raw: NonNull<c_void>,
     // A V8 isolate is thread-affine. Keep Runtime !Send and !Sync.
     _thread_affinity: PhantomData<Rc<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryStats {
+    pub heap_used: u64,
+    pub heap_committed: u64,
+    pub heap_limit: u64,
+    pub persistent_handles: u64,
+    pub timers: u64,
 }
 
 impl Runtime {
@@ -99,12 +139,32 @@ impl Runtime {
     }
 
     pub fn execute(&mut self, source: &str, resource_name: &str) -> Result<(), V8Error> {
+        self.execute_with_args(source, resource_name, &[])
+    }
+
+    pub fn execute_with_args(
+        &mut self,
+        source: &str,
+        resource_name: &str,
+        arguments: &[String],
+    ) -> Result<(), V8Error> {
         if source.len() > i32::MAX as usize {
             return Err(V8Error("JavaScript source exceeds V8 string limits".into()));
         }
         if resource_name.len() > i32::MAX as usize {
             return Err(V8Error("script path exceeds V8 string limits".into()));
         }
+        if arguments.len() > i32::MAX as usize
+            || arguments
+                .iter()
+                .any(|argument| argument.len() > i32::MAX as usize)
+        {
+            return Err(V8Error("script arguments exceed V8 string limits".into()));
+        }
+        let argument_bytes: Vec<*const u8> =
+            arguments.iter().map(|argument| argument.as_ptr()).collect();
+        let argument_lengths: Vec<usize> =
+            arguments.iter().map(|argument| argument.len()).collect();
         let mut error = vec![0_u8; ERROR_BUFFER_CAPACITY];
         // SAFETY: Runtime exclusively owns a live native runtime. The byte slices and
         // writable error buffer remain valid for the duration of this synchronous call.
@@ -115,6 +175,114 @@ impl Runtime {
                 source.len(),
                 resource_name.as_ptr(),
                 resource_name.len(),
+                argument_bytes.as_ptr(),
+                argument_lengths.as_ptr(),
+                arguments.len(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(error_from_buffer(&error))
+        }
+    }
+
+    pub fn memory_stats(&self) -> MemoryStats {
+        let mut stats = MemoryStats {
+            heap_used: 0,
+            heap_committed: 0,
+            heap_limit: 0,
+            persistent_handles: 0,
+            timers: 0,
+        };
+        // SAFETY: raw is live and each output pointer refers to initialized writable storage.
+        let status = unsafe {
+            sako_v8_runtime_memory_stats(
+                self.raw.as_ptr(),
+                &mut stats.heap_used,
+                &mut stats.heap_committed,
+                &mut stats.heap_limit,
+                &mut stats.persistent_handles,
+                &mut stats.timers,
+            )
+        };
+        debug_assert_eq!(status, 0);
+        stats
+    }
+
+    pub fn execute_module_with_args(
+        &mut self,
+        path: &str,
+        arguments: &[String],
+    ) -> Result<(), V8Error> {
+        if path.len() > i32::MAX as usize {
+            return Err(V8Error("module path exceeds V8 string limits".into()));
+        }
+        if arguments.len() > i32::MAX as usize
+            || arguments
+                .iter()
+                .any(|argument| argument.len() > i32::MAX as usize)
+        {
+            return Err(V8Error("script arguments exceed V8 string limits".into()));
+        }
+        let argument_bytes: Vec<*const u8> =
+            arguments.iter().map(|argument| argument.as_ptr()).collect();
+        let argument_lengths: Vec<usize> =
+            arguments.iter().map(|argument| argument.len()).collect();
+        let mut error = vec![0_u8; ERROR_BUFFER_CAPACITY];
+        // SAFETY: Runtime owns a live native runtime. The path, argument slices,
+        // pointer arrays, and writable error buffer remain valid for this call.
+        let status = unsafe {
+            sako_v8_runtime_execute_module(
+                self.raw.as_ptr(),
+                path.as_ptr(),
+                path.len(),
+                argument_bytes.as_ptr(),
+                argument_lengths.as_ptr(),
+                arguments.len(),
+                error.as_mut_ptr().cast(),
+                error.len(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(error_from_buffer(&error))
+        }
+    }
+
+    pub fn execute_commonjs_with_args(
+        &mut self,
+        path: &str,
+        arguments: &[String],
+    ) -> Result<(), V8Error> {
+        if path.len() > i32::MAX as usize {
+            return Err(V8Error("CommonJS path exceeds V8 string limits".into()));
+        }
+        if arguments.len() > i32::MAX as usize
+            || arguments
+                .iter()
+                .any(|argument| argument.len() > i32::MAX as usize)
+        {
+            return Err(V8Error("script arguments exceed V8 string limits".into()));
+        }
+        let argument_bytes: Vec<*const u8> =
+            arguments.iter().map(|argument| argument.as_ptr()).collect();
+        let argument_lengths: Vec<usize> =
+            arguments.iter().map(|argument| argument.len()).collect();
+        let mut error = vec![0_u8; ERROR_BUFFER_CAPACITY];
+        // SAFETY: Runtime owns a live native runtime. The path, argument slices,
+        // pointer arrays, and writable error buffer remain valid for this call.
+        let status = unsafe {
+            sako_v8_runtime_execute_commonjs(
+                self.raw.as_ptr(),
+                path.as_ptr(),
+                path.len(),
+                argument_bytes.as_ptr(),
+                argument_lengths.as_ptr(),
+                arguments.len(),
                 error.as_mut_ptr().cast(),
                 error.len(),
             )

@@ -10,4 +10,6 @@ name = "sako"
 path = "src/main.rs"
 
 [dependencies]
+sako-package = { path = "../sako-package" }
 sako-v8 = { path = "../sako-v8" }
+serde_json = "1.0"

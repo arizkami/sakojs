@@ -23,32 +23,35 @@ Phase 1 exit criterion: Sako boots the supplied V8 build on Windows x64, runs th
 
 ## Phase 2: Script runtime and CLI
 
-- [ ] Support `sako app.js` and `sako run app.js` with script arguments.
-- [ ] Support `sako eval`, `sako repl`, `sako --version`, and package-script dispatch.
-- [ ] Establish the runtime bootstrap JS layer and basic globals.
-- [ ] Implement correct timers, cancellation, queued microtasks, and event-loop draining.
-- [ ] Add structured JS/system error mapping and stable stack traces.
-- [ ] Add startup, exception, timer, and microtask integration tests.
-- [ ] Add initial memory statistics and persistent-handle counters.
+- [x] Support `sako app.js` and `sako run app.js` with script arguments.
+- [x] Support `sako eval`, `sako repl`, `sako --version`, and package-script dispatch.
+- [x] Establish the runtime bootstrap JS layer and basic globals.
+- [x] Implement correct timers, cancellation, queued microtasks, and event-loop draining.
+- [x] Add structured JS/system error mapping and stable stack traces.
+- [x] Add startup, exception, timer, and microtask integration tests.
+- [x] Add initial memory statistics and persistent-handle counters.
 
 ## Phase 3: Modules and core Node compatibility
 
-- [ ] Implement V8-native ESM compilation, linking, evaluation, and relative/absolute resolution.
-- [ ] Implement `package.json` `type`, `exports`, `imports`, and conditional resolution.
-- [ ] Implement CommonJS loading and the CJS/ESM interoperability rules.
-- [ ] Add the first `node:` modules: assert, buffer, console, events, fs, fs/promises, path, process, timers, URL, and util.
-- [ ] Track each API honestly in `docs/node-compatibility.md`.
-- [ ] Cover Windows paths, Unicode paths, UNC paths, extended paths, links, and locking behavior.
+- [x] Implement V8-native ESM compilation, linking, evaluation, and relative/absolute resolution.
+- [x] Select `.js` entry mode from the nearest `package.json` `type`.
+- [ ] Implement package `exports`, `imports`, and conditional resolution.
+- [x] Implement cached CommonJS loading, JSON modules, package `main`, `node_modules` lookup, and `require.resolve`.
+- [ ] Implement the CJS/ESM interoperability rules.
+- [ ] Add the first `node:` modules: assert, buffer, console, events, fs, fs/promises, path, process, timers, URL, and util. (`assert`, `console`, `process`, and `timers` have an initial CommonJS surface.)
+- [x] Track each API honestly in `docs/node-compatibility.md`.
+- [ ] Cover Windows paths, Unicode paths, UNC paths, extended paths, links, and locking behavior. (Normal and Unicode local paths are covered.)
 
 ## Phase 4: npm packages
 
-- [ ] Implement npm registry metadata and tarball fetching with integrity verification.
-- [ ] Implement semver, dist-tags, dependency classes, peer constraints, scopes, auth, and private registries.
-- [ ] Implement a bounded content-addressed Windows package store.
-- [ ] Design and implement deterministic `sako.lock` serialization.
-- [ ] Implement `install`, `add`, `remove`, and `update`.
-- [ ] Support lifecycle scripts with `--ignore-scripts` and documented security behavior.
-- [ ] Run a real pure-JavaScript npm package without source changes.
+- [x] Implement npm registry metadata and tarball fetching with integrity verification.
+- [x] Implement semver ranges, dist-tags, dependency classes, and scoped packages.
+- [ ] Implement peer constraints, workspaces, registry auth, and private registry configuration.
+- [x] Implement a bounded content-addressed Windows package store.
+- [x] Design and implement deterministic `sako.lock` serialization.
+- [x] Implement `install`, `add`, `remove`, and `update`.
+- [x] Support lifecycle scripts with `--ignore-scripts` and documented security behavior.
+- [x] Run a real pure-JavaScript npm package without source changes.
 
 ## Phase 5: Windows I/O, networking, and Express
 

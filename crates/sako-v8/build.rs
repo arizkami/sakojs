@@ -46,6 +46,7 @@ fn main() {
         .include(&include_dir)
         .file(&bridge)
         .define("V8_COMPRESS_POINTERS", None)
+        .flag_if_supported("/EHsc")
         .flag_if_supported("/Zc:__cplusplus")
         .flag_if_supported("/utf-8")
         .warnings(true)

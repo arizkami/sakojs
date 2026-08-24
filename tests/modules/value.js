@@ -1,0 +1,3 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+export const answer = 42;

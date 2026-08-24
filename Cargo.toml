@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/sako-cli",
+    "crates/sako-package",
     "crates/sako-v8",
 ]
 resolver = "3"
