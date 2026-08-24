@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -72,6 +73,48 @@ inline void Record(const char* name) {
   ++g_count;
 }
 
+// Buckets for phases that repeat too often to record one mark each. The HTTP
+// request path accumulates into these instead, so the report can show where a
+// request's time goes without one timestamp per phase per request surviving to
+// the end of the run.
+enum Bucket {
+  kBucketHttpMarshalRequest,
+  kBucketHttpHandler,
+  kBucketHttpMicrotasks,
+  kBucketHttpFinalize,
+  kBucketHttpMarshalResponse,
+  kBucketCount,
+};
+
+constexpr const char* kBucketNames[kBucketCount] = {
+    "http.marshal-request", "http.handler",         "http.microtasks",
+    "http.finalize",        "http.marshal-response",
+};
+
+int64_t g_bucket_counters[kBucketCount] = {};
+uint64_t g_bucket_events[kBucketCount] = {};
+
+// Times one phase of a repeating path. Constructing and destroying it costs
+// nothing while recording is off.
+class Span {
+ public:
+  explicit Span(Bucket bucket)
+      : bucket_(bucket), started_(g_enabled ? Counter() : 0) {}
+
+  ~Span() {
+    if (!g_enabled) return;
+    g_bucket_counters[bucket_] += Counter() - started_;
+    g_bucket_events[bucket_] += 1;
+  }
+
+  Span(const Span&) = delete;
+  Span& operator=(const Span&) = delete;
+
+ private:
+  Bucket bucket_;
+  int64_t started_;
+};
+
 }  // namespace sako_perf
 
 // Records phase marks from C++ hot-path-free startup code.
@@ -130,6 +173,23 @@ void sako_perf_report(void) {
         static_cast<double>(sako_perf::g_marks[index].counter - origin) * scale;
     snprintf(line, sizeof(line), "  %-28s %9.3f %9.3f\n",
              sako_perf::g_marks[index].name, delta, total);
+    report += line;
+  }
+  bool any_bucket = false;
+  for (int index = 0; index < sako_perf::kBucketCount; ++index) {
+    if (sako_perf::g_bucket_events[index] == 0) continue;
+    if (!any_bucket) {
+      report += "  --- repeating phases: total ms, microseconds each ---\n";
+      any_bucket = true;
+    }
+    const double total =
+        static_cast<double>(sako_perf::g_bucket_counters[index]) * scale;
+    const double each =
+        total * 1000.0 /
+        static_cast<double>(sako_perf::g_bucket_events[index]);
+    snprintf(line, sizeof(line), "  %-28s %9.3f %9.3f us x%llu\n",
+             sako_perf::kBucketNames[index], total, each,
+             static_cast<unsigned long long>(sako_perf::g_bucket_events[index]));
     report += line;
   }
   const HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
@@ -218,6 +278,33 @@ void WriteError(char* output, size_t capacity, const std::string& message) {
 std::string ToUtf8(v8::Isolate* isolate, v8::Local<v8::Value> value) {
   v8::String::Utf8Value utf8(isolate, value);
   return *utf8 == nullptr ? std::string() : std::string(*utf8, utf8.length());
+}
+
+// Encodes a JavaScript string straight into storage the caller already owns.
+//
+// v8::String::Utf8Value allocates its own buffer and a std::string copy of it
+// allocates a second, so every string handed across the boundary cost two
+// allocations and two copies. Writing into a reused std::string keeps its
+// capacity between calls, which matters on the HTTP response path where the
+// same handful of strings crosses once per request.
+bool ToUtf8Into(v8::Isolate* isolate, v8::Local<v8::Value> value,
+                std::string* output) {
+  if (!value->IsString()) {
+    v8::Local<v8::String> converted;
+    if (!value->ToString(isolate->GetCurrentContext()).ToLocal(&converted)) {
+      output->clear();
+      return false;
+    }
+    return ToUtf8Into(isolate, converted, output);
+  }
+  v8::Local<v8::String> text = value.As<v8::String>();
+  const size_t length = text->Utf8LengthV2(isolate);
+  output->resize(length);
+  if (length != 0) {
+    text->WriteUtf8V2(isolate, output->data(), length,
+                      v8::String::WriteFlags::kReplaceInvalidUtf8);
+  }
+  return true;
 }
 
 std::wstring Utf8ToWide(const std::string& value) {
@@ -3681,6 +3768,10 @@ class Runtime {
           isolate, reinterpret_cast<const char*>(bytes.data),
           v8::NewStringType::kNormal, static_cast<int>(bytes.length));
     };
+    std::optional<sako_perf::Span> marshal_request;
+    if (sako_perf::g_enabled) {
+      marshal_request.emplace(sako_perf::kBucketHttpMarshalRequest);
+    }
     v8::Local<v8::String> method_value;
     v8::Local<v8::String> target_value;
     v8::Local<v8::ArrayBuffer> body_buffer;
@@ -3759,20 +3850,43 @@ class Runtime {
     v8::Local<v8::Value> arguments[] = {
         binding->handler.Get(isolate), method_value, target_value, header_values,
         header_ranges, body_value, v8::Boolean::New(isolate, binding->secure)};
+    marshal_request.reset();
     v8::Local<v8::Value> result;
-    if (!dispatcher->Call(js_context, v8::Undefined(isolate), 7, arguments)
-             .ToLocal(&result) ||
-        !result->IsObject()) {
-      runtime->async_error_ = FormatException(isolate, js_context, try_catch);
-      return 1;
+    {
+      std::optional<sako_perf::Span> handler_span;
+      if (sako_perf::g_enabled) {
+        handler_span.emplace(sako_perf::kBucketHttpHandler);
+      }
+      if (!dispatcher->Call(js_context, v8::Undefined(isolate), 7, arguments)
+               .ToLocal(&result) ||
+          !result->IsObject()) {
+        runtime->async_error_ = FormatException(isolate, js_context, try_catch);
+        return 1;
+      }
     }
-    isolate->PerformMicrotaskCheckpoint();
+    {
+      std::optional<sako_perf::Span> microtask_span;
+      if (sako_perf::g_enabled) {
+        microtask_span.emplace(sako_perf::kBucketHttpMicrotasks);
+      }
+      isolate->PerformMicrotaskCheckpoint();
+    }
     v8::Local<v8::Value> finalized;
-    if (!runtime->http_finalizer_.Get(isolate)
-             ->Call(js_context, v8::Undefined(isolate), 1, &result)
-             .ToLocal(&finalized)) {
-      runtime->async_error_ = FormatException(isolate, js_context, try_catch);
-      return 1;
+    {
+      std::optional<sako_perf::Span> finalize_span;
+      if (sako_perf::g_enabled) {
+        finalize_span.emplace(sako_perf::kBucketHttpFinalize);
+      }
+      if (!runtime->http_finalizer_.Get(isolate)
+               ->Call(js_context, v8::Undefined(isolate), 1, &result)
+               .ToLocal(&finalized)) {
+        runtime->async_error_ = FormatException(isolate, js_context, try_catch);
+        return 1;
+      }
+    }
+    std::optional<sako_perf::Span> marshal_response;
+    if (sako_perf::g_enabled) {
+      marshal_response.emplace(sako_perf::kBucketHttpMarshalResponse);
     }
     // The finalizer returns [status, reason, headers, body]: reading four
     // array elements avoids creating and looking up four property names on
@@ -3800,9 +3914,9 @@ class Runtime {
       runtime->async_error_ = "HTTP dispatcher returned an invalid status";
       return 1;
     }
-    binding->response_reason = ToUtf8(isolate, reason);
+    ToUtf8Into(isolate, reason, &binding->response_reason);
     if (response_body->IsString()) {
-      binding->response_body = ToUtf8(isolate, response_body);
+      ToUtf8Into(isolate, response_body, &binding->response_body);
     } else {
       const uint8_t* bytes = nullptr;
       size_t length = 0;
@@ -3818,10 +3932,13 @@ class Runtime {
       return 1;
     }
     const size_t pair_count = pairs->Length() / 2;
-    binding->response_header_names.clear();
-    binding->response_header_values.clear();
-    binding->response_header_names.reserve(pair_count);
-    binding->response_header_values.reserve(pair_count);
+    // The name and value vectors are never shrunk, so a steady stream of
+    // responses with the same header set reuses every string's storage
+    // instead of allocating one per header per response.
+    if (binding->response_header_names.size() < pair_count) {
+      binding->response_header_names.resize(pair_count);
+      binding->response_header_values.resize(pair_count);
+    }
     for (uint32_t index = 0; index < pairs->Length(); index += 2) {
       v8::Local<v8::Value> name;
       v8::Local<v8::Value> value;
@@ -3830,8 +3947,8 @@ class Runtime {
         runtime->async_error_ = "cannot read HTTP response headers";
         return 1;
       }
-      binding->response_header_names.push_back(ToUtf8(isolate, name));
-      binding->response_header_values.push_back(ToUtf8(isolate, value));
+      ToUtf8Into(isolate, name, &binding->response_header_names[index / 2]);
+      ToUtf8Into(isolate, value, &binding->response_header_values[index / 2]);
     }
     binding->response_headers.clear();
     binding->response_headers.reserve(pair_count);
