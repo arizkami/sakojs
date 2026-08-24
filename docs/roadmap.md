@@ -26,6 +26,7 @@ Phase 1 exit criterion: Sako boots the supplied V8 build on Windows x64, runs th
 - [x] Support `sako app.js` and `sako run app.js` with script arguments.
 - [x] Support `sako eval`, `sako repl`, `sako --version`, and package-script dispatch.
 - [x] Establish the runtime bootstrap JS layer and basic globals, including bounded `fetch`, `Headers`, `Request`, and `Response` over native HTTP/HTTPS transport.
+- [x] Run bounded parser-backed TypeScript for `.ts`, `.mts`, `.cts`, and `.tsx` entries and transitive modules across ESM/CommonJS package scopes.
 - [x] Implement correct timers, cancellation, queued microtasks, and event-loop draining.
 - [x] Add structured JS/system error mapping and stable stack traces.
 - [x] Add startup, exception, timer, and microtask integration tests.

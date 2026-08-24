@@ -8,6 +8,7 @@ members = [
     "crates/sako-package",
     "crates/sako-platform",
     "crates/sako-process",
+    "crates/sako-typescript",
     "crates/sako-v8",
 ]
 resolver = "3"

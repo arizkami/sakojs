@@ -351,7 +351,7 @@
   };
 
   class EventEmitter {
-    constructor() { this._events = new Map(); }
+    constructor() { this._events = null; }
     on(name, listener) {
       if (typeof listener !== "function") throw new TypeError("listener must be a function");
       if (!this._events) this._events = new Map();
@@ -378,16 +378,20 @@
       return this;
     }
     emit(name, ...args) {
-      const listeners = this._events?.get(name);
-      if (!listeners || listeners.length === 0) {
+      const listeners = this._events === null ? undefined : this._events.get(name);
+      if (listeners === undefined || listeners.length === 0) {
         if (name === "error") throw args[0] instanceof Error ? args[0] : new Error(String(args[0]));
         return false;
       }
-      for (const listener of listeners.slice()) listener.apply(this, args);
+      if (listeners.length === 1) listeners[0].apply(this, args);
+      else for (const listener of listeners.slice()) listener.apply(this, args);
       return true;
     }
     listeners(name) { return (this._events?.get(name) || []).map((item) => item.listener || item); }
-    listenerCount(name) { return (this._events?.get(name) || []).length; }
+    listenerCount(name) {
+      const listeners = this._events === null ? undefined : this._events.get(name);
+      return listeners === undefined ? 0 : listeners.length;
+    }
   }
 
   console.error = console.error || console.log;
@@ -819,7 +823,43 @@
       this.complete = true;
       this.readable = true;
       this.readableEnded = false;
+      this._headerBytes = undefined;
+      this._headerRanges = undefined;
+      this._rawHeaders = undefined;
+      this._normalizedHeaders = undefined;
     }
+    // Request headers stay as the bytes the parser produced until something
+    // asks for them, so a handler that ignores headers never decodes any.
+    get rawHeaders() {
+      if (this._rawHeaders !== undefined) return this._rawHeaders;
+      const bytes = this._headerBytes;
+      const ranges = this._headerRanges;
+      const values = [];
+      if (ranges !== undefined) {
+        for (let index = 0; index < ranges.length; index += 4) {
+          values.push(
+            __sakoDecodeUtf8(bytes.subarray(ranges[index], ranges[index] + ranges[index + 1])),
+            __sakoDecodeUtf8(bytes.subarray(ranges[index + 2], ranges[index + 2] + ranges[index + 3])),
+          );
+        }
+      }
+      this._rawHeaders = values;
+      return values;
+    }
+    set rawHeaders(value) { this._rawHeaders = value; }
+    get headers() {
+      if (this._normalizedHeaders !== undefined) return this._normalizedHeaders;
+      const normalized = Object.create(null);
+      const values = this.rawHeaders;
+      for (let index = 0; index < values.length; index += 2) {
+        const name = values[index].toLowerCase();
+        const value = values[index + 1];
+        normalized[name] = normalized[name] === undefined ? value : `${normalized[name]}, ${value}`;
+      }
+      this._normalizedHeaders = normalized;
+      return normalized;
+    }
+    set headers(value) { this._normalizedHeaders = value; }
     resume() { return this; }
     pipe(destination) { return destination; }
     unpipe() { return this; }
@@ -859,7 +899,14 @@
     write(chunk, encoding) {
       if (this.writableEnded) throw new Error("write after end");
       this.headersSent = true;
-      if (chunk !== undefined) this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding));
+      if (chunk === undefined) return true;
+      // A plain UTF-8 string is handed to the native encoder as-is; converting
+      // it to a Buffer here would copy the body an extra time per response.
+      if (typeof chunk === "string" && (encoding === undefined || encoding === "utf8" || encoding === "utf-8")) {
+        this._chunks.push(chunk);
+      } else {
+        this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding));
+      }
       return true;
     }
     end(chunk, encoding, callback) {
@@ -1110,6 +1157,8 @@
     options,
   );
 
+  const plainSocket = { remoteAddress: "127.0.0.1", encrypted: false };
+  const secureSocket = { remoteAddress: "127.0.0.1", encrypted: true };
   Object.defineProperty(globalThis, "__sakoDispatchHttpRequest", {
     value(handler, method, target, headerBytes, headerRanges, requestBody, secure = false) {
       const request = new IncomingMessage();
@@ -1118,52 +1167,28 @@
       request.httpVersion = "1.1";
       request.httpVersionMajor = 1;
       request.httpVersionMinor = 1;
-      let rawHeaders;
-      let normalizedHeaders;
-      const materializeRawHeaders = () => {
-        if (rawHeaders !== undefined) return rawHeaders;
-        rawHeaders = [];
-        for (let index = 0; index < headerRanges.length; index += 4) {
-          rawHeaders.push(
-            __sakoDecodeUtf8(headerBytes.subarray(headerRanges[index], headerRanges[index] + headerRanges[index + 1])),
-            __sakoDecodeUtf8(headerBytes.subarray(headerRanges[index + 2], headerRanges[index + 2] + headerRanges[index + 3])),
-          );
-        }
-        return rawHeaders;
-      };
-      Object.defineProperty(request, "rawHeaders", {
-        enumerable: true,
-        get: materializeRawHeaders,
-        set: (value) => { rawHeaders = value; },
-      });
-      Object.defineProperty(request, "headers", {
-        enumerable: true,
-        get() {
-          if (normalizedHeaders !== undefined) return normalizedHeaders;
-          normalizedHeaders = Object.create(null);
-          const values = materializeRawHeaders();
-          for (let index = 0; index < values.length; index += 2) {
-            const name = values[index].toLowerCase();
-            const value = values[index + 1];
-            normalizedHeaders[name] = normalizedHeaders[name] === undefined ? value : `${normalizedHeaders[name]}, ${value}`;
-          }
-          return normalizedHeaders;
-        },
-        set: (value) => { normalizedHeaders = value; },
-      });
-      request.socket = request.connection = { remoteAddress: "127.0.0.1", encrypted: Boolean(secure) };
+      request._headerBytes = headerBytes;
+      request._headerRanges = headerRanges;
+      request.socket = request.connection = secure ? secureSocket : plainSocket;
       const response = new ServerResponse(request);
       response.socket = response.connection = request.socket;
       request.res = response;
       handler(request, response);
-      queueMicrotask(() => {
-        if (requestBody.length !== 0 && request.listenerCount("data") !== 0) {
-          request.emit("data", Buffer.from(requestBody));
-        }
+      // Only schedule the readable events a listener is waiting for; a handler
+      // that ignores the request body costs no microtask at all.
+      if (request.listenerCount("data") !== 0 || request.listenerCount("end") !== 0) {
+        queueMicrotask(() => {
+          if (requestBody.length !== 0 && request.listenerCount("data") !== 0) {
+            request.emit("data", Buffer.from(requestBody));
+          }
+          request.readable = false;
+          request.readableEnded = true;
+          request.emit("end");
+        });
+      } else {
         request.readable = false;
         request.readableEnded = true;
-        request.emit("end");
-      });
+      }
       return response;
     },
   });
@@ -1174,12 +1199,19 @@
       for (const [, [name, value]] of response._headers) {
         headers.push(name, Array.isArray(value) ? value.join(", ") : String(value));
       }
-      return {
-        status: response.statusCode,
-        reason: response.statusMessage || STATUS_CODES[response.statusCode] || "Unknown",
+      const chunks = response._chunks;
+      let body;
+      if (chunks.length === 0) body = "";
+      else if (chunks.length === 1) body = chunks[0];
+      else if (chunks.every((chunk) => typeof chunk === "string")) body = chunks.join("");
+      else body = Buffer.concat(chunks.map((chunk) => typeof chunk === "string" ? Buffer.from(chunk) : chunk));
+      // Positional: the native side reads [status, reason, headers, body].
+      return [
+        response.statusCode,
+        response.statusMessage || STATUS_CODES[response.statusCode] || "Unknown",
         headers,
-        body: Buffer.concat(response._chunks),
-      };
+        body,
+      ];
     },
   });
 

@@ -11,6 +11,7 @@ build = "build.rs"
 sako-http = { path = "../sako-http" }
 sako-net = { path = "../sako-net" }
 sako-process = { path = "../sako-process" }
+sako-typescript = { path = "../sako-typescript" }
 ureq = "2.12"
 
 [build-dependencies]

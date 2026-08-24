@@ -13,6 +13,7 @@ use std::time::Duration;
 use sako_http::{HttpResponse, HttpServer, HttpServerConfig, RequestHead};
 use sako_net::resolve_host;
 use sako_process::spawn_native_with_bounded_output;
+use sako_typescript::{OutputModuleKind, transpile};
 
 const ERROR_BUFFER_CAPACITY: usize = 16 * 1024;
 const MAXIMUM_DNS_RESULTS: usize = 16;
@@ -56,6 +57,85 @@ struct NativeFetchOutput {
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+struct NativeTypeScriptOutput {
+    source: Vec<u8>,
+}
+
+/// Transpiles one bounded TypeScript source for the native module loader.
+///
+/// # Safety
+/// `path` and `source` must describe readable UTF-8 ranges for this call.
+/// `error` follows the writable-buffer contract. The returned owner must be
+/// deleted exactly once with `sako_typescript_output_delete`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_typescript_transpile(
+    path: NativeBytes,
+    source: NativeBytes,
+    commonjs: c_int,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> *mut c_void {
+    let path = match copy_utf8(path, "TypeScript path") {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        Ok(_) => {
+            write_native_error(error, error_capacity, "TypeScript path is empty");
+            return std::ptr::null_mut();
+        }
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return std::ptr::null_mut();
+        }
+    };
+    let source = match copy_utf8(source, "TypeScript source") {
+        Ok(source) => source,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return std::ptr::null_mut();
+        }
+    };
+    let output_kind = if commonjs == 0 {
+        OutputModuleKind::Esm
+    } else {
+        OutputModuleKind::CommonJs
+    };
+    let source = match transpile(&path, &source, output_kind) {
+        Ok(source) => source.into_bytes(),
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    Box::into_raw(Box::new(NativeTypeScriptOutput { source })).cast()
+}
+
+/// Borrows the emitted JavaScript for a live TypeScript output.
+///
+/// # Safety
+/// `output` must remain live until the returned range is consumed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_typescript_output_source(output: *const c_void) -> NativeBytes {
+    // SAFETY: the caller upholds the live output pointer contract.
+    unsafe { output.cast::<NativeTypeScriptOutput>().as_ref() }.map_or(
+        NativeBytes {
+            data: std::ptr::null(),
+            length: 0,
+        },
+        |output| native_bytes(&output.source),
+    )
+}
+
+/// Deletes one TypeScript transpilation output owner.
+///
+/// # Safety
+/// `output` must be null or uniquely owned from `sako_typescript_transpile`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_typescript_output_delete(output: *mut c_void) {
+    if !output.is_null() {
+        // SAFETY: ownership is returned exactly once by the native loader.
+        drop(unsafe { Box::from_raw(output.cast::<NativeTypeScriptOutput>()) });
+    }
 }
 
 /// Executes one bounded HTTP/HTTPS request for the JavaScript Fetch surface.
@@ -667,6 +747,32 @@ pub unsafe extern "C" fn sako_http_server_tick(
             write_native_error(error, error_capacity, &cause.to_string());
             -1
         }
+    }
+}
+
+/// Blocks until an HTTP server has socket activity or `timeout_milliseconds`
+/// elapses, returning the number of completions applied.
+///
+/// The event loop calls this instead of sleeping between ticks so an arriving
+/// request wakes the runtime immediately.
+///
+/// # Safety
+/// `server` must be a live pointer returned by `sako_http_server_new` and may
+/// not be aliased by another tick/wait/delete call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_http_server_wait(
+    server: *mut c_void,
+    timeout_milliseconds: u32,
+) -> c_int {
+    // SAFETY: the caller upholds the live, uniquely borrowed server contract.
+    let Some(server) = (unsafe { server.cast::<NativeHttpServer>().as_mut() }) else {
+        return -1;
+    };
+    match server.server.wait(std::time::Duration::from_millis(
+        timeout_milliseconds.into(),
+    )) {
+        Ok(applied) => c_int::try_from(applied).unwrap_or(c_int::MAX),
+        Err(_) => -1,
     }
 }
 

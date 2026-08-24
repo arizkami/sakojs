@@ -470,5 +470,5 @@ fn finish_diagnostics(runtime: &Runtime, options: DiagnosticsOptions) -> Result<
 }
 
 fn usage() -> String {
-    "usage: sako [--memory-stats] [--detect-leaks] [--workers=N|auto] <script.js> [args...] | run <script|name> | eval <source> | repl | install | add <package> | remove <package> | update | --version".into()
+    "usage: sako [--memory-stats] [--detect-leaks] [--workers=N|auto] <script.js|script.ts> [args...] | run <script|name> | eval <source> | repl | install | add <package> | remove <package> | update | --version".into()
 }

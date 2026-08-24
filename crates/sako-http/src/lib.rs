@@ -6,6 +6,7 @@ use std::io::{self, BufReader, Cursor, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::{ServerConfig, ServerConnection};
 use sako_net::{ConnectionId, TcpAcceptor, TcpServerConfig};
@@ -128,6 +129,17 @@ pub fn parse_request_head(
     source: &[u8],
     limits: ParserLimits,
 ) -> Result<ParsedRequest<'_>, ParseError> {
+    parse_request_head_with(source, limits, Vec::new())
+}
+
+/// Parses a request head, reusing `headers` as the range storage so a busy
+/// connection does not allocate a fresh header vector per request.
+fn parse_request_head_with(
+    source: &[u8],
+    limits: ParserLimits,
+    mut headers: Vec<HeaderRange>,
+) -> Result<ParsedRequest<'_>, ParseError> {
+    headers.clear();
     let head_end = find_sequence(source, b"\r\n\r\n").ok_or({
         if source.len() >= limits.maximum_head_bytes {
             ParseError::HeadTooLarge
@@ -175,7 +187,7 @@ pub fn parse_request_head(
         _ => return Err(ParseError::UnsupportedVersion),
     };
 
-    let mut headers = Vec::with_capacity(limits.maximum_headers.min(16));
+    headers.reserve(limits.maximum_headers.min(16));
     let mut cursor = request_line_end + 2;
     while cursor < head_end {
         if headers.len() >= limits.maximum_headers {
@@ -257,9 +269,35 @@ pub fn encode_response(
     body: &[u8],
     maximum_bytes: usize,
 ) -> Result<Vec<u8>, ParseError> {
+    let mut output = Vec::with_capacity(128_usize.saturating_add(body.len()));
+    encode_response_into(
+        &mut output,
+        status,
+        reason,
+        headers.iter().map(|(name, value)| (*name, *value)),
+        body,
+        maximum_bytes,
+    )?;
+    Ok(output)
+}
+
+/// Appends an encoded response to `output`, which lets a connection reuse one
+/// response buffer instead of allocating per request. Nothing is appended when
+/// the response is rejected.
+fn encode_response_into<'a, H>(
+    output: &mut Vec<u8>,
+    status: u16,
+    reason: &str,
+    headers: H,
+    body: &[u8],
+    maximum_bytes: usize,
+) -> Result<(), ParseError>
+where
+    H: Iterator<Item = (&'a str, &'a str)> + Clone,
+{
     if !(100..=999).contains(&status)
         || reason.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
-        || headers.iter().any(|(name, value)| {
+        || headers.clone().any(|(name, value)| {
             name.is_empty()
                 || !name.bytes().all(is_token)
                 || value.bytes().any(|byte| matches!(byte, b'\r' | b'\n'))
@@ -269,20 +307,42 @@ pub fn encode_response(
     {
         return Err(ParseError::InvalidHeader);
     }
-    let mut output = Vec::with_capacity(128_usize.saturating_add(body.len()));
-    output.extend_from_slice(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes());
+    let start = output.len();
+    output.extend_from_slice(b"HTTP/1.1 ");
+    write_integer(output, status as u64);
+    output.push(b' ');
+    output.extend_from_slice(reason.as_bytes());
+    output.extend_from_slice(b"\r\n");
     for (name, value) in headers {
         output.extend_from_slice(name.as_bytes());
         output.extend_from_slice(b": ");
         output.extend_from_slice(value.as_bytes());
         output.extend_from_slice(b"\r\n");
     }
-    output.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+    output.extend_from_slice(b"Content-Length: ");
+    write_integer(output, body.len() as u64);
+    output.extend_from_slice(b"\r\n\r\n");
     output.extend_from_slice(body);
-    if output.len() > maximum_bytes {
+    if output.len() - start > maximum_bytes {
+        output.truncate(start);
         return Err(ParseError::HeadTooLarge);
     }
-    Ok(output)
+    Ok(())
+}
+
+fn write_integer(output: &mut Vec<u8>, value: u64) {
+    let mut digits = [0_u8; 20];
+    let mut cursor = digits.len();
+    let mut remaining = value;
+    loop {
+        cursor -= 1;
+        digits[cursor] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    output.extend_from_slice(&digits[cursor..]);
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +388,7 @@ impl Default for HttpServerConfig {
 #[derive(Default)]
 struct HttpConnection {
     input: Vec<u8>,
+    consumed: usize,
     output: Vec<u8>,
     written: usize,
     wire_output: Vec<u8>,
@@ -342,7 +403,18 @@ pub struct HttpServer {
     connections: BTreeMap<ConnectionId, HttpConnection>,
     config: HttpServerConfig,
     tls: Option<Arc<ServerConfig>>,
+    /// Scratch state reused across ticks so a busy server allocates nothing per
+    /// request: the connection identifiers to service, the ones to close, the
+    /// TLS plaintext staging buffer, and the request parser's header ranges.
+    active: Vec<ConnectionId>,
+    closing: Vec<ConnectionId>,
+    tls_scratch: Vec<u8>,
+    header_scratch: Vec<HeaderRange>,
 }
+
+/// Requests dispatched for one connection in a single tick before the server
+/// moves on, so a pipelining client cannot starve its peers.
+const MAXIMUM_REQUESTS_PER_TICK: usize = 64;
 
 impl HttpServer {
     pub fn bind(address: impl ToSocketAddrs, config: HttpServerConfig) -> io::Result<Self> {
@@ -362,6 +434,10 @@ impl HttpServer {
             connections: BTreeMap::new(),
             config,
             tls: None,
+            active: Vec::new(),
+            closing: Vec::new(),
+            tls_scratch: Vec::new(),
+            header_scratch: Vec::new(),
         })
     }
 
@@ -422,10 +498,18 @@ impl HttpServer {
         self.tick_with_body(|request, _body| handler(request))
     }
 
+    /// Blocks for up to `timeout` waiting for socket activity. The event loop
+    /// calls this instead of sleeping so a request that arrives mid-wait wakes
+    /// the runtime immediately rather than at the next timer tick.
+    pub fn wait(&mut self, timeout: Duration) -> io::Result<usize> {
+        self.tcp.poll_io(timeout)
+    }
+
     pub fn tick_with_body<F>(&mut self, mut handler: F) -> io::Result<usize>
     where
         F: FnMut(&RequestHead<'_>, &[u8]) -> HttpResponse,
     {
+        self.tcp.poll_io(Duration::ZERO)?;
         for id in self.tcp.accept_ready()? {
             let tls = self
                 .tls
@@ -447,10 +531,17 @@ impl HttpServer {
             );
         }
 
+        let config = self.config;
         let mut handled = 0;
-        let mut closing = Vec::new();
-        let ids = self.connections.keys().copied().collect::<Vec<_>>();
-        for id in ids {
+        let mut closing = std::mem::take(&mut self.closing);
+        let mut active = std::mem::take(&mut self.active);
+        let mut headers = std::mem::take(&mut self.header_scratch);
+        let mut scratch = std::mem::take(&mut self.tls_scratch);
+        closing.clear();
+        active.clear();
+        active.extend(self.connections.keys().copied());
+
+        for id in active.iter().copied() {
             let Some(connection) = self.connections.get_mut(&id) else {
                 continue;
             };
@@ -466,7 +557,7 @@ impl HttpServer {
                     .write_all(&connection.output)?;
                 connection.output.clear();
                 connection.written = 0;
-                drain_tls_output(connection, self.config.maximum_response_bytes)?;
+                drain_tls_output(connection, config.maximum_response_bytes)?;
             }
             if connection.tls.is_some()
                 && connection.close_after_write
@@ -475,37 +566,10 @@ impl HttpServer {
             {
                 connection.tls.as_mut().unwrap().send_close_notify();
                 connection.tls_close_notify_sent = true;
-                drain_tls_output(connection, self.config.maximum_response_bytes)?;
+                drain_tls_output(connection, config.maximum_response_bytes)?;
             }
-            if connection.tls.is_some() {
-                if connection.wire_written < connection.wire_output.len() {
-                    match self
-                        .tcp
-                        .write(id, &connection.wire_output[connection.wire_written..])
-                    {
-                        Ok(0) => closing.push(id),
-                        Ok(bytes) => connection.wire_written += bytes,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(_) => closing.push(id),
-                    }
-                    if connection.wire_written < connection.wire_output.len() {
-                        continue;
-                    }
-                    connection.wire_output.clear();
-                    connection.wire_written = 0;
-                }
-            } else if connection.written < connection.output.len() {
-                match self.tcp.write(id, &connection.output[connection.written..]) {
-                    Ok(0) => closing.push(id),
-                    Ok(bytes) => connection.written += bytes,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => closing.push(id),
-                }
-                if connection.written < connection.output.len() {
-                    continue;
-                }
-                connection.output.clear();
-                connection.written = 0;
+            if !flush_connection(&mut self.tcp, id, connection, &mut closing) {
+                continue;
             }
             if connection.close_after_write
                 && connection.output.is_empty()
@@ -515,160 +579,253 @@ impl HttpServer {
                 continue;
             }
 
-            let maximum_input_bytes = self
-                .config
+            let maximum_input_bytes = config
                 .parser
                 .maximum_head_bytes
-                .saturating_add(self.config.maximum_request_body_bytes);
-            let remaining = maximum_input_bytes.saturating_sub(connection.input.len());
+                .saturating_add(config.maximum_request_body_bytes);
+            let buffered = connection.input.len() - connection.consumed;
+            let remaining = maximum_input_bytes.saturating_sub(buffered);
             if remaining != 0 {
-                let read_length = if connection.tls.is_some() {
-                    self.config.read_chunk_bytes
-                } else {
-                    remaining.min(self.config.read_chunk_bytes)
-                };
-                let mut buffer = vec![0_u8; read_length];
-                match self.tcp.read(id, &mut buffer) {
-                    Ok(0) => {
-                        closing.push(id);
-                        continue;
+                if let Some(tls) = connection.tls.as_mut() {
+                    if scratch.len() < config.read_chunk_bytes {
+                        scratch.resize(config.read_chunk_bytes, 0);
                     }
-                    Ok(bytes) if connection.tls.is_some() => {
-                        let tls = connection.tls.as_mut().unwrap();
-                        tls.read_tls(&mut Cursor::new(&buffer[..bytes]))?;
-                        tls.process_new_packets()
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                        let mut plaintext = [0_u8; 16 * 1024];
-                        loop {
-                            match tls.reader().read(&mut plaintext) {
-                                Ok(0) => break,
-                                Ok(count) => {
-                                    if connection.input.len().saturating_add(count)
-                                        > maximum_input_bytes
-                                    {
-                                        closing.push(id);
+                    match self.tcp.read(id, &mut scratch[..config.read_chunk_bytes]) {
+                        Ok(0) => {
+                            closing.push(id);
+                            continue;
+                        }
+                        Ok(bytes) => {
+                            tls.read_tls(&mut Cursor::new(&scratch[..bytes]))?;
+                            tls.process_new_packets().map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?;
+                            let mut plaintext = [0_u8; 16 * 1024];
+                            loop {
+                                match tls.reader().read(&mut plaintext) {
+                                    Ok(0) => break,
+                                    Ok(count) => {
+                                        if connection.input.len().saturating_add(count)
+                                            > maximum_input_bytes
+                                                .saturating_add(connection.consumed)
+                                        {
+                                            closing.push(id);
+                                            break;
+                                        }
+                                        connection.input.extend_from_slice(&plaintext[..count]);
+                                    }
+                                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                         break;
                                     }
-                                    connection.input.extend_from_slice(&plaintext[..count]);
+                                    Err(error) => return Err(error),
                                 }
-                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(error) => return Err(error),
                             }
+                            drain_tls_output(connection, config.maximum_response_bytes)?;
                         }
-                        drain_tls_output(connection, self.config.maximum_response_bytes)?;
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            closing.push(id);
+                            continue;
+                        }
                     }
-                    Ok(bytes) => connection.input.extend_from_slice(&buffer[..bytes]),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        closing.push(id);
-                        continue;
+                } else {
+                    match self.tcp.read_into(
+                        id,
+                        &mut connection.input,
+                        remaining,
+                        remaining.min(config.read_chunk_bytes),
+                    ) {
+                        Ok(0) => {
+                            closing.push(id);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => {
+                            closing.push(id);
+                            continue;
+                        }
                     }
                 }
             }
 
-            match parse_request_head(&connection.input, self.config.parser) {
-                Ok(parsed) => {
-                    let keep_alive = parsed.head.keep_alive();
-                    let unsupported_encoding = parsed.head.header(b"transfer-encoding").is_some();
-                    let content_length = match request_content_length(&parsed.head) {
-                        Ok(length) => length,
-                        Err(_) => {
-                            connection.output = encode_response(
-                                400,
-                                "Bad Request",
-                                &[("Connection", "close")],
-                                b"invalid content length",
-                                self.config.maximum_response_bytes,
-                            )
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                            connection.close_after_write = true;
-                            continue;
+            // Pipelined requests are answered into one buffer, so the loop also
+            // stops once that buffer reaches the response limit; the queued
+            // bytes have to reach the socket before more work is taken on.
+            let mut dispatched = 0;
+            while dispatched < MAXIMUM_REQUESTS_PER_TICK
+                && !connection.close_after_write
+                && connection.output.len() < config.maximum_response_bytes
+            {
+                let pending = &connection.input[connection.consumed..];
+                let parsed = match parse_request_head_with(pending, config.parser, headers) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        headers = Vec::new();
+                        if error == ParseError::Incomplete {
+                            break;
                         }
-                    };
-                    if content_length > self.config.maximum_request_body_bytes {
-                        connection.output = encode_response(
-                            413,
-                            "Payload Too Large",
-                            &[("Connection", "close")],
-                            b"request body too large",
-                            self.config.maximum_response_bytes,
+                        let (status, reason, body) = match error {
+                            ParseError::HeadTooLarge | ParseError::TooManyHeaders => (
+                                431,
+                                "Request Header Fields Too Large",
+                                &b"request head too large"[..],
+                            ),
+                            _ => (400, "Bad Request", &b"bad request"[..]),
+                        };
+                        encode_response_into(
+                            &mut connection.output,
+                            status,
+                            reason,
+                            [("Connection", "close")].into_iter(),
+                            body,
+                            config.maximum_response_bytes,
                         )
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                         connection.close_after_write = true;
-                        continue;
+                        break;
                     }
-                    let request_bytes = parsed.consumed.saturating_add(content_length);
-                    if connection.input.len() < request_bytes {
-                        continue;
-                    }
-                    let response = if unsupported_encoding {
-                        HttpResponse {
-                            status: 501,
-                            reason: "Not Implemented".into(),
-                            headers: Vec::new(),
-                            body: b"transfer encoding is not implemented".to_vec(),
-                        }
-                    } else {
-                        handler(
-                            &parsed.head,
-                            &connection.input[parsed.consumed..request_bytes],
+                };
+
+                let keep_alive = parsed.head.keep_alive();
+                let unsupported_encoding = parsed.head.header(b"transfer-encoding").is_some();
+                let content_length = match request_content_length(&parsed.head) {
+                    Ok(length) => length,
+                    Err(_) => {
+                        headers = parsed.head.headers;
+                        encode_response_into(
+                            &mut connection.output,
+                            400,
+                            "Bad Request",
+                            [("Connection", "close")].into_iter(),
+                            b"invalid content length",
+                            config.maximum_response_bytes,
                         )
-                    };
-                    let close_after_write = !keep_alive || unsupported_encoding;
-                    let mut response_headers = response.headers;
-                    if close_after_write
-                        && !response_headers
-                            .iter()
-                            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
-                    {
-                        response_headers.push(("Connection".into(), "close".into()));
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                        connection.close_after_write = true;
+                        break;
                     }
-                    let headers = response_headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str()))
-                        .collect::<Vec<_>>();
-                    connection.output = encode_response(
-                        response.status,
-                        &response.reason,
-                        &headers,
-                        &response.body,
-                        self.config.maximum_response_bytes,
-                    )
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    connection.input.drain(..request_bytes);
-                    connection.close_after_write = close_after_write;
-                    handled += 1;
-                }
-                Err(ParseError::Incomplete) => {}
-                Err(error) => {
-                    let (status, reason, body) = match error {
-                        ParseError::HeadTooLarge | ParseError::TooManyHeaders => (
-                            431,
-                            "Request Header Fields Too Large",
-                            &b"request head too large"[..],
-                        ),
-                        _ => (400, "Bad Request", &b"bad request"[..]),
-                    };
-                    connection.output = encode_response(
-                        status,
-                        reason,
-                        &[("Connection", "close")],
-                        body,
-                        self.config.maximum_response_bytes,
+                };
+                if content_length > config.maximum_request_body_bytes {
+                    headers = parsed.head.headers;
+                    encode_response_into(
+                        &mut connection.output,
+                        413,
+                        "Payload Too Large",
+                        [("Connection", "close")].into_iter(),
+                        b"request body too large",
+                        config.maximum_response_bytes,
                     )
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                     connection.close_after_write = true;
+                    break;
                 }
+                let request_bytes = parsed.consumed.saturating_add(content_length);
+                if pending.len() < request_bytes {
+                    headers = parsed.head.headers;
+                    break;
+                }
+                let response = if unsupported_encoding {
+                    HttpResponse {
+                        status: 501,
+                        reason: "Not Implemented".into(),
+                        headers: Vec::new(),
+                        body: b"transfer encoding is not implemented".to_vec(),
+                    }
+                } else {
+                    handler(&parsed.head, &pending[parsed.consumed..request_bytes])
+                };
+                headers = parsed.head.headers;
+                let close_after_write = !keep_alive || unsupported_encoding;
+                let close_header = close_after_write
+                    && !response
+                        .headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("connection"));
+                let encoded = encode_response_into(
+                    &mut connection.output,
+                    response.status,
+                    &response.reason,
+                    response
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str()))
+                        .chain(close_header.then_some(("Connection", "close"))),
+                    &response.body,
+                    config.maximum_response_bytes,
+                );
+                encoded.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                connection.consumed += request_bytes;
+                connection.close_after_write = close_after_write;
+                handled += 1;
+                dispatched += 1;
+            }
+
+            if connection.consumed == connection.input.len() {
+                connection.input.clear();
+                connection.consumed = 0;
+            } else if connection.consumed >= config.read_chunk_bytes {
+                connection.input.drain(..connection.consumed);
+                connection.consumed = 0;
+            }
+
+            if dispatched != 0 && connection.tls.is_none() {
+                flush_connection(&mut self.tcp, id, connection, &mut closing);
             }
         }
+
+        self.active = active;
+        self.header_scratch = headers;
+        self.tls_scratch = scratch;
         closing.sort_unstable();
         closing.dedup();
-        for id in closing {
+        for id in closing.drain(..) {
             self.connections.remove(&id);
             self.tcp.close(id);
         }
+        self.closing = closing;
         Ok(handled)
     }
+}
+
+/// Writes as much of a connection's queued output as the socket accepts,
+/// returning whether the queue drained completely.
+fn flush_connection(
+    tcp: &mut TcpAcceptor,
+    id: ConnectionId,
+    connection: &mut HttpConnection,
+    closing: &mut Vec<ConnectionId>,
+) -> bool {
+    if connection.tls.is_some() {
+        if connection.wire_written < connection.wire_output.len() {
+            match tcp.write(id, &connection.wire_output[connection.wire_written..]) {
+                Ok(0) => closing.push(id),
+                Ok(bytes) => connection.wire_written += bytes,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => closing.push(id),
+            }
+            if connection.wire_written < connection.wire_output.len() {
+                return false;
+            }
+            connection.wire_output.clear();
+            connection.wire_written = 0;
+        }
+        return true;
+    }
+    if connection.written < connection.output.len() {
+        match tcp.write(id, &connection.output[connection.written..]) {
+            Ok(0) => closing.push(id),
+            Ok(bytes) => connection.written += bytes,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => closing.push(id),
+        }
+        if connection.written < connection.output.len() {
+            return false;
+        }
+        connection.output.clear();
+        connection.written = 0;
+    }
+    true
 }
 
 fn drain_tls_output(

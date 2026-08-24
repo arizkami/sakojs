@@ -220,6 +220,63 @@ fn executes_commonjs_from_a_unicode_path() {
 }
 
 #[test]
+fn executes_typescript_across_module_modes_and_imports() {
+    let esm = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("typescript/main.ts"))
+        .output()
+        .expect("Sako TypeScript ESM should start");
+    assert!(
+        esm.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&esm.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&esm.stdout),
+        "typescript Sako fast 42 42 42 dynamic output\n"
+    );
+
+    let mts = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("typescript/entry.mts"))
+        .output()
+        .expect("Sako .mts should start");
+    assert!(mts.status.success());
+    assert_eq!(String::from_utf8_lossy(&mts.stdout), "mts\n");
+
+    let cts = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("typescript-commonjs.cts"))
+        .output()
+        .expect("Sako .cts should start");
+    assert!(cts.status.success());
+    assert_eq!(String::from_utf8_lossy(&cts.stdout), "cts\n");
+
+    let commonjs = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("typescript-commonjs/main.ts"))
+        .output()
+        .expect("Sako CommonJS-scoped .ts should start");
+    assert!(
+        commonjs.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&commonjs.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&commonjs.stdout),
+        "typescript-commonjs\n"
+    );
+}
+
+#[test]
+fn reports_typescript_syntax_errors_with_source_locations() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("typescript-broken.ts"))
+        .output()
+        .expect("Sako invalid TypeScript should start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("typescript-broken.ts"), "stderr: {stderr}");
+    assert!(stderr.contains("3:"), "stderr: {stderr}");
+}
+
+#[test]
 fn supports_initial_node_modules_and_web_globals() {
     let output_path =
         std::env::temp_dir().join(format!("sako-node-core-{}.txt", std::process::id()));

@@ -5,13 +5,14 @@
 #[cfg(not(windows))]
 compile_error!("sako-platform currently supports only Windows");
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::windows::io::{
-    AsHandle, AsRawHandle, AsRawSocket, AsSocket, BorrowedHandle, BorrowedSocket, FromRawHandle,
-    OwnedHandle, OwnedSocket,
+    AsHandle, AsRawHandle, AsRawSocket, BorrowedHandle, BorrowedSocket, FromRawHandle, OwnedHandle,
+    OwnedSocket,
 };
 use std::ptr::{self, NonNull};
 use std::time::Duration;
@@ -154,18 +155,67 @@ pub trait PlatformRuntime {
     fn wake(&mut self) -> Result<(), PostError>;
 }
 
+/// Hashes the integer keys the reactor uses — operation identifiers and
+/// OVERLAPPED addresses — by multiplication instead of SipHash. Both are
+/// already unique and unpredictable to anything outside the process, so the
+/// cryptographic mixing of the default hasher is pure overhead on a path that
+/// runs twice per socket operation.
+#[derive(Default)]
+pub struct IntegerHasher(u64);
+
+impl Hasher for IntegerHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(*byte)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+type IntegerMap<K, V> = HashMap<K, V, BuildHasherDefault<IntegerHasher>>;
+
+/// Completion entries fetched from the kernel in one `poll` call. The reactor
+/// keeps this array allocated for its lifetime instead of sizing it to the
+/// operation capacity on every poll.
+const MAXIMUM_POLL_ENTRIES: usize = 256;
+
+/// Receive and send buffers retained for reuse between operations.
+const MAXIMUM_POOLED_BUFFERS: usize = 512;
+
 pub struct IocpReactor {
     port: OwnedHandle,
     capacity: usize,
     pending_posts: usize,
     next_operation_id: u64,
-    operations: HashMap<usize, PendingOperation>,
-    completed_operations: VecDeque<OperationCompletion>,
+    operations: IntegerMap<usize, PendingOperation>,
+    operation_pointers: IntegerMap<u64, usize>,
+    completed_operations: IntegerMap<u64, OperationCompletion>,
+    entries: Vec<MaybeUninit<OverlappedEntry>>,
+    buffer_pool: Vec<Vec<u8>>,
+    // Each record must keep a stable address while the kernel owns it, so the
+    // pool stores individual boxes rather than one contiguous vector.
+    #[allow(clippy::vec_box)]
+    overlapped_pool: Vec<Box<NativeOverlapped>>,
 }
 
 enum OperationOwner {
     Handle(OwnedHandle),
     Socket(OwnedSocket),
+    /// A socket owned by the caller. Submitting against a borrowed socket keeps
+    /// the hot path free of the handle duplication an `OwnedSocket` requires;
+    /// the caller keeps the socket alive until the completion is drained.
+    BorrowedSocket(usize),
 }
 
 impl OperationOwner {
@@ -173,6 +223,7 @@ impl OperationOwner {
         match self {
             Self::Handle(handle) => handle.as_raw_handle(),
             Self::Socket(socket) => socket.as_raw_socket() as *mut c_void,
+            Self::BorrowedSocket(socket) => *socket as *mut c_void,
         }
     }
 }
@@ -203,13 +254,21 @@ impl IocpReactor {
         }
         // SAFETY: CreateIoCompletionPort returned a new owned HANDLE above.
         let port = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let entry_capacity = capacity.min(MAXIMUM_POLL_ENTRIES);
         Ok(Self {
             port,
             capacity,
             pending_posts: 0,
             next_operation_id: 1,
-            operations: HashMap::with_capacity(capacity),
-            completed_operations: VecDeque::with_capacity(capacity),
+            operations: IntegerMap::with_capacity_and_hasher(capacity, Default::default()),
+            operation_pointers: IntegerMap::with_capacity_and_hasher(capacity, Default::default()),
+            completed_operations: IntegerMap::with_capacity_and_hasher(
+                capacity,
+                Default::default(),
+            ),
+            entries: Vec::with_capacity(entry_capacity),
+            buffer_pool: Vec::new(),
+            overlapped_pool: Vec::new(),
         })
     }
 
@@ -311,7 +370,56 @@ impl IocpReactor {
         let id = operation.id;
         let pointer = operation.overlapped.as_ref() as *const NativeOverlapped as usize;
         self.operations.insert(pointer, operation);
+        self.operation_pointers.insert(id, pointer);
         id
+    }
+
+    /// Takes a buffer of exactly `length` bytes from the reuse pool, falling
+    /// back to a fresh allocation. Pooled buffers keep their initialized bytes,
+    /// so a reused receive buffer costs neither an allocation nor a zero fill.
+    pub fn acquire_buffer(&mut self, length: usize) -> Vec<u8> {
+        let mut buffer = match self.buffer_pool.pop() {
+            Some(buffer) if buffer.capacity() >= length => buffer,
+            Some(buffer) => {
+                self.recycle_buffer(buffer);
+                Vec::with_capacity(length)
+            }
+            None => Vec::with_capacity(length),
+        };
+        if buffer.len() < length {
+            buffer.resize(length, 0);
+        } else {
+            buffer.truncate(length);
+        }
+        buffer
+    }
+
+    /// Returns a completed operation's buffer to the reuse pool.
+    pub fn recycle_buffer(&mut self, buffer: Vec<u8>) {
+        if buffer.capacity() != 0 && self.buffer_pool.len() < MAXIMUM_POOLED_BUFFERS {
+            self.buffer_pool.push(buffer);
+        }
+    }
+
+    /// Takes an OVERLAPPED record from the reuse pool. Every submission needs
+    /// one at a stable address, so they are pooled rather than reallocated.
+    fn acquire_overlapped(&mut self, offset: u64) -> Box<NativeOverlapped> {
+        let mut overlapped = self
+            .overlapped_pool
+            .pop()
+            .unwrap_or_else(|| Box::new(NativeOverlapped::default()));
+        *overlapped = NativeOverlapped {
+            offset: offset as u32,
+            offset_high: (offset >> 32) as u32,
+            ..NativeOverlapped::default()
+        };
+        overlapped
+    }
+
+    fn recycle_overlapped(&mut self, overlapped: Box<NativeOverlapped>) {
+        if self.overlapped_pool.len() < MAXIMUM_POOLED_BUFFERS {
+            self.overlapped_pool.push(overlapped);
+        }
     }
 
     pub fn submit_file_read(
@@ -324,17 +432,15 @@ impl IocpReactor {
         self.reserve_operation()?;
         self.associate(handle.as_handle(), key)
             .map_err(PostError::System)?;
+        let buffer = self.acquire_buffer(length as usize);
+        let overlapped = self.acquire_overlapped(offset);
         let mut operation = PendingOperation {
             id: self.allocate_operation_id(),
             key,
             kind: OperationKind::FileRead,
             owner: OperationOwner::Handle(handle),
-            overlapped: Box::new(NativeOverlapped {
-                offset: offset as u32,
-                offset_high: (offset >> 32) as u32,
-                ..NativeOverlapped::default()
-            }),
-            buffer: vec![0; length as usize],
+            overlapped,
+            buffer,
         };
         let mut immediate = 0;
         // SAFETY: the operation owns the handle, stable OVERLAPPED allocation,
@@ -373,16 +479,13 @@ impl IocpReactor {
         })?;
         self.associate(handle.as_handle(), key)
             .map_err(PostError::System)?;
+        let overlapped = self.acquire_overlapped(offset);
         let mut operation = PendingOperation {
             id: self.allocate_operation_id(),
             key,
             kind: OperationKind::FileWrite,
             owner: OperationOwner::Handle(handle),
-            overlapped: Box::new(NativeOverlapped {
-                offset: offset as u32,
-                offset_high: (offset >> 32) as u32,
-                ..NativeOverlapped::default()
-            }),
+            overlapped,
             buffer,
         };
         let mut immediate = 0;
@@ -412,7 +515,7 @@ impl IocpReactor {
         key: usize,
         length: u32,
     ) -> Result<u64, PostError> {
-        self.submit_socket_receive_inner(socket, key, length, true)
+        self.submit_socket_receive_inner(OperationOwner::Socket(socket), key, length, true)
     }
 
     /// Submits a receive on a socket file object already associated with this IOCP.
@@ -423,32 +526,41 @@ impl IocpReactor {
     /// it belongs to another completion port, completion cannot be drained here.
     pub unsafe fn submit_associated_socket_receive(
         &mut self,
-        socket: OwnedSocket,
+        socket: BorrowedSocket<'_>,
         key: usize,
         length: u32,
     ) -> Result<u64, PostError> {
-        self.submit_socket_receive_inner(socket, key, length, false)
+        self.submit_socket_receive_inner(
+            OperationOwner::BorrowedSocket(socket.as_raw_socket() as usize),
+            key,
+            length,
+            false,
+        )
     }
 
     fn submit_socket_receive_inner(
         &mut self,
-        socket: OwnedSocket,
+        owner: OperationOwner,
         key: usize,
         length: u32,
         associate: bool,
     ) -> Result<u64, PostError> {
         self.reserve_operation()?;
         if associate {
-            self.associate_socket(socket.as_socket(), key)
+            // SAFETY: the owner holds a live socket for the duration of this call.
+            let socket = unsafe { BorrowedSocket::borrow_raw(owner.raw_handle() as _) };
+            self.associate_socket(socket, key)
                 .map_err(PostError::System)?;
         }
+        let buffer = self.acquire_buffer(length as usize);
+        let overlapped = self.acquire_overlapped(0);
         let mut operation = PendingOperation {
             id: self.allocate_operation_id(),
             key,
             kind: OperationKind::SocketReceive,
-            owner: OperationOwner::Socket(socket),
-            overlapped: Box::new(NativeOverlapped::default()),
-            buffer: vec![0; length as usize],
+            owner,
+            overlapped,
+            buffer,
         };
         let mut wsa_buffer = WsaBuffer {
             length,
@@ -485,7 +597,7 @@ impl IocpReactor {
         key: usize,
         buffer: Vec<u8>,
     ) -> Result<u64, PostError> {
-        self.submit_socket_send_inner(socket, key, buffer, true)
+        self.submit_socket_send_inner(OperationOwner::Socket(socket), key, buffer, true)
     }
 
     /// Submits a send on a socket file object already associated with this IOCP.
@@ -496,16 +608,21 @@ impl IocpReactor {
     /// it belongs to another completion port, completion cannot be drained here.
     pub unsafe fn submit_associated_socket_send(
         &mut self,
-        socket: OwnedSocket,
+        socket: BorrowedSocket<'_>,
         key: usize,
         buffer: Vec<u8>,
     ) -> Result<u64, PostError> {
-        self.submit_socket_send_inner(socket, key, buffer, false)
+        self.submit_socket_send_inner(
+            OperationOwner::BorrowedSocket(socket.as_raw_socket() as usize),
+            key,
+            buffer,
+            false,
+        )
     }
 
     fn submit_socket_send_inner(
         &mut self,
-        socket: OwnedSocket,
+        owner: OperationOwner,
         key: usize,
         buffer: Vec<u8>,
         associate: bool,
@@ -518,15 +635,18 @@ impl IocpReactor {
             ))
         })?;
         if associate {
-            self.associate_socket(socket.as_socket(), key)
+            // SAFETY: the owner holds a live socket for the duration of this call.
+            let socket = unsafe { BorrowedSocket::borrow_raw(owner.raw_handle() as _) };
+            self.associate_socket(socket, key)
                 .map_err(PostError::System)?;
         }
+        let overlapped = self.acquire_overlapped(0);
         let mut operation = PendingOperation {
             id: self.allocate_operation_id(),
             key,
             kind: OperationKind::SocketSend,
-            owner: OperationOwner::Socket(socket),
-            overlapped: Box::new(NativeOverlapped::default()),
+            owner,
+            overlapped,
             buffer,
         };
         let mut wsa_buffer = WsaBuffer {
@@ -559,9 +679,9 @@ impl IocpReactor {
 
     pub fn cancel_operation(&self, id: u64) -> io::Result<bool> {
         let Some(operation) = self
-            .operations
-            .values()
-            .find(|operation| operation.id == id)
+            .operation_pointers
+            .get(&id)
+            .and_then(|pointer| self.operations.get(pointer))
         else {
             return Ok(false);
         };
@@ -584,22 +704,40 @@ impl IocpReactor {
     }
 
     pub fn take_operation_completion(&mut self, id: u64) -> Option<OperationCompletion> {
-        let index = self
-            .completed_operations
-            .iter()
-            .position(|completion| completion.id == id)?;
-        self.completed_operations.remove(index)
+        self.completed_operations.remove(&id)
     }
 }
 
-impl PlatformRuntime for IocpReactor {
-    fn poll(&mut self, timeout: Duration, maximum: usize) -> io::Result<Vec<Completion>> {
-        let count = maximum.min(self.capacity).min(u32::MAX as usize);
+impl IocpReactor {
+    /// Waits up to `timeout` for completions and files each one against its
+    /// pending operation. Returns the number of entries the kernel reported.
+    ///
+    /// `completed` collects the operation identifiers that finished, which lets
+    /// callers dispatch without scanning their own connection tables.
+    pub fn poll_operations(
+        &mut self,
+        timeout: Duration,
+        maximum: usize,
+        completed: &mut Vec<u64>,
+    ) -> io::Result<usize> {
+        self.drain_port(timeout, maximum, None, Some(completed))
+    }
+
+    fn drain_port(
+        &mut self,
+        timeout: Duration,
+        maximum: usize,
+        mut reported: Option<&mut Vec<Completion>>,
+        mut completed: Option<&mut Vec<u64>>,
+    ) -> io::Result<usize> {
+        let count = maximum.min(self.entries.capacity()).min(u32::MAX as usize);
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
         let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
-        let mut entries = Vec::<MaybeUninit<OverlappedEntry>>::with_capacity(count);
+        // The entry array lives for the reactor's lifetime; move it aside so the
+        // completion bookkeeping below can borrow the reactor mutably.
+        let mut entries = std::mem::take(&mut self.entries);
         let mut removed = 0_u32;
         // SAFETY: entries has storage for count values and Windows initializes the
         // first `removed` entries on success. The port remains live for this call.
@@ -615,8 +753,10 @@ impl PlatformRuntime for IocpReactor {
         };
         if result == 0 {
             let error = io::Error::last_os_error();
+            entries.clear();
+            self.entries = entries;
             if error.raw_os_error() == Some(WAIT_TIMEOUT) {
-                return Ok(Vec::new());
+                return Ok(0);
             }
             return Err(error);
         }
@@ -624,38 +764,52 @@ impl PlatformRuntime for IocpReactor {
         // entries, which cannot exceed the supplied count.
         unsafe { entries.set_len(removed as usize) };
         let mut manual_completions = 0_usize;
-        let completions = entries
-            .into_iter()
-            .map(|entry| {
-                // SAFETY: every vector element is among the initialized entries.
-                let entry = unsafe { entry.assume_init() };
-                let pointer = NonNull::new(entry.overlapped);
-                if let Some(pointer) = pointer {
-                    if let Some(operation) = self.operations.remove(&(pointer.as_ptr() as usize)) {
-                        self.completed_operations.push_back(OperationCompletion {
+        for entry in &entries {
+            // SAFETY: every element below `removed` was initialized by Windows.
+            let entry = unsafe { entry.assume_init_ref() };
+            let pointer = NonNull::new(entry.overlapped);
+            match pointer.and_then(|pointer| self.operations.remove(&(pointer.as_ptr() as usize))) {
+                Some(operation) => {
+                    self.operation_pointers.remove(&operation.id);
+                    self.recycle_overlapped(operation.overlapped);
+                    if let Some(completed) = completed.as_deref_mut() {
+                        completed.push(operation.id);
+                    }
+                    self.completed_operations.insert(
+                        operation.id,
+                        OperationCompletion {
                             id: operation.id,
                             key: operation.key,
                             kind: operation.kind,
                             bytes_transferred: entry.bytes_transferred,
                             status: entry.internal,
                             buffer: operation.buffer,
-                        });
-                    } else {
-                        manual_completions += 1;
-                    }
-                } else {
-                    manual_completions += 1;
+                        },
+                    );
                 }
-                Completion {
+                None => manual_completions += 1,
+            }
+            if let Some(reported) = reported.as_deref_mut() {
+                reported.push(Completion {
                     key: entry.completion_key,
                     bytes_transferred: entry.bytes_transferred,
                     overlapped: pointer,
                     status: entry.internal,
-                }
-            })
-            .collect();
+                });
+            }
+        }
+        entries.clear();
+        self.entries = entries;
         self.pending_posts = self.pending_posts.saturating_sub(manual_completions);
-        Ok(completions)
+        Ok(removed as usize)
+    }
+}
+
+impl PlatformRuntime for IocpReactor {
+    fn poll(&mut self, timeout: Duration, maximum: usize) -> io::Result<Vec<Completion>> {
+        let mut reported = Vec::new();
+        self.drain_port(timeout, maximum, Some(&mut reported), None)?;
+        Ok(reported)
     }
 
     fn wake(&mut self) -> Result<(), PostError> {
@@ -673,8 +827,10 @@ impl Drop for IocpReactor {
         for id in ids {
             let _ = self.cancel_operation(id);
         }
+        let mut completed = Vec::new();
         while !self.operations.is_empty() {
-            let _ = self.poll(Duration::from_millis(100), self.capacity);
+            let _ = self.poll_operations(Duration::from_millis(100), self.capacity, &mut completed);
+            completed.clear();
         }
     }
 }

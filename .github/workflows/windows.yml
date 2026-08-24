@@ -21,8 +21,8 @@ jobs:
         with:
           components: clippy,rustfmt
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p sako-accel -p sako-diagnostics -p sako-http -p sako-net -p sako-package -p sako-platform -p sako-process --all-targets -- -D warnings
-      - run: cargo test -p sako-accel -p sako-diagnostics -p sako-http -p sako-net -p sako-package -p sako-platform -p sako-process
+      - run: cargo clippy -p sako-accel -p sako-diagnostics -p sako-http -p sako-net -p sako-package -p sako-platform -p sako-process -p sako-typescript --all-targets -- -D warnings
+      - run: cargo test -p sako-accel -p sako-diagnostics -p sako-http -p sako-net -p sako-package -p sako-platform -p sako-process -p sako-typescript
 
   runtime:
     runs-on: windows-2025

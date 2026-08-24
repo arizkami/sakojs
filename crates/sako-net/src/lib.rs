@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::windows::io::AsSocket;
+use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket};
 use std::time::Duration;
 
-use sako_platform::{IocpReactor, PlatformRuntime, PostError};
+use sako_platform::{IocpReactor, PostError};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId {
@@ -53,9 +54,13 @@ struct TcpConnection {
 }
 
 pub struct TcpAcceptor {
+    // The reactor is declared first so it is dropped first: draining its
+    // in-flight operations requires the connection sockets to still be open.
+    reactor: IocpReactor,
     listener: TcpListener,
     connections: ConnectionSlab<TcpConnection>,
-    reactor: IocpReactor,
+    operation_owners: HashMap<u64, ConnectionId>,
+    completed: Vec<u64>,
     maximum_accepts_per_tick: usize,
     rejected_connections: u64,
     accepting: bool,
@@ -79,9 +84,11 @@ impl TcpAcceptor {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "I/O capacity overflow"))?;
         let reactor = IocpReactor::new(operation_capacity)?;
         Ok(Self {
+            reactor,
             listener,
             connections,
-            reactor,
+            operation_owners: HashMap::with_capacity(operation_capacity),
+            completed: Vec::with_capacity(operation_capacity.min(256)),
             maximum_accepts_per_tick: config.maximum_accepts_per_tick,
             rejected_connections: 0,
             accepting: true,
@@ -93,7 +100,6 @@ impl TcpAcceptor {
     }
 
     pub fn accept_ready(&mut self) -> io::Result<Vec<ConnectionId>> {
-        self.drain_completions()?;
         if !self.accepting {
             return Ok(Vec::new());
         }
@@ -156,7 +162,6 @@ impl TcpAcceptor {
     }
 
     pub fn read(&mut self, id: ConnectionId, buffer: &mut [u8]) -> io::Result<usize> {
-        self.drain_completions()?;
         let connection = self.live_connection_mut(id)?;
         if connection.failed {
             return Err(io::Error::new(
@@ -169,33 +174,87 @@ impl TcpAcceptor {
             let length = available.len().min(buffer.len());
             buffer[..length].copy_from_slice(&available[..length]);
             connection.ready_read_offset += length;
-            if connection.ready_read_offset == connection.ready_read.len() {
-                connection.ready_read.clear();
-                connection.ready_read_offset = 0;
-            }
+            self.release_consumed_read(id);
             return Ok(length);
         }
         if connection.read_closed || buffer.is_empty() {
             return Ok(0);
         }
-        if connection.pending_read.is_some() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        let socket = connection.stream.try_clone()?.into();
-        let length = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-        // SAFETY: accept_ready associated this connection's socket file object
-        // with this reactor. try_clone duplicates that same file object.
-        let operation = unsafe {
-            self.reactor
-                .submit_associated_socket_receive(socket, id.completion_key(), length)
-        }
-        .map_err(post_error)?;
-        self.connections.get_mut(id).unwrap().pending_read = Some(operation);
+        self.submit_receive(id, buffer.len())?;
         Err(io::ErrorKind::WouldBlock.into())
     }
 
+    /// Appends up to `limit` received bytes to `output` without staging them in
+    /// a caller-owned scratch buffer, submitting a `chunk`-sized receive when no
+    /// buffered bytes remain.
+    pub fn read_into(
+        &mut self,
+        id: ConnectionId,
+        output: &mut Vec<u8>,
+        limit: usize,
+        chunk: usize,
+    ) -> io::Result<usize> {
+        let connection = self.live_connection_mut(id)?;
+        if connection.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "overlapped receive failed",
+            ));
+        }
+        if connection.ready_read_offset < connection.ready_read.len() {
+            let available = &connection.ready_read[connection.ready_read_offset..];
+            let length = available.len().min(limit);
+            output.extend_from_slice(&available[..length]);
+            connection.ready_read_offset += length;
+            self.release_consumed_read(id);
+            return Ok(length);
+        }
+        if connection.read_closed {
+            return Ok(0);
+        }
+        if limit == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.submit_receive(id, chunk)?;
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+
+    fn release_consumed_read(&mut self, id: ConnectionId) {
+        let Some(connection) = self.connections.get_mut(id) else {
+            return;
+        };
+        if connection.ready_read_offset != connection.ready_read.len() {
+            return;
+        }
+        let buffer = std::mem::take(&mut connection.ready_read);
+        connection.ready_read_offset = 0;
+        self.reactor.recycle_buffer(buffer);
+    }
+
+    fn submit_receive(&mut self, id: ConnectionId, length: usize) -> io::Result<()> {
+        let connection = self.live_connection_mut(id)?;
+        if connection.pending_read.is_some() {
+            return Ok(());
+        }
+        let socket = connection.stream.as_raw_socket();
+        let length = u32::try_from(length).unwrap_or(u32::MAX);
+        // SAFETY: accept_ready associated this connection's socket file object
+        // with this reactor, and the connection owns that socket until every
+        // pending operation on it has been drained by drain_completions.
+        let operation = unsafe {
+            self.reactor.submit_associated_socket_receive(
+                BorrowedSocket::borrow_raw(socket),
+                id.completion_key(),
+                length,
+            )
+        }
+        .map_err(post_error)?;
+        self.connections.get_mut(id).unwrap().pending_read = Some(operation);
+        self.operation_owners.insert(operation, id);
+        Ok(())
+    }
+
     pub fn write(&mut self, id: ConnectionId, buffer: &[u8]) -> io::Result<usize> {
-        self.drain_completions()?;
         let connection = self.live_connection_mut(id)?;
         if connection.failed {
             return Err(io::Error::new(
@@ -212,20 +271,26 @@ impl TcpAcceptor {
         if connection.pending_write.is_some() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        let socket = connection.stream.try_clone()?.into();
+        let socket = connection.stream.as_raw_socket();
+        let mut payload = self.reactor.acquire_buffer(buffer.len());
+        payload.copy_from_slice(buffer);
         // SAFETY: accept_ready associated this connection's socket file object
-        // with this reactor. try_clone duplicates that same file object.
+        // with this reactor, and the connection owns that socket until every
+        // pending operation on it has been drained by drain_completions.
         let operation = unsafe {
-            self.reactor
-                .submit_associated_socket_send(socket, id.completion_key(), buffer.to_vec())
+            self.reactor.submit_associated_socket_send(
+                BorrowedSocket::borrow_raw(socket),
+                id.completion_key(),
+                payload,
+            )
         }
         .map_err(post_error)?;
         self.connections.get_mut(id).unwrap().pending_write = Some(operation);
+        self.operation_owners.insert(operation, id);
         Err(io::ErrorKind::WouldBlock.into())
     }
 
     pub fn close(&mut self, id: ConnectionId) -> bool {
-        let _ = self.drain_completions();
         let Some(connection) = self.connections.get_mut(id) else {
             return false;
         };
@@ -247,13 +312,32 @@ impl TcpAcceptor {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection is not live"))
     }
 
-    fn drain_completions(&mut self) -> io::Result<()> {
-        self.reactor.poll(Duration::ZERO, self.reactor.capacity())?;
-        let mut finished = Vec::new();
-        for (id, connection) in self.connections.values_mut_with_ids() {
-            if let Some(operation) = connection.pending_read
-                && let Some(mut completion) = self.reactor.take_operation_completion(operation)
-            {
+    /// Waits up to `timeout` for socket completions and applies them to their
+    /// connections. Callers drive this once per event-loop turn; the read and
+    /// write paths never poll on their own.
+    pub fn poll_io(&mut self, timeout: Duration) -> io::Result<usize> {
+        self.drain_completions(timeout)
+    }
+
+    fn drain_completions(&mut self, timeout: Duration) -> io::Result<usize> {
+        let mut completed = std::mem::take(&mut self.completed);
+        completed.clear();
+        let result = self
+            .reactor
+            .poll_operations(timeout, self.reactor.capacity(), &mut completed);
+        let mut applied = 0;
+        for operation in completed.drain(..) {
+            let Some(id) = self.operation_owners.remove(&operation) else {
+                continue;
+            };
+            let Some(mut completion) = self.reactor.take_operation_completion(operation) else {
+                continue;
+            };
+            let Some(connection) = self.connections.get_mut(id) else {
+                self.reactor.recycle_buffer(completion.buffer);
+                continue;
+            };
+            if connection.pending_read == Some(operation) {
                 connection.pending_read = None;
                 if completion.succeeded() {
                     completion
@@ -261,35 +345,42 @@ impl TcpAcceptor {
                         .truncate(completion.bytes_transferred as usize);
                     if completion.buffer.is_empty() {
                         connection.read_closed = true;
+                        self.reactor.recycle_buffer(completion.buffer);
                     } else {
-                        connection.ready_read = completion.buffer;
+                        let stale =
+                            std::mem::replace(&mut connection.ready_read, completion.buffer);
                         connection.ready_read_offset = 0;
+                        self.reactor.recycle_buffer(stale);
                     }
-                } else if !completion.cancelled() {
-                    connection.failed = true;
+                } else {
+                    if !completion.cancelled() {
+                        connection.failed = true;
+                    }
+                    self.reactor.recycle_buffer(completion.buffer);
                 }
-            }
-            if let Some(operation) = connection.pending_write
-                && let Some(completion) = self.reactor.take_operation_completion(operation)
-            {
+            } else if connection.pending_write == Some(operation) {
                 connection.pending_write = None;
                 if completion.succeeded() {
                     connection.completed_write = Some(completion.bytes_transferred as usize);
                 } else if !completion.cancelled() {
                     connection.failed = true;
                 }
+                self.reactor.recycle_buffer(completion.buffer);
+            } else {
+                self.reactor.recycle_buffer(completion.buffer);
             }
-            if connection.closing
-                && connection.pending_read.is_none()
-                && connection.pending_write.is_none()
-            {
-                finished.push(id);
+            applied += 1;
+            if self.connections.get(id).is_some_and(|connection| {
+                connection.closing
+                    && connection.pending_read.is_none()
+                    && connection.pending_write.is_none()
+            }) {
+                self.connections.remove(id);
             }
         }
-        for id in finished {
-            self.connections.remove(id);
-        }
-        Ok(())
+        self.completed = completed;
+        result?;
+        Ok(applied)
     }
 }
 
@@ -356,23 +447,6 @@ impl<T> ConnectionSlab<T> {
 
     fn values(&self) -> impl Iterator<Item = &T> {
         self.slots.iter().filter_map(|slot| slot.value.as_ref())
-    }
-
-    fn values_mut_with_ids(&mut self) -> impl Iterator<Item = (ConnectionId, &mut T)> {
-        self.slots
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                slot.value.as_mut().map(|value| {
-                    (
-                        ConnectionId {
-                            index: index as u32,
-                            generation: slot.generation,
-                        },
-                        value,
-                    )
-                })
-            })
     }
 
     pub fn insert(&mut self, value: T) -> Result<ConnectionId, CapacityError> {
@@ -538,7 +612,7 @@ mod tests {
             match acceptor.read(id, &mut buffer) {
                 Ok(4) => break,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(1));
+                    acceptor.poll_io(Duration::from_millis(1)).unwrap();
                 }
                 result => panic!("unexpected read result: {result:?}"),
             }
@@ -583,7 +657,7 @@ mod tests {
         assert!(acceptor.close(id));
         assert_eq!(acceptor.connection_count(), 0);
         while !acceptor.connections.is_empty() {
-            acceptor.drain_completions().unwrap();
+            acceptor.drain_completions(Duration::ZERO).unwrap();
             assert!(Instant::now() < deadline, "cancel drain timed out");
             thread::sleep(Duration::from_millis(1));
         }

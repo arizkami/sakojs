@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -54,6 +55,7 @@ void* sako_https_server_new(uint16_t port, SakoNativeBytes certificate,
                             char* error, size_t error_capacity);
 int sako_http_server_tick(void* server, SakoNativeHttpHandler handler,
                           void* context, char* error, size_t error_capacity);
+int sako_http_server_wait(void* server, uint32_t timeout_milliseconds);
 void sako_http_server_delete(void* server);
 int sako_http_server_close(void* server);
 int sako_http_server_stats(void* server, uint64_t* connections,
@@ -80,6 +82,11 @@ SakoNativeBytes sako_fetch_output_header_name(const void* output, size_t index);
 SakoNativeBytes sako_fetch_output_header_value(const void* output, size_t index);
 SakoNativeBytes sako_fetch_output_body(const void* output);
 void sako_fetch_output_delete(void* output);
+void* sako_typescript_transpile(SakoNativeBytes path, SakoNativeBytes source,
+                                int commonjs, char* error,
+                                size_t error_capacity);
+SakoNativeBytes sako_typescript_output_source(const void* output);
+void sako_typescript_output_delete(void* output);
 }
 
 namespace {
@@ -184,16 +191,87 @@ std::string PathToUtf8(const std::filesystem::path& path) {
   return WideToUtf8(UserPath(path).native());
 }
 
+// Opens a file for a sequential whole-file read. The caller owns the handle.
+HANDLE OpenFileForRead(const std::filesystem::path& path, uint64_t* size) {
+  const HANDLE file = CreateFileW(
+      ExtendedPath(path).c_str(), GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+      nullptr);
+  if (file == INVALID_HANDLE_VALUE) return file;
+  LARGE_INTEGER file_size = {};
+  if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0) {
+    CloseHandle(file);
+    return INVALID_HANDLE_VALUE;
+  }
+  *size = static_cast<uint64_t>(file_size.QuadPart);
+  return file;
+}
+
+// Fills exactly `size` bytes of `destination` from `file`. Reading straight
+// into the caller's storage keeps a whole-file read to one copy: no stream
+// buffer, no intermediate string, and no second pass to hand the bytes on.
+bool ReadFileBytes(HANDLE file, void* destination, uint64_t size) {
+  constexpr DWORD kMaximumChunk = 1u << 30;
+  auto* output = static_cast<uint8_t*>(destination);
+  uint64_t offset = 0;
+  while (offset < size) {
+    const uint64_t remaining = size - offset;
+    const DWORD chunk = remaining > kMaximumChunk
+                            ? kMaximumChunk
+                            : static_cast<DWORD>(remaining);
+    DWORD read = 0;
+    if (!::ReadFile(file, output + offset, chunk, &read, nullptr)) return false;
+    if (read == 0) break;
+    offset += read;
+  }
+  return offset == size;
+}
+
 bool ReadFile(const std::filesystem::path& path, std::string* source) {
-  std::ifstream input(ExtendedPath(path), std::ios::binary);
-  if (!input) return false;
-  input.seekg(0, std::ios::end);
-  const std::streamoff size = input.tellg();
-  if (size < 0 || size > std::numeric_limits<int>::max()) return false;
-  input.seekg(0, std::ios::beg);
+  uint64_t size = 0;
+  const HANDLE file = OpenFileForRead(path, &size);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  if (size > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    CloseHandle(file);
+    return false;
+  }
   source->resize(static_cast<size_t>(size));
-  if (size != 0) input.read(source->data(), size);
-  return input.good() || input.eof();
+  const bool read = size == 0 || ReadFileBytes(file, source->data(), size);
+  CloseHandle(file);
+  return read;
+}
+
+bool IsTypeScriptPath(const std::filesystem::path& path) {
+  std::wstring extension = path.extension().native();
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+                 [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+  return extension == L".ts" || extension == L".mts" ||
+         extension == L".cts" || extension == L".tsx";
+}
+
+bool TranspileTypeScript(const std::filesystem::path& path, bool commonjs,
+                         std::string* source, std::string* error) {
+  if (!IsTypeScriptPath(path)) return true;
+  const std::string path_utf8 = PathToUtf8(path);
+  char native_error[16 * 1024] = {};
+  void* raw = sako_typescript_transpile(
+      {reinterpret_cast<const uint8_t*>(path_utf8.data()), path_utf8.size()},
+      {reinterpret_cast<const uint8_t*>(source->data()), source->size()},
+      commonjs ? 1 : 0, native_error, sizeof(native_error));
+  if (raw == nullptr) {
+    *error = native_error;
+    return false;
+  }
+  std::unique_ptr<void, void (*)(void*)> output(
+      raw, sako_typescript_output_delete);
+  const SakoNativeBytes emitted = sako_typescript_output_source(raw);
+  if (emitted.length != 0 && emitted.data == nullptr) {
+    *error = "TypeScript transpiler returned an invalid output range";
+    return false;
+  }
+  source->assign(reinterpret_cast<const char*>(emitted.data), emitted.length);
+  return true;
 }
 
 void WriteStdout(const char* bytes, size_t length) {
@@ -680,15 +758,26 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
     ThrowTypeError(isolate, "readFileSync needs a string path");
     return;
   }
-  std::string bytes;
-  if (!ReadFile(path, &bytes) || bytes.size() > kMaximumFileBytes) {
-    ThrowFileError(isolate, "read", path);
-    return;
-  }
   const bool text =
       info.Length() > 1 && info[1]->IsString() &&
       (ToUtf8(isolate, info[1]) == "utf8" || ToUtf8(isolate, info[1]) == "utf-8");
+  uint64_t size = 0;
+  const HANDLE file = OpenFileForRead(path, &size);
+  if (file == INVALID_HANDLE_VALUE || size > kMaximumFileBytes) {
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    ThrowFileError(isolate, "read", path);
+    return;
+  }
+  const size_t length = static_cast<size_t>(size);
   if (text) {
+    std::string bytes;
+    bytes.resize(length);
+    const bool read = length == 0 || ReadFileBytes(file, bytes.data(), length);
+    CloseHandle(file);
+    if (!read || length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      ThrowFileError(isolate, "read", path);
+      return;
+    }
     v8::Local<v8::String> value;
     if (v8::String::NewFromUtf8(isolate, bytes.data(),
                                 v8::NewStringType::kNormal,
@@ -698,12 +787,20 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
     }
     return;
   }
+  // The backing store is left uninitialized because the read below overwrites
+  // every byte of it; zeroing first would double the cost of a large read.
   std::unique_ptr<v8::BackingStore> backing =
-      v8::ArrayBuffer::NewBackingStore(isolate, bytes.size());
-  if (!bytes.empty()) std::memcpy(backing->Data(), bytes.data(), bytes.size());
+      v8::ArrayBuffer::NewBackingStore(
+          isolate, length, v8::BackingStoreInitializationMode::kUninitialized);
+  const bool read = length == 0 || ReadFileBytes(file, backing->Data(), length);
+  CloseHandle(file);
+  if (!read) {
+    ThrowFileError(isolate, "read", path);
+    return;
+  }
   v8::Local<v8::ArrayBuffer> buffer =
       v8::ArrayBuffer::New(isolate, std::move(backing));
-  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, bytes.size()));
+  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, length));
 }
 
 void WriteFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -1052,12 +1149,114 @@ std::string FormatRejection(v8::Isolate* isolate,
   return ToUtf8(isolate, reason);
 }
 
+// Keeps a few recently freed large ArrayBuffer blocks instead of returning them
+// to the system, and hands them back to uninitialized allocations. A workload
+// that reads a file repeatedly allocates and frees the same size every
+// iteration, and reusing the block skips the soft page faults that fresh
+// storage would take as the read fills it.
+class PooledArrayBufferAllocator : public v8::ArrayBuffer::Allocator {
+ public:
+  explicit PooledArrayBufferAllocator(
+      std::unique_ptr<v8::ArrayBuffer::Allocator> base)
+      : base_(std::move(base)) {}
+
+  ~PooledArrayBufferAllocator() override {
+    for (const Block& block : blocks_) base_->Free(block.data, block.length);
+  }
+
+  void* Allocate(size_t length) override {
+    // Deliberately not pooled. Fresh pages arrive zeroed and are only faulted
+    // in as they are touched, which beats memsetting a reused block that the
+    // caller may never write to.
+    return base_->Allocate(length);
+  }
+
+  void* AllocateUninitialized(size_t length) override {
+    if (void* reused = Take(length)) return reused;
+    return base_->AllocateUninitialized(length);
+  }
+
+  void Free(void* data, size_t length) override {
+    if (Retain(data, length)) return;
+    base_->Free(data, length);
+  }
+
+  size_t MaxAllocationSize() const override {
+    return base_->MaxAllocationSize();
+  }
+
+  v8::PageAllocator* GetPageAllocator() override {
+    return base_->GetPageAllocator();
+  }
+
+  size_t pooled_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pooled_bytes_;
+  }
+
+ private:
+  struct Block {
+    void* data;
+    size_t length;
+  };
+
+  // Only whole-buffer sizes worth pooling, and never more than a few of them:
+  // the point is to absorb a repeating allocation, not to hold memory back.
+  static constexpr size_t kMinimumPooledBytes = 1 << 20;
+  static constexpr size_t kMaximumPooledBytes = 32u << 20;
+  static constexpr size_t kMaximumBlocks = 4;
+
+  void* Take(size_t length) {
+    if (length < kMinimumPooledBytes) return nullptr;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto block = blocks_.begin(); block != blocks_.end(); ++block) {
+      if (block->length != length) continue;
+      void* data = block->data;
+      pooled_bytes_ -= length;
+      blocks_.erase(block);
+      return data;
+    }
+    return nullptr;
+  }
+
+  bool Retain(void* data, size_t length) {
+    if (length < kMinimumPooledBytes || length > kMaximumPooledBytes) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (blocks_.size() >= kMaximumBlocks ||
+        pooled_bytes_ + length > kMaximumPooledBytes) {
+      return false;
+    }
+    blocks_.push_back({data, length});
+    pooled_bytes_ += length;
+    return true;
+  }
+
+  std::unique_ptr<v8::ArrayBuffer::Allocator> base_;
+  mutable std::mutex mutex_;
+  std::vector<Block> blocks_;
+  size_t pooled_bytes_ = 0;
+};
+
+// Baseline V8 tuning applied to every isolate before initialization.
+constexpr const char* kSakoV8Flags = "";
+
 class Engine {
  public:
   bool Initialize(const char* executable_path, const char* icu_data_path,
                   std::string* error) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (initialized_) return true;
+    // Baseline tuning first, so an embedder override from SAKO_V8_FLAGS wins.
+    if (kSakoV8Flags[0] != '\0') v8::V8::SetFlagsFromString(kSakoV8Flags);
+    size_t override_length = 0;
+    char* override_flags = nullptr;
+    if (_dupenv_s(&override_flags, &override_length, "SAKO_V8_FLAGS") == 0 &&
+        override_flags != nullptr) {
+      v8::V8::SetFlagsFromString(override_flags);
+      free(override_flags);
+    }
     if (!v8::V8::InitializeICUDefaultLocation(executable_path, icu_data_path)) {
       *error = std::string("failed to initialize ICU from ") + icu_data_path;
       return false;
@@ -1109,11 +1308,14 @@ class Runtime {
     if (!engine.Initialize(executable_path, icu_data_path, error)) return nullptr;
     runtime->platform_ = engine.platform();
 
-    runtime->allocator_.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
-    if (!runtime->allocator_) {
+    std::unique_ptr<v8::ArrayBuffer::Allocator> base_allocator(
+        v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+    if (!base_allocator) {
       *error = "failed to create the V8 ArrayBuffer allocator";
       return nullptr;
     }
+    runtime->allocator_ =
+        std::make_unique<PooledArrayBufferAllocator>(std::move(base_allocator));
 
     v8::Isolate::CreateParams params;
     params.array_buffer_allocator = runtime->allocator_.get();
@@ -1166,6 +1368,10 @@ class Runtime {
           binding->server = nullptr;
         }
         http_servers_.clear();
+        http_dispatcher_.Reset();
+        http_finalizer_.Reset();
+        empty_bytes_.Reset();
+        empty_ranges_.Reset();
         context_.Reset();
         isolate_->SetData(0, nullptr);
       }
@@ -1383,6 +1589,9 @@ class Runtime {
   static constexpr size_t kMaximumModuleBytes = 64 * 1024 * 1024;
   static constexpr size_t kMaximumHttpServers = 64;
   static constexpr size_t kMaximumFileDescriptors = 1'024;
+  // Longest the loop blocks with an idle HTTP server before looping back to
+  // check timers and other runtime work.
+  static constexpr uint32_t kIdleHttpWaitMilliseconds = 50;
 
   struct FileDescriptor {
     HANDLE handle = INVALID_HANDLE_VALUE;
@@ -1559,6 +1768,7 @@ class Runtime {
       *error = "cannot read module: " + canonical_path;
       return false;
     }
+    if (!TranspileTypeScript(path, false, &source_text, error)) return false;
     if (module_source_bytes_ + source_text.size() > kMaximumModuleBytes) {
       *error = "module source cache byte limit exceeded";
       return false;
@@ -1753,10 +1963,13 @@ class Runtime {
 
   bool IsCommonJsPath(v8::Local<v8::Context> context,
                       const std::filesystem::path& path) {
-    if (path.extension() == L".cjs" || path.extension() == L".json") {
+    if (path.extension() == L".cjs" || path.extension() == L".cts" ||
+        path.extension() == L".json") {
       return true;
     }
-    if (path.extension() == L".mjs") return false;
+    if (path.extension() == L".mjs" || path.extension() == L".mts") {
+      return false;
+    }
     std::filesystem::path directory = path.parent_path();
     while (!directory.empty()) {
       v8::Local<v8::Object> manifest;
@@ -1975,7 +2188,13 @@ class Runtime {
     if (!candidate.has_extension()) {
       candidates.push_back(candidate.native() + std::wstring(L".js"));
       candidates.push_back(candidate.native() + std::wstring(L".mjs"));
+      candidates.push_back(candidate.native() + std::wstring(L".ts"));
+      candidates.push_back(candidate.native() + std::wstring(L".mts"));
+      candidates.push_back(candidate.native() + std::wstring(L".tsx"));
       candidates.push_back(candidate / L"index.js");
+      candidates.push_back(candidate / L"index.ts");
+      candidates.push_back(candidate / L"index.mts");
+      candidates.push_back(candidate / L"index.tsx");
     }
     for (const auto& path : candidates) {
       std::error_code status_error;
@@ -2261,6 +2480,7 @@ class Runtime {
       *error = "cannot read CommonJS module: " + canonical_path;
       return false;
     }
+    if (!TranspileTypeScript(path, true, &source_text, error)) return false;
     if (module_source_bytes_ + source_text.size() > kMaximumModuleBytes) {
       *error = "module source cache byte limit exceeded";
       return false;
@@ -2620,6 +2840,10 @@ class Runtime {
         candidate,
         candidate.native() + std::wstring(L".js"),
         candidate.native() + std::wstring(L".cjs"),
+        candidate.native() + std::wstring(L".ts"),
+        candidate.native() + std::wstring(L".cts"),
+        candidate.native() + std::wstring(L".mts"),
+        candidate.native() + std::wstring(L".tsx"),
         candidate.native() + std::wstring(L".json"),
     };
     for (const auto& file : files) {
@@ -2654,6 +2878,10 @@ class Runtime {
               main_path,
               main_path.native() + std::wstring(L".js"),
               main_path.native() + std::wstring(L".cjs"),
+              main_path.native() + std::wstring(L".ts"),
+              main_path.native() + std::wstring(L".cts"),
+              main_path.native() + std::wstring(L".mts"),
+              main_path.native() + std::wstring(L".tsx"),
           };
           for (const auto& file : main_files) {
             std::error_code status_error;
@@ -3197,15 +3425,12 @@ class Runtime {
     v8::HandleScope handle_scope(isolate);
     v8::Local<v8::Context> js_context = isolate->GetCurrentContext();
     v8::TryCatch try_catch(isolate);
-    v8::Local<v8::Value> dispatcher_value;
-    if (!js_context->Global()
-             ->Get(js_context, v8::String::NewFromUtf8Literal(
-                                  isolate, "__sakoDispatchHttpRequest"))
-             .ToLocal(&dispatcher_value) ||
-        !dispatcher_value->IsFunction()) {
+    if (!runtime->ResolveHttpDispatchers(js_context)) {
       runtime->async_error_ = "HTTP JavaScript dispatcher is unavailable";
       return 1;
     }
+    v8::Local<v8::Function> dispatcher =
+        runtime->http_dispatcher_.Get(isolate);
     auto make_string = [isolate](SakoNativeBytes bytes) {
       return v8::String::NewFromUtf8(
           isolate, reinterpret_cast<const char*>(bytes.data),
@@ -3221,14 +3446,21 @@ class Runtime {
       runtime->async_error_ = "HTTP request strings exceed V8 limits";
       return 1;
     }
-    std::unique_ptr<v8::BackingStore> body_backing =
-        v8::ArrayBuffer::NewBackingStore(isolate, body.length);
-    if (body.length != 0) {
+    // Every ArrayBuffer costs an allocation, an extension record, and sweeper
+    // bookkeeping, so a request carries at most one: an empty body reuses a
+    // shared view, and the header ranges share the header buffer's storage.
+    v8::Local<v8::Uint8Array> body_value;
+    if (body.length == 0) {
+      body_value = runtime->EmptyBytes(isolate);
+    } else {
+      std::unique_ptr<v8::BackingStore> body_backing =
+          v8::ArrayBuffer::NewBackingStore(
+              isolate, body.length,
+              v8::BackingStoreInitializationMode::kUninitialized);
       std::memcpy(body_backing->Data(), body.data, body.length);
+      body_buffer = v8::ArrayBuffer::New(isolate, std::move(body_backing));
+      body_value = v8::Uint8Array::New(body_buffer, 0, body.length);
     }
-    body_buffer = v8::ArrayBuffer::New(isolate, std::move(body_backing));
-    v8::Local<v8::Uint8Array> body_value =
-        v8::Uint8Array::New(body_buffer, 0, body.length);
     size_t header_bytes_length = 0;
     for (size_t index = 0; index < header_count; ++index) {
       const size_t item_length = headers[index].name.length +
@@ -3241,74 +3473,79 @@ class Runtime {
       }
       header_bytes_length += item_length;
     }
-    std::unique_ptr<v8::BackingStore> header_backing =
-        v8::ArrayBuffer::NewBackingStore(isolate, header_bytes_length);
     const size_t range_count = header_count * 4;
-    std::unique_ptr<v8::BackingStore> range_backing =
-        v8::ArrayBuffer::NewBackingStore(isolate, range_count * sizeof(uint32_t));
-    auto* header_output = static_cast<uint8_t*>(header_backing->Data());
-    auto* ranges = static_cast<uint32_t*>(range_backing->Data());
-    size_t header_offset = 0;
-    for (size_t index = 0; index < header_count; ++index) {
-      ranges[index * 4] = static_cast<uint32_t>(header_offset);
-      ranges[index * 4 + 1] = static_cast<uint32_t>(headers[index].name.length);
-      if (headers[index].name.length != 0) {
-        std::memcpy(header_output + header_offset, headers[index].name.data,
-                    headers[index].name.length);
+    const size_t range_bytes = range_count * sizeof(uint32_t);
+    v8::Local<v8::Uint8Array> header_values;
+    v8::Local<v8::Uint32Array> header_ranges;
+    if (header_count == 0) {
+      header_values = runtime->EmptyBytes(isolate);
+      header_ranges = runtime->EmptyRanges(isolate);
+    } else {
+      std::unique_ptr<v8::BackingStore> header_backing =
+          v8::ArrayBuffer::NewBackingStore(
+              isolate, range_bytes + header_bytes_length,
+              v8::BackingStoreInitializationMode::kUninitialized);
+      auto* ranges = static_cast<uint32_t*>(header_backing->Data());
+      auto* header_output =
+          static_cast<uint8_t*>(header_backing->Data()) + range_bytes;
+      size_t header_offset = 0;
+      for (size_t index = 0; index < header_count; ++index) {
+        ranges[index * 4] = static_cast<uint32_t>(header_offset);
+        ranges[index * 4 + 1] = static_cast<uint32_t>(headers[index].name.length);
+        if (headers[index].name.length != 0) {
+          std::memcpy(header_output + header_offset, headers[index].name.data,
+                      headers[index].name.length);
+        }
+        header_offset += headers[index].name.length;
+        ranges[index * 4 + 2] = static_cast<uint32_t>(header_offset);
+        ranges[index * 4 + 3] = static_cast<uint32_t>(headers[index].value.length);
+        if (headers[index].value.length != 0) {
+          std::memcpy(header_output + header_offset, headers[index].value.data,
+                      headers[index].value.length);
+        }
+        header_offset += headers[index].value.length;
       }
-      header_offset += headers[index].name.length;
-      ranges[index * 4 + 2] = static_cast<uint32_t>(header_offset);
-      ranges[index * 4 + 3] = static_cast<uint32_t>(headers[index].value.length);
-      if (headers[index].value.length != 0) {
-        std::memcpy(header_output + header_offset, headers[index].value.data,
-                    headers[index].value.length);
-      }
-      header_offset += headers[index].value.length;
+      v8::Local<v8::ArrayBuffer> header_buffer =
+          v8::ArrayBuffer::New(isolate, std::move(header_backing));
+      header_ranges = v8::Uint32Array::New(header_buffer, 0, range_count);
+      header_values =
+          v8::Uint8Array::New(header_buffer, range_bytes, header_bytes_length);
     }
-    v8::Local<v8::ArrayBuffer> header_buffer =
-        v8::ArrayBuffer::New(isolate, std::move(header_backing));
-    v8::Local<v8::Uint8Array> header_values =
-        v8::Uint8Array::New(header_buffer, 0, header_bytes_length);
-    v8::Local<v8::ArrayBuffer> range_buffer =
-        v8::ArrayBuffer::New(isolate, std::move(range_backing));
-    v8::Local<v8::Uint32Array> header_ranges =
-        v8::Uint32Array::New(range_buffer, 0, range_count);
     v8::Local<v8::Value> arguments[] = {
         binding->handler.Get(isolate), method_value, target_value, header_values,
         header_ranges, body_value, v8::Boolean::New(isolate, binding->secure)};
     v8::Local<v8::Value> result;
-    if (!dispatcher_value.As<v8::Function>()
-              ->Call(js_context, v8::Undefined(isolate), 7, arguments)
+    if (!dispatcher->Call(js_context, v8::Undefined(isolate), 7, arguments)
              .ToLocal(&result) ||
         !result->IsObject()) {
       runtime->async_error_ = FormatException(isolate, js_context, try_catch);
       return 1;
     }
     isolate->PerformMicrotaskCheckpoint();
-    v8::Local<v8::Value> finalize_value;
     v8::Local<v8::Value> finalized;
-    if (!js_context->Global()
-             ->Get(js_context,
-                   v8::String::NewFromUtf8Literal(
-                       isolate, "__sakoFinalizeHttpResponse"))
-             .ToLocal(&finalize_value) ||
-        !finalize_value->IsFunction() ||
-        !finalize_value.As<v8::Function>()
+    if (!runtime->http_finalizer_.Get(isolate)
              ->Call(js_context, v8::Undefined(isolate), 1, &result)
-             .ToLocal(&finalized) ||
-        !finalized->IsObject()) {
+             .ToLocal(&finalized)) {
       runtime->async_error_ = FormatException(isolate, js_context, try_catch);
       return 1;
     }
-    v8::Local<v8::Object> object = finalized.As<v8::Object>();
+    // The finalizer returns [status, reason, headers, body]: reading four
+    // array elements avoids creating and looking up four property names on
+    // every request.
     v8::Local<v8::Value> status;
     v8::Local<v8::Value> reason;
     v8::Local<v8::Value> response_body;
     v8::Local<v8::Value> response_headers;
-    if (!runtime->GetProperty(js_context, object, "status", &status) ||
-        !runtime->GetProperty(js_context, object, "reason", &reason) ||
-        !runtime->GetProperty(js_context, object, "body", &response_body) ||
-        !runtime->GetProperty(js_context, object, "headers", &response_headers) ||
+    if (!finalized->IsArray()) {
+      runtime->async_error_ = "HTTP dispatcher returned an invalid response";
+      return 1;
+    }
+    v8::Local<v8::Array> response_fields = finalized.As<v8::Array>();
+    if (response_fields->Length() != 4 ||
+        !response_fields->Get(js_context, 0).ToLocal(&status) ||
+        !response_fields->Get(js_context, 1).ToLocal(&reason) ||
+        !response_fields->Get(js_context, 2).ToLocal(&response_headers) ||
+        !response_fields->Get(js_context, 3).ToLocal(&response_body) ||
         !reason->IsString() || !response_headers->IsArray()) {
       runtime->async_error_ = "HTTP dispatcher returned an invalid response";
       return 1;
@@ -3372,6 +3609,51 @@ class Runtime {
     return 0;
   }
 
+  // Zero-length views handed to every request that carries no body or no
+  // headers. They expose no bytes, so sharing them cannot leak request data.
+  v8::Local<v8::Uint8Array> EmptyBytes(v8::Isolate* isolate) {
+    if (empty_bytes_.IsEmpty()) {
+      v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(isolate, 0);
+      v8::Local<v8::Uint8Array> view = v8::Uint8Array::New(buffer, 0, 0);
+      empty_bytes_.Reset(isolate, view);
+      return view;
+    }
+    return empty_bytes_.Get(isolate);
+  }
+
+  v8::Local<v8::Uint32Array> EmptyRanges(v8::Isolate* isolate) {
+    if (empty_ranges_.IsEmpty()) {
+      v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(isolate, 0);
+      v8::Local<v8::Uint32Array> view = v8::Uint32Array::New(buffer, 0, 0);
+      empty_ranges_.Reset(isolate, view);
+      return view;
+    }
+    return empty_ranges_.Get(isolate);
+  }
+
+  // Looks up the bootstrap's HTTP dispatch functions once per runtime; the
+  // request path then calls them without a global property lookup each time.
+  bool ResolveHttpDispatchers(v8::Local<v8::Context> context) {
+    if (!http_dispatcher_.IsEmpty()) return true;
+    v8::Local<v8::Value> dispatcher;
+    v8::Local<v8::Value> finalizer;
+    if (!context->Global()
+             ->Get(context, v8::String::NewFromUtf8Literal(
+                                isolate_, "__sakoDispatchHttpRequest"))
+             .ToLocal(&dispatcher) ||
+        !dispatcher->IsFunction() ||
+        !context->Global()
+             ->Get(context, v8::String::NewFromUtf8Literal(
+                                isolate_, "__sakoFinalizeHttpResponse"))
+             .ToLocal(&finalizer) ||
+        !finalizer->IsFunction()) {
+      return false;
+    }
+    http_dispatcher_.Reset(isolate_, dispatcher.As<v8::Function>());
+    http_finalizer_.Reset(isolate_, finalizer.As<v8::Function>());
+    return true;
+  }
+
   void ScheduleTimer(const v8::FunctionCallbackInfo<v8::Value>& info,
                      bool repeat) {
     v8::Isolate* isolate = info.GetIsolate();
@@ -3405,6 +3687,20 @@ class Runtime {
     }
     timers_.emplace(id, std::move(timer));
     info.GetReturnValue().Set(v8::Number::New(isolate, static_cast<double>(id)));
+  }
+
+  // Blocks in each server's completion port until one reports activity. With
+  // a single server this is one wait; with several, each gets a slice so no
+  // server can hold the loop while another has work.
+  void WaitForHttpServers(uint32_t timeout_milliseconds) {
+    if (http_servers_.empty() || timeout_milliseconds == 0) return;
+    const uint32_t slice = static_cast<uint32_t>(std::max<size_t>(
+        1, timeout_milliseconds / http_servers_.size()));
+    for (auto& [id, binding] : http_servers_) {
+      (void)id;
+      if (binding->server == nullptr) continue;
+      if (sako_http_server_wait(binding->server, slice) != 0) return;
+    }
   }
 
   bool DrainEventLoop(v8::Local<v8::Context> context, std::string* error) {
@@ -3469,7 +3765,10 @@ class Runtime {
       }
       if (timers_.empty()) {
         if (http_servers_.empty()) return true;
-        if (!handled_http) Sleep(1);
+        // Nothing ran this turn, so block in the completion port rather than
+        // sleeping: a request that lands mid-wait wakes the loop at once,
+        // instead of waiting out the system timer tick.
+        if (!handled_http) WaitForHttpServers(kIdleHttpWaitMilliseconds);
         continue;
       }
 
@@ -3482,9 +3781,16 @@ class Runtime {
       if (next->second.deadline > now) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             next->second.deadline - now + std::chrono::milliseconds(1));
-        int64_t sleep_milliseconds = remaining.count();
-        if (!http_servers_.empty()) sleep_milliseconds = std::min<int64_t>(1, sleep_milliseconds);
-        Sleep(static_cast<DWORD>(std::min<int64_t>(sleep_milliseconds, MAXDWORD)));
+        const int64_t wait_milliseconds =
+            std::min<int64_t>(remaining.count(), MAXDWORD);
+        if (http_servers_.empty()) {
+          Sleep(static_cast<DWORD>(wait_milliseconds));
+        } else if (!handled_http) {
+          // A pending timer caps the wait, but socket activity still ends it
+          // early because the completion port is what the loop blocks on.
+          WaitForHttpServers(static_cast<uint32_t>(
+              std::min<int64_t>(wait_milliseconds, kIdleHttpWaitMilliseconds)));
+        }
       }
 
       const auto ready_at = std::chrono::steady_clock::now();
@@ -3539,6 +3845,10 @@ class Runtime {
   std::unordered_map<uint64_t, std::unique_ptr<HttpBinding>> http_servers_;
   std::unordered_map<int, FileDescriptor> file_descriptors_;
   std::vector<uint64_t> closing_http_servers_;
+  v8::Global<v8::Function> http_dispatcher_;
+  v8::Global<v8::Function> http_finalizer_;
+  v8::Global<v8::Uint8Array> empty_bytes_;
+  v8::Global<v8::Uint32Array> empty_ranges_;
   std::string async_error_;
   size_t module_source_bytes_ = 0;
   uint64_t next_timer_id_ = 1;
