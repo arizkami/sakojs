@@ -1,0 +1,6 @@
+# The V8 bridge compiles against the static CRT, so linking Rust against the
+# dynamic one gave the process two C runtimes, two heaps, and a LNK4098
+# warning. One static CRT keeps ownership of an allocation on one heap and
+# drops the VCRUNTIME140 and api-ms-win-crt import chain from startup.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
