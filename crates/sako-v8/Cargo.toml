@@ -1,0 +1,11 @@
+[package]
+name = "sako-v8"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "sako_v8_bridge"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1.2"

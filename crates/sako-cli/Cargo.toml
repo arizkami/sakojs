@@ -1,0 +1,13 @@
+[package]
+name = "sako-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sako"
+path = "src/main.rs"
+
+[dependencies]
+sako-v8 = { path = "../sako-v8" }
