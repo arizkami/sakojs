@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -20,15 +21,40 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <bcrypt.h>
+#else
+#include <cerrno>
+#include <cstdlib>
+#include <ctime>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 #include "libplatform/libplatform.h"
 #include "v8.h"
 #include "bootstrap.generated.h"
 #include "bootstrap_cache.generated.h"
+
+// A single alias for the path representation that differs between platforms
+// (UTF-16 on Windows, UTF-8 directly on POSIX) so the module-resolution and
+// path-candidate logic below can be written once instead of duplicated per
+// platform. `SAKO_PATH_LITERAL` mirrors it for string literals.
+#if defined(_WIN32)
+using PathChar = wchar_t;
+using PathString = std::wstring;
+#define SAKO_PATH_LITERAL(x) L##x
+#else
+using PathChar = char;
+using PathString = std::string;
+#define SAKO_PATH_LITERAL(x) x
+#endif
 
 // --- Startup phase instrumentation -----------------------------------------
 //
@@ -61,9 +87,15 @@ int64_t g_frequency = 1;
 int64_t g_process_start_offset_100ns = 0;
 
 inline int64_t Counter() {
+#if defined(_WIN32)
   LARGE_INTEGER value;
   QueryPerformanceCounter(&value);
   return value.QuadPart;
+#else
+  struct timespec value;
+  clock_gettime(CLOCK_MONOTONIC, &value);
+  return static_cast<int64_t>(value.tv_sec) * 1'000'000'000 + value.tv_nsec;
+#endif
 }
 
 inline void Record(const char* name) {
@@ -123,6 +155,7 @@ class Span {
 extern "C" {
 
 void sako_perf_enable(void) {
+#if defined(_WIN32)
   LARGE_INTEGER frequency;
   QueryPerformanceFrequency(&frequency);
   sako_perf::g_frequency = frequency.QuadPart == 0 ? 1 : frequency.QuadPart;
@@ -144,6 +177,13 @@ void sako_perf_enable(void) {
         (static_cast<int64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
     sako_perf::g_process_start_offset_100ns = current - created;
   }
+#else
+  // Counter() already reports nanoseconds, so the "frequency" scale is fixed
+  // and there is no equivalent of Windows' process-creation-time query
+  // without parsing /proc/self/stat; the image-load line just reports 0 here.
+  sako_perf::g_frequency = 1'000'000'000;
+  sako_perf::g_process_start_offset_100ns = 0;
+#endif
   sako_perf::g_enabled = true;
   sako_perf::Record("cli.enter");
 }
@@ -192,12 +232,24 @@ void sako_perf_report(void) {
              static_cast<unsigned long long>(sako_perf::g_bucket_events[index]));
     report += line;
   }
+#if defined(_WIN32)
   const HANDLE error_handle = GetStdHandle(STD_ERROR_HANDLE);
   if (error_handle != INVALID_HANDLE_VALUE && error_handle != nullptr) {
     DWORD written = 0;
     WriteFile(error_handle, report.data(),
               static_cast<DWORD>(report.size()), &written, nullptr);
   }
+#else
+  {
+    size_t written_total = 0;
+    while (written_total < report.size()) {
+      const ssize_t written = write(STDERR_FILENO, report.data() + written_total,
+                                    report.size() - written_total);
+      if (written <= 0) break;
+      written_total += static_cast<size_t>(written);
+    }
+  }
+#endif
 }
 
 }  // extern "C"
@@ -264,6 +316,8 @@ void* sako_typescript_transpile(SakoNativeBytes path, SakoNativeBytes source,
                                 size_t error_capacity);
 SakoNativeBytes sako_typescript_output_source(const void* output);
 void sako_typescript_output_delete(void* output);
+// Writes exactly 20 bytes (the SHA-1 digest length) to `digest`.
+void sako_sha1(SakoNativeBytes bytes, uint8_t* digest);
 }
 
 namespace {
@@ -307,6 +361,7 @@ bool ToUtf8Into(v8::Isolate* isolate, v8::Local<v8::Value> value,
   return true;
 }
 
+#if defined(_WIN32)
 std::wstring Utf8ToWide(const std::string& value) {
   if (value.empty()) return {};
   const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
@@ -334,8 +389,24 @@ std::string WideToUtf8(const std::wstring& value) {
   }
   return result;
 }
+#endif
 
+// Converts UTF-8 text into this platform's native path representation:
+// UTF-16 on Windows, identity on POSIX (already UTF-8).
+PathString Utf8ToPathString(const std::string& value) {
+#if defined(_WIN32)
+  return Utf8ToWide(value);
+#else
+  return value;
+#endif
+}
+
+// On Windows this rewrites an absolute path with the `\\?\` prefix that lifts
+// MAX_PATH and reparse-point traversal limits. POSIX has neither limit, so
+// the path is returned unchanged there; every ExtendedPath/UserPath call site
+// below stays the same on both platforms.
 std::filesystem::path ExtendedPath(const std::filesystem::path& path) {
+#if defined(_WIN32)
   std::error_code error;
   std::filesystem::path absolute =
       path.is_absolute() ? path : std::filesystem::absolute(path, error);
@@ -348,9 +419,13 @@ std::filesystem::path ExtendedPath(const std::filesystem::path& path) {
     return std::filesystem::path(L"\\\\?\\UNC\\" + native.substr(2));
   }
   return std::filesystem::path(L"\\\\?\\" + native);
+#else
+  return path;
+#endif
 }
 
 std::filesystem::path UserPath(const std::filesystem::path& path) {
+#if defined(_WIN32)
   const std::wstring& native = path.native();
   if (native.starts_with(L"\\\\?\\UNC\\")) {
     return std::filesystem::path(L"\\\\" + native.substr(8));
@@ -359,6 +434,9 @@ std::filesystem::path UserPath(const std::filesystem::path& path) {
     return std::filesystem::path(native.substr(4));
   }
   return path;
+#else
+  return path;
+#endif
 }
 
 std::filesystem::path CanonicalPath(const std::filesystem::path& path,
@@ -368,6 +446,7 @@ std::filesystem::path CanonicalPath(const std::filesystem::path& path,
 
 bool IsRegularFile(const std::filesystem::path& path,
                    std::error_code& error) {
+#if defined(_WIN32)
   const std::filesystem::path extended = ExtendedPath(path);
   const DWORD attributes = GetFileAttributesW(extended.native().c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -377,9 +456,14 @@ bool IsRegularFile(const std::filesystem::path& path,
   }
   error.clear();
   return (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+  const bool result = std::filesystem::is_regular_file(path, error);
+  return !error && result;
+#endif
 }
 
 bool IsDirectory(const std::filesystem::path& path, std::error_code& error) {
+#if defined(_WIN32)
   const std::filesystem::path extended = ExtendedPath(path);
   const DWORD attributes = GetFileAttributesW(extended.native().c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -389,14 +473,39 @@ bool IsDirectory(const std::filesystem::path& path, std::error_code& error) {
   }
   error.clear();
   return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+  const bool result = std::filesystem::is_directory(path, error);
+  return !error && result;
+#endif
 }
 
 std::string PathToUtf8(const std::filesystem::path& path) {
+#if defined(_WIN32)
   return WideToUtf8(UserPath(path).native());
+#else
+  return UserPath(path).native();
+#endif
 }
 
 // Opens a file for a sequential whole-file read. The caller owns the handle.
-HANDLE OpenFileForRead(const std::filesystem::path& path, uint64_t* size) {
+#if defined(_WIN32)
+using NativeFile = HANDLE;
+const NativeFile kInvalidFile = INVALID_HANDLE_VALUE;
+#else
+using NativeFile = int;
+constexpr NativeFile kInvalidFile = -1;
+#endif
+
+void CloseNativeFile(NativeFile file) {
+#if defined(_WIN32)
+  CloseHandle(file);
+#else
+  close(file);
+#endif
+}
+
+NativeFile OpenFileForRead(const std::filesystem::path& path, uint64_t* size) {
+#if defined(_WIN32)
   const HANDLE file = CreateFileW(
       ExtendedPath(path).c_str(), GENERIC_READ,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -410,24 +519,42 @@ HANDLE OpenFileForRead(const std::filesystem::path& path, uint64_t* size) {
   }
   *size = static_cast<uint64_t>(file_size.QuadPart);
   return file;
+#else
+  const int file = open(ExtendedPath(path).c_str(), O_RDONLY);
+  if (file < 0) return kInvalidFile;
+  struct stat info;
+  if (fstat(file, &info) != 0 || info.st_size < 0) {
+    close(file);
+    return kInvalidFile;
+  }
+  *size = static_cast<uint64_t>(info.st_size);
+  return file;
+#endif
 }
 
 // Fills exactly `size` bytes of `destination` from `file`. Reading straight
 // into the caller's storage keeps a whole-file read to one copy: no stream
 // buffer, no intermediate string, and no second pass to hand the bytes on.
-bool ReadFileBytes(HANDLE file, void* destination, uint64_t size) {
-  constexpr DWORD kMaximumChunk = 1u << 30;
+bool ReadFileBytes(NativeFile file, void* destination, uint64_t size) {
+  constexpr uint64_t kMaximumChunk = 1ull << 30;
   auto* output = static_cast<uint8_t*>(destination);
   uint64_t offset = 0;
   while (offset < size) {
     const uint64_t remaining = size - offset;
-    const DWORD chunk = remaining > kMaximumChunk
-                            ? kMaximumChunk
-                            : static_cast<DWORD>(remaining);
+    const uint64_t chunk = remaining > kMaximumChunk ? kMaximumChunk : remaining;
+#if defined(_WIN32)
     DWORD read = 0;
-    if (!::ReadFile(file, output + offset, chunk, &read, nullptr)) return false;
+    if (!::ReadFile(file, output + offset, static_cast<DWORD>(chunk), &read,
+                    nullptr)) {
+      return false;
+    }
+#else
+    const ssize_t read =
+        ::read(file, output + offset, static_cast<size_t>(chunk));
+    if (read < 0) return false;
+#endif
     if (read == 0) break;
-    offset += read;
+    offset += static_cast<uint64_t>(read);
   }
   return offset == size;
 }
@@ -438,33 +565,51 @@ bool ReadFileBytes(HANDLE file, void* destination, uint64_t size) {
 // stays inside it for the whole call. Each worker opens its own handle so the
 // reads do not serialize on one file object's lock, and every read carries an
 // explicit offset so no worker depends on another's file pointer.
-bool ReadFileRange(const std::wstring& path, uint8_t* destination,
+bool ReadFileRange(const PathString& path, uint8_t* destination,
                    uint64_t offset, uint64_t size) {
+#if defined(_WIN32)
   const HANDLE file = CreateFileW(
       path.c_str(), GENERIC_READ,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE) return false;
-  constexpr DWORD kMaximumChunk = 1u << 24;
+#else
+  const int file = open(path.c_str(), O_RDONLY);
+  if (file < 0) return false;
+#endif
+  constexpr uint64_t kMaximumChunk = 1ull << 24;
   uint64_t done = 0;
   while (done < size) {
     const uint64_t remaining = size - done;
-    const DWORD chunk = remaining > kMaximumChunk
-                            ? kMaximumChunk
-                            : static_cast<DWORD>(remaining);
+    const uint64_t chunk = remaining > kMaximumChunk ? kMaximumChunk : remaining;
     const uint64_t position = offset + done;
+#if defined(_WIN32)
     OVERLAPPED overlapped = {};
     overlapped.Offset = static_cast<DWORD>(position & 0xFFFFFFFFull);
     overlapped.OffsetHigh = static_cast<DWORD>(position >> 32);
     DWORD read = 0;
-    if (!::ReadFile(file, destination + done, chunk, &read, &overlapped) ||
+    if (!::ReadFile(file, destination + done, static_cast<DWORD>(chunk), &read,
+                    &overlapped) ||
         read == 0) {
       CloseHandle(file);
       return false;
     }
-    done += read;
+#else
+    const ssize_t read = pread(file, destination + done,
+                               static_cast<size_t>(chunk),
+                               static_cast<off_t>(position));
+    if (read <= 0) {
+      close(file);
+      return false;
+    }
+#endif
+    done += static_cast<uint64_t>(read);
   }
+#if defined(_WIN32)
   CloseHandle(file);
+#else
+  close(file);
+#endif
   return true;
 }
 
@@ -483,7 +628,7 @@ constexpr size_t kParallelReadWorkers = 4;
 // outlives the buffer.
 bool ReadFileParallel(const std::filesystem::path& path, uint8_t* destination,
                       uint64_t size) {
-  const std::wstring native = ExtendedPath(path).native();
+  const PathString native = ExtendedPath(path).native();
   const uint64_t span = (size + kParallelReadWorkers - 1) / kParallelReadWorkers;
   std::atomic<bool> failed(false);
   std::vector<std::thread> workers;
@@ -509,7 +654,7 @@ bool ReadFileParallel(const std::filesystem::path& path, uint8_t* destination,
 // split across worker threads; anything smaller stays on the calling thread.
 // The caller keeps ownership of `file`, which the serial path reads from its
 // current position.
-bool ReadWholeFile(HANDLE file, const std::filesystem::path& path,
+bool ReadWholeFile(NativeFile file, const std::filesystem::path& path,
                    void* destination, uint64_t size) {
   if (size == 0) return true;
   if (size >= kParallelReadThresholdBytes &&
@@ -521,24 +666,34 @@ bool ReadWholeFile(HANDLE file, const std::filesystem::path& path,
 
 bool ReadFile(const std::filesystem::path& path, std::string* source) {
   uint64_t size = 0;
-  const HANDLE file = OpenFileForRead(path, &size);
-  if (file == INVALID_HANDLE_VALUE) return false;
+  const NativeFile file = OpenFileForRead(path, &size);
+  if (file == kInvalidFile) return false;
   if (size > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-    CloseHandle(file);
+    CloseNativeFile(file);
     return false;
   }
   source->resize(static_cast<size_t>(size));
   const bool read = ReadWholeFile(file, path, source->data(), size);
-  CloseHandle(file);
+  CloseNativeFile(file);
   return read;
 }
 
 bool IsTypeScriptPath(const std::filesystem::path& path) {
-  std::wstring extension = path.extension().native();
+  PathString extension = path.extension().native();
+#if defined(_WIN32)
   std::transform(extension.begin(), extension.end(), extension.begin(),
                  [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
-  return extension == L".ts" || extension == L".mts" ||
-         extension == L".cts" || extension == L".tsx";
+#else
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+                 [](char value) {
+                   return static_cast<char>(
+                       std::tolower(static_cast<unsigned char>(value)));
+                 });
+#endif
+  return extension == SAKO_PATH_LITERAL(".ts") ||
+         extension == SAKO_PATH_LITERAL(".mts") ||
+         extension == SAKO_PATH_LITERAL(".cts") ||
+         extension == SAKO_PATH_LITERAL(".tsx");
 }
 
 bool TranspileTypeScript(const std::filesystem::path& path, bool commonjs,
@@ -565,17 +720,7 @@ bool TranspileTypeScript(const std::filesystem::path& path, bool commonjs,
   return true;
 }
 
-void WriteStdout(const char* bytes, size_t length) {
-  HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-  while (output != INVALID_HANDLE_VALUE && output != nullptr && length != 0) {
-    const DWORD chunk = length > MAXDWORD ? MAXDWORD : static_cast<DWORD>(length);
-    DWORD written = 0;
-    if (!WriteFile(output, bytes, chunk, &written, nullptr) || written == 0) return;
-    bytes += written;
-    length -= written;
-  }
-}
-
+#if defined(_WIN32)
 void WriteHandle(HANDLE output, const char* bytes, size_t length) {
   while (output != INVALID_HANDLE_VALUE && output != nullptr && length != 0) {
     const DWORD chunk = length > MAXDWORD ? MAXDWORD : static_cast<DWORD>(length);
@@ -585,6 +730,24 @@ void WriteHandle(HANDLE output, const char* bytes, size_t length) {
     length -= written;
   }
 }
+
+void WriteStdout(const char* bytes, size_t length) {
+  WriteHandle(GetStdHandle(STD_OUTPUT_HANDLE), bytes, length);
+}
+#else
+void WriteHandle(int output, const char* bytes, size_t length) {
+  while (output >= 0 && length != 0) {
+    const ssize_t written = ::write(output, bytes, length);
+    if (written <= 0) return;
+    bytes += written;
+    length -= static_cast<size_t>(written);
+  }
+}
+
+void WriteStdout(const char* bytes, size_t length) {
+  WriteHandle(STDOUT_FILENO, bytes, length);
+}
+#endif
 
 void ThrowTypeError(v8::Isolate* isolate, const char* message);
 bool ReadBytes(v8::Local<v8::Value> value, const uint8_t** bytes,
@@ -607,10 +770,16 @@ void WriteStream(const v8::FunctionCallbackInfo<v8::Value>& info) {
     ThrowTypeError(isolate, "stream write needs a string or byte array");
     return;
   }
+#if defined(_WIN32)
   const DWORD stream = info.Data()->Int32Value(isolate->GetCurrentContext())
                            .FromMaybe(STD_OUTPUT_HANDLE);
   WriteHandle(GetStdHandle(stream), reinterpret_cast<const char*>(bytes),
               length);
+#else
+  const int stream = info.Data()->Int32Value(isolate->GetCurrentContext())
+                          .FromMaybe(STDOUT_FILENO);
+  WriteHandle(stream, reinterpret_cast<const char*>(bytes), length);
+#endif
   info.GetReturnValue().Set(v8::True(isolate));
 }
 
@@ -619,12 +788,18 @@ void IsTty(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Context> context = isolate->GetCurrentContext();
   const int descriptor =
       info.Length() == 0 ? -1 : info[0]->Int32Value(context).FromMaybe(-1);
+#if defined(_WIN32)
   const DWORD stream = descriptor == 1   ? STD_OUTPUT_HANDLE
                        : descriptor == 2 ? STD_ERROR_HANDLE
                                          : STD_INPUT_HANDLE;
   DWORD mode = 0;
   info.GetReturnValue().Set(descriptor >= 0 &&
                             GetConsoleMode(GetStdHandle(stream), &mode) != 0);
+#else
+  // The JavaScript side already passes POSIX-numbered descriptors (0/1/2),
+  // so this needs no stream-to-handle mapping at all.
+  info.GetReturnValue().Set(descriptor >= 0 && isatty(descriptor) != 0);
+#endif
 }
 
 void ResolveHost(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -874,6 +1049,9 @@ void FetchSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
   info.GetReturnValue().Set(result);
 }
 
+// SHA-1 is computed by the Rust side (RustCrypto's `sha1` crate) on every
+// platform: it needs no OS crypto API at all, which removes a Windows-only
+// BCrypt dependency here without adding an OpenSSL/libcrypto one on POSIX.
 void Sha1(const v8::FunctionCallbackInfo<v8::Value>& info) {
   constexpr size_t kMaximumHashBytes = 256 * 1024 * 1024;
   v8::Isolate* isolate = info.GetIsolate();
@@ -888,52 +1066,14 @@ void Sha1(const v8::FunctionCallbackInfo<v8::Value>& info) {
         v8::String::NewFromUtf8Literal(isolate, "hash input exceeds byte limit")));
     return;
   }
-  BCRYPT_ALG_HANDLE algorithm = nullptr;
-  BCRYPT_HASH_HANDLE hash = nullptr;
-  DWORD object_length = 0;
-  DWORD hash_length = 0;
-  DWORD written = 0;
-  NTSTATUS status = BCryptOpenAlgorithmProvider(
-      &algorithm, BCRYPT_SHA1_ALGORITHM, nullptr, 0);
-  if (BCRYPT_SUCCESS(status)) {
-    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-                               reinterpret_cast<PUCHAR>(&object_length),
-                               sizeof(object_length), &written, 0);
-  }
-  if (BCRYPT_SUCCESS(status)) {
-    status = BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
-                               reinterpret_cast<PUCHAR>(&hash_length),
-                               sizeof(hash_length), &written, 0);
-  }
-  std::vector<uint8_t> object(object_length);
-  std::vector<uint8_t> digest(hash_length);
-  if (BCRYPT_SUCCESS(status)) {
-    status = BCryptCreateHash(algorithm, &hash, object.data(), object_length,
-                              nullptr, 0, 0);
-  }
-  size_t offset = 0;
-  while (BCRYPT_SUCCESS(status) && offset < length) {
-    const ULONG chunk = static_cast<ULONG>(
-        std::min<size_t>(length - offset, std::numeric_limits<ULONG>::max()));
-    status = BCryptHashData(hash, const_cast<PUCHAR>(bytes + offset), chunk, 0);
-    offset += chunk;
-  }
-  if (BCRYPT_SUCCESS(status)) {
-    status = BCryptFinishHash(hash, digest.data(), hash_length, 0);
-  }
-  if (hash != nullptr) BCryptDestroyHash(hash);
-  if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
-  if (!BCRYPT_SUCCESS(status)) {
-    isolate->ThrowException(v8::Exception::Error(
-        v8::String::NewFromUtf8Literal(isolate, "Windows SHA-1 failed")));
-    return;
-  }
+  uint8_t digest[20];
+  sako_sha1({bytes, length}, digest);
   std::unique_ptr<v8::BackingStore> backing =
-      v8::ArrayBuffer::NewBackingStore(isolate, digest.size());
-  std::memcpy(backing->Data(), digest.data(), digest.size());
+      v8::ArrayBuffer::NewBackingStore(isolate, sizeof(digest));
+  std::memcpy(backing->Data(), digest, sizeof(digest));
   v8::Local<v8::ArrayBuffer> buffer =
       v8::ArrayBuffer::New(isolate, std::move(backing));
-  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, digest.size()));
+  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, sizeof(digest)));
 }
 
 void ConsoleLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -1008,20 +1148,35 @@ void DecodeUtf8(const v8::FunctionCallbackInfo<v8::Value>& info) {
 std::filesystem::path CallbackPath(
     const v8::FunctionCallbackInfo<v8::Value>& info) {
   if (info.Length() == 0 || !info[0]->IsString()) return {};
-  return std::filesystem::path(Utf8ToWide(ToUtf8(info.GetIsolate(), info[0])));
+  const std::string utf8 = ToUtf8(info.GetIsolate(), info[0]);
+#if defined(_WIN32)
+  return std::filesystem::path(Utf8ToWide(utf8));
+#else
+  return std::filesystem::path(utf8);
+#endif
 }
 
 std::filesystem::path ValuePath(v8::Isolate* isolate,
                                 v8::Local<v8::Value> value) {
   if (!value->IsString()) return {};
-  return std::filesystem::path(Utf8ToWide(ToUtf8(isolate, value)));
+  const std::string utf8 = ToUtf8(isolate, value);
+#if defined(_WIN32)
+  return std::filesystem::path(Utf8ToWide(utf8));
+#else
+  return std::filesystem::path(utf8);
+#endif
 }
 
 void ThrowFileError(v8::Isolate* isolate, const std::string& operation,
                     const std::filesystem::path& path) {
-  const std::string message =
-      operation + " failed for " + PathToUtf8(path) + ": " +
+#if defined(_WIN32)
+  const std::string reason =
       std::system_category().message(static_cast<int>(GetLastError()));
+#else
+  const std::string reason = std::generic_category().message(errno);
+#endif
+  const std::string message =
+      operation + " failed for " + PathToUtf8(path) + ": " + reason;
   isolate->ThrowException(v8::Exception::Error(
       v8::String::NewFromUtf8(isolate, message.data(),
                               v8::NewStringType::kNormal,
@@ -1053,9 +1208,9 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
       info.Length() > 1 && info[1]->IsString() &&
       (ToUtf8(isolate, info[1]) == "utf8" || ToUtf8(isolate, info[1]) == "utf-8");
   uint64_t size = 0;
-  const HANDLE file = OpenFileForRead(path, &size);
-  if (file == INVALID_HANDLE_VALUE || size > kMaximumFileBytes) {
-    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+  const NativeFile file = OpenFileForRead(path, &size);
+  if (file == kInvalidFile || size > kMaximumFileBytes) {
+    if (file != kInvalidFile) CloseNativeFile(file);
     ThrowFileError(isolate, "read", path);
     return;
   }
@@ -1064,7 +1219,7 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
     std::string bytes;
     bytes.resize(length);
     const bool read = ReadWholeFile(file, path, bytes.data(), length);
-    CloseHandle(file);
+    CloseNativeFile(file);
     if (!read || length > static_cast<size_t>(std::numeric_limits<int>::max())) {
       ThrowFileError(isolate, "read", path);
       return;
@@ -1084,7 +1239,7 @@ void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
       v8::ArrayBuffer::NewBackingStore(
           isolate, length, v8::BackingStoreInitializationMode::kUninitialized);
   const bool read = ReadWholeFile(file, path, backing->Data(), length);
-  CloseHandle(file);
+  CloseNativeFile(file);
   if (!read) {
     ThrowFileError(isolate, "read", path);
     return;
@@ -1376,6 +1531,7 @@ void RealPathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
 }
 
 void ProcessCwd(const v8::FunctionCallbackInfo<v8::Value>& info) {
+#if defined(_WIN32)
   const DWORD required = GetCurrentDirectoryW(0, nullptr);
   std::wstring path(required, L'\0');
   const DWORD written =
@@ -1386,6 +1542,18 @@ void ProcessCwd(const v8::FunctionCallbackInfo<v8::Value>& info) {
   }
   path.resize(written);
   const std::string utf8 = WideToUtf8(path);
+#else
+  std::string utf8;
+  utf8.resize(4096);
+  while (getcwd(utf8.data(), utf8.size()) == nullptr) {
+    if (errno != ERANGE) {
+      ThrowFileError(info.GetIsolate(), "read current directory", {});
+      return;
+    }
+    utf8.resize(utf8.size() * 2);
+  }
+  utf8.resize(std::strlen(utf8.c_str()));
+#endif
   info.GetReturnValue().Set(
       v8::String::NewFromUtf8(info.GetIsolate(), utf8.data(),
                               v8::NewStringType::kNormal,
@@ -1541,6 +1709,7 @@ class Engine {
     if (initialized_) return true;
     // Baseline tuning first, so an embedder override from SAKO_V8_FLAGS wins.
     if (kSakoV8Flags[0] != '\0') v8::V8::SetFlagsFromString(kSakoV8Flags);
+#if defined(_WIN32)
     size_t override_length = 0;
     char* override_flags = nullptr;
     if (_dupenv_s(&override_flags, &override_length, "SAKO_V8_FLAGS") == 0 &&
@@ -1548,8 +1717,17 @@ class Engine {
       v8::V8::SetFlagsFromString(override_flags);
       free(override_flags);
     }
+#else
+    if (const char* override_flags = getenv("SAKO_V8_FLAGS")) {
+      v8::V8::SetFlagsFromString(override_flags);
+    }
+#endif
     SAKO_PERF_MARK("v8.flags");
-    if (!v8::V8::InitializeICUDefaultLocation(executable_path, icu_data_path)) {
+    // An empty path means this V8 build already has ICU data compiled in
+    // (icu_use_data_file=false), so there is no external file to point at
+    // and V8 initializes its built-in data without this call.
+    if (icu_data_path[0] != '\0' &&
+        !v8::V8::InitializeICUDefaultLocation(executable_path, icu_data_path)) {
       *error = std::string("failed to initialize ICU from ") + icu_data_path;
       return false;
     }
@@ -1633,7 +1811,7 @@ class Runtime {
   ~Runtime() {
     for (auto& [descriptor, file] : file_descriptors_) {
       (void)descriptor;
-      if (file.handle != INVALID_HANDLE_VALUE) CloseHandle(file.handle);
+      if (file.handle != kInvalidFile) CloseNativeFile(file.handle);
     }
     file_descriptors_.clear();
     if (isolate_ != nullptr) {
@@ -1752,7 +1930,7 @@ class Runtime {
     SAKO_PERF_MARK("runtime.process-globals");
     const std::string path_text(reinterpret_cast<const char*>(path_bytes),
                                 path_length);
-    const std::wstring wide_path = Utf8ToWide(path_text);
+    const PathString wide_path = Utf8ToPathString(path_text);
     if (wide_path.empty()) {
       *error = "module path is not valid UTF-8";
       return false;
@@ -1814,7 +1992,7 @@ class Runtime {
     SAKO_PERF_MARK("runtime.process-globals");
     const std::string path_text(reinterpret_cast<const char*>(path_bytes),
                                 path_length);
-    const std::wstring wide_path = Utf8ToWide(path_text);
+    const PathString wide_path = Utf8ToPathString(path_text);
     std::error_code path_error;
     const std::filesystem::path entry =
         CanonicalPath(wide_path, path_error);
@@ -1900,7 +2078,7 @@ class Runtime {
   static constexpr uint32_t kIdleHttpWaitMilliseconds = 50;
 
   struct FileDescriptor {
-    HANDLE handle = INVALID_HANDLE_VALUE;
+    NativeFile handle = kInvalidFile;
     bool append = false;
   };
 
@@ -2012,18 +2190,42 @@ class Runtime {
     }
 
     SAKO_PERF_MARK("runtime.builtins");
+#if defined(_WIN32)
     const DWORD cwd_length = GetCurrentDirectoryW(0, nullptr);
     std::wstring cwd(cwd_length, L'\0');
     const DWORD cwd_written =
         cwd_length == 0 ? 0 : GetCurrentDirectoryW(cwd_length, cwd.data());
     if (cwd_written != 0) cwd.resize(cwd_written);
     const std::string cwd_utf8 = WideToUtf8(cwd);
-    if (cwd_written == 0 ||
+    const bool cwd_ok = cwd_written != 0;
+#else
+    std::string cwd_utf8;
+    cwd_utf8.resize(4096);
+    bool cwd_ok = getcwd(cwd_utf8.data(), cwd_utf8.size()) != nullptr;
+    while (!cwd_ok && errno == ERANGE) {
+      cwd_utf8.resize(cwd_utf8.size() * 2);
+      cwd_ok = getcwd(cwd_utf8.data(), cwd_utf8.size()) != nullptr;
+    }
+    if (cwd_ok) cwd_utf8.resize(std::strlen(cwd_utf8.c_str()));
+#endif
+    // Bootstrap needs to know which `path` flavor (win32/posix) to export
+    // before `process` exists, since InstallProcess only runs per script
+    // execution while this context initialization runs once.
+    if (!cwd_ok ||
         !Set(context, context->Global(), "__sakoCwd",
              v8::String::NewFromUtf8(isolate_, cwd_utf8.data(),
                                      v8::NewStringType::kNormal,
                                      static_cast<int>(cwd_utf8.size()))
                  .ToLocalChecked()) ||
+        !Set(context, context->Global(), "__sakoPlatform",
+             v8::String::NewFromUtf8Literal(
+                 isolate_,
+#if defined(_WIN32)
+                 "win32"
+#else
+                 "linux"
+#endif
+                 )) ||
         !RunBootstrap(context, error)) {
       if (error->empty()) *error = "failed to install runtime bootstrap";
       return false;
@@ -2291,17 +2493,20 @@ class Runtime {
 
   bool IsCommonJsPath(v8::Local<v8::Context> context,
                       const std::filesystem::path& path) {
-    if (path.extension() == L".cjs" || path.extension() == L".cts" ||
-        path.extension() == L".json") {
+    if (path.extension() == SAKO_PATH_LITERAL(".cjs") ||
+        path.extension() == SAKO_PATH_LITERAL(".cts") ||
+        path.extension() == SAKO_PATH_LITERAL(".json")) {
       return true;
     }
-    if (path.extension() == L".mjs" || path.extension() == L".mts") {
+    if (path.extension() == SAKO_PATH_LITERAL(".mjs") ||
+        path.extension() == SAKO_PATH_LITERAL(".mts")) {
       return false;
     }
     std::filesystem::path directory = path.parent_path();
     while (!directory.empty()) {
       v8::Local<v8::Object> manifest;
-      if (ReadJsonObject(context, directory / L"package.json", &manifest)) {
+      if (ReadJsonObject(context, directory / SAKO_PATH_LITERAL("package.json"),
+                         &manifest)) {
         v8::Local<v8::Value> type;
         return !(GetProperty(context, manifest, "type", &type) &&
                  type->IsString() && ToUtf8(isolate_, type) == "module");
@@ -2490,8 +2695,8 @@ class Runtime {
       *error = "unsupported built-in module: " + request;
       return false;
     }
-    const std::wstring request_wide = Utf8ToWide(request);
-    const std::wstring referrer_wide = Utf8ToWide(referrer);
+    const PathString request_wide = Utf8ToPathString(request);
+    const PathString referrer_wide = Utf8ToPathString(referrer);
     if (request_wide.empty() || referrer_wide.empty()) {
       *error = "module specifier is not valid UTF-8";
       return false;
@@ -2514,15 +2719,15 @@ class Runtime {
 
     std::vector<std::filesystem::path> candidates = {candidate};
     if (!candidate.has_extension()) {
-      candidates.push_back(candidate.native() + std::wstring(L".js"));
-      candidates.push_back(candidate.native() + std::wstring(L".mjs"));
-      candidates.push_back(candidate.native() + std::wstring(L".ts"));
-      candidates.push_back(candidate.native() + std::wstring(L".mts"));
-      candidates.push_back(candidate.native() + std::wstring(L".tsx"));
-      candidates.push_back(candidate / L"index.js");
-      candidates.push_back(candidate / L"index.ts");
-      candidates.push_back(candidate / L"index.mts");
-      candidates.push_back(candidate / L"index.tsx");
+      candidates.push_back(candidate.native() + PathString(SAKO_PATH_LITERAL(".js")));
+      candidates.push_back(candidate.native() + PathString(SAKO_PATH_LITERAL(".mjs")));
+      candidates.push_back(candidate.native() + PathString(SAKO_PATH_LITERAL(".ts")));
+      candidates.push_back(candidate.native() + PathString(SAKO_PATH_LITERAL(".mts")));
+      candidates.push_back(candidate.native() + PathString(SAKO_PATH_LITERAL(".tsx")));
+      candidates.push_back(candidate / SAKO_PATH_LITERAL("index.js"));
+      candidates.push_back(candidate / SAKO_PATH_LITERAL("index.ts"));
+      candidates.push_back(candidate / SAKO_PATH_LITERAL("index.mts"));
+      candidates.push_back(candidate / SAKO_PATH_LITERAL("index.tsx"));
     }
     for (const auto& path : candidates) {
       std::error_code status_error;
@@ -2656,7 +2861,7 @@ class Runtime {
                             std::filesystem::path* output) {
     if (!target.starts_with("./")) return false;
     const std::filesystem::path candidate =
-        package_root / Utf8ToWide(target.substr(2));
+        package_root / Utf8ToPathString(target.substr(2));
     std::error_code root_error;
     std::error_code target_error;
     const std::filesystem::path canonical_root =
@@ -2677,9 +2882,10 @@ class Runtime {
                             std::filesystem::path* output,
                             std::string* error) {
     std::filesystem::path directory =
-        std::filesystem::path(Utf8ToWide(referrer)).parent_path();
+        std::filesystem::path(Utf8ToPathString(referrer)).parent_path();
     while (!directory.empty()) {
-      const std::filesystem::path manifest_path = directory / L"package.json";
+      const std::filesystem::path manifest_path =
+          directory / SAKO_PATH_LITERAL("package.json");
       v8::Local<v8::Object> manifest;
       if (ReadJsonObject(context, manifest_path, &manifest)) {
         v8::Local<v8::Value> imports;
@@ -2728,14 +2934,16 @@ class Runtime {
     }
 
     std::filesystem::path directory =
-        std::filesystem::path(Utf8ToWide(referrer)).parent_path();
+        std::filesystem::path(Utf8ToPathString(referrer)).parent_path();
     while (!directory.empty()) {
       const std::filesystem::path package_root =
-          directory / L"node_modules" / Utf8ToWide(package_name);
+          directory / SAKO_PATH_LITERAL("node_modules") /
+          Utf8ToPathString(package_name);
       std::error_code directory_error;
       if (IsDirectory(package_root, directory_error)) {
         v8::Local<v8::Object> manifest;
-        if (ReadJsonObject(context, package_root / L"package.json", &manifest)) {
+        if (ReadJsonObject(context, package_root / SAKO_PATH_LITERAL("package.json"),
+                           &manifest)) {
           v8::Local<v8::Value> exports;
           if (GetProperty(context, manifest, "exports", &exports) &&
               !exports->IsUndefined()) {
@@ -2777,7 +2985,7 @@ class Runtime {
         const std::filesystem::path candidate =
             package_subpath.empty()
                 ? package_root
-                : package_root / Utf8ToWide(package_subpath);
+                : package_root / Utf8ToPathString(package_subpath);
         if (ResolveCommonJsCandidate(context, candidate, output)) return true;
       }
       const auto parent = directory.parent_path();
@@ -2817,7 +3025,7 @@ class Runtime {
     }
 
     v8::Local<v8::Object> module = v8::Object::New(isolate_);
-    if (path.extension() == L".json") {
+    if (path.extension() == SAKO_PATH_LITERAL(".json")) {
       v8::Local<v8::String> json_source;
       v8::Local<v8::Value> parsed;
       if (!v8::String::NewFromUtf8(isolate_, source_text.data(),
@@ -3142,8 +3350,8 @@ class Runtime {
       return ResolvePackageImport(context, request, referrer, "require",
                                   output, error);
     }
-    const std::wstring request_wide = Utf8ToWide(request);
-    const std::filesystem::path referrer_path(Utf8ToWide(referrer));
+    const PathString request_wide = Utf8ToPathString(request);
+    const std::filesystem::path referrer_path(Utf8ToPathString(referrer));
     if (request_wide.empty()) {
       *error = "require specifier is not valid UTF-8";
       return false;
@@ -3170,13 +3378,13 @@ class Runtime {
                                 std::filesystem::path* output) {
     std::vector<std::filesystem::path> files = {
         candidate,
-        candidate.native() + std::wstring(L".js"),
-        candidate.native() + std::wstring(L".cjs"),
-        candidate.native() + std::wstring(L".ts"),
-        candidate.native() + std::wstring(L".cts"),
-        candidate.native() + std::wstring(L".mts"),
-        candidate.native() + std::wstring(L".tsx"),
-        candidate.native() + std::wstring(L".json"),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".js")),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".cjs")),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".ts")),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".cts")),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".mts")),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".tsx")),
+        candidate.native() + PathString(SAKO_PATH_LITERAL(".json")),
     };
     for (const auto& file : files) {
       std::error_code status_error;
@@ -3189,7 +3397,8 @@ class Runtime {
 
     std::error_code directory_error;
     if (!IsDirectory(candidate, directory_error)) return false;
-    const std::filesystem::path manifest_path = candidate / L"package.json";
+    const std::filesystem::path manifest_path =
+        candidate / SAKO_PATH_LITERAL("package.json");
     std::string manifest_source;
     if (ReadFile(manifest_path, &manifest_source)) {
       v8::Local<v8::String> json;
@@ -3205,15 +3414,16 @@ class Runtime {
                       v8::String::NewFromUtf8Literal(isolate_, "main"))
                 .ToLocal(&main) &&
             main->IsString()) {
-          const std::filesystem::path main_path = candidate / Utf8ToWide(ToUtf8(isolate_, main));
+          const std::filesystem::path main_path =
+              candidate / Utf8ToPathString(ToUtf8(isolate_, main));
           const std::vector<std::filesystem::path> main_files = {
               main_path,
-              main_path.native() + std::wstring(L".js"),
-              main_path.native() + std::wstring(L".cjs"),
-              main_path.native() + std::wstring(L".ts"),
-              main_path.native() + std::wstring(L".cts"),
-              main_path.native() + std::wstring(L".mts"),
-              main_path.native() + std::wstring(L".tsx"),
+              main_path.native() + PathString(SAKO_PATH_LITERAL(".js")),
+              main_path.native() + PathString(SAKO_PATH_LITERAL(".cjs")),
+              main_path.native() + PathString(SAKO_PATH_LITERAL(".ts")),
+              main_path.native() + PathString(SAKO_PATH_LITERAL(".cts")),
+              main_path.native() + PathString(SAKO_PATH_LITERAL(".mts")),
+              main_path.native() + PathString(SAKO_PATH_LITERAL(".tsx")),
           };
           for (const auto& file : main_files) {
             std::error_code status_error;
@@ -3226,7 +3436,8 @@ class Runtime {
         }
       }
     }
-    return ResolveCommonJsCandidate(context, candidate / L"index", output);
+    return ResolveCommonJsCandidate(context, candidate / SAKO_PATH_LITERAL("index"),
+                                    output);
   }
 
   bool InstallProcess(v8::Local<v8::Context> context,
@@ -3260,13 +3471,18 @@ class Runtime {
     v8::Local<v8::Object> stderr_stream = v8::Object::New(isolate_);
     v8::Local<v8::Function> stdout_write;
     v8::Local<v8::Function> stderr_write;
-    if (!v8::Function::New(
-             context, WriteStream,
-             v8::Integer::New(isolate_, static_cast<int32_t>(STD_OUTPUT_HANDLE)))
+#if defined(_WIN32)
+    const int32_t stdout_selector = static_cast<int32_t>(STD_OUTPUT_HANDLE);
+    const int32_t stderr_selector = static_cast<int32_t>(STD_ERROR_HANDLE);
+#else
+    const int32_t stdout_selector = STDOUT_FILENO;
+    const int32_t stderr_selector = STDERR_FILENO;
+#endif
+    if (!v8::Function::New(context, WriteStream,
+                           v8::Integer::New(isolate_, stdout_selector))
              .ToLocal(&stdout_write) ||
-        !v8::Function::New(
-             context, WriteStream,
-             v8::Integer::New(isolate_, static_cast<int32_t>(STD_ERROR_HANDLE)))
+        !v8::Function::New(context, WriteStream,
+                           v8::Integer::New(isolate_, stderr_selector))
              .ToLocal(&stderr_write) ||
         !Set(context, stdout_stream, "fd", v8::Integer::New(isolate_, 1)) ||
         !Set(context, stdout_stream, "write", stdout_write) ||
@@ -3309,7 +3525,13 @@ class Runtime {
            Set(context, process, "version",
                v8::String::NewFromUtf8Literal(isolate_, "v0.1.0")) &&
            Set(context, process, "platform",
-               v8::String::NewFromUtf8Literal(isolate_, "win32")) &&
+               v8::String::NewFromUtf8Literal(isolate_,
+#if defined(_WIN32)
+                                              "win32"
+#else
+                                              "linux"
+#endif
+                                              )) &&
            Set(context, process, "arch",
                v8::String::NewFromUtf8Literal(isolate_, "x64")) &&
            Set(context, versions, "sako",
@@ -3332,9 +3554,10 @@ class Runtime {
     if (runtime == nullptr) return;
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
     v8::Local<v8::Object> environment = v8::Object::New(isolate);
+    bool environment_ok = true;
+#if defined(_WIN32)
     LPWCH environment_block = GetEnvironmentStringsW();
     if (environment_block == nullptr) return;
-    bool environment_ok = true;
     for (const wchar_t* entry = environment_block; *entry != L'\0';) {
       const std::wstring item(entry);
       entry += item.size() + 1;
@@ -3357,6 +3580,25 @@ class Runtime {
       }
     }
     FreeEnvironmentStringsW(environment_block);
+#else
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+      const std::string item(*entry);
+      const size_t equals = item.find('=');
+      if (equals == std::string::npos) continue;
+      const std::string variable = item.substr(0, equals);
+      const std::string value = item.substr(equals + 1);
+      v8::Local<v8::String> text;
+      if (variable.empty() ||
+          !v8::String::NewFromUtf8(isolate, value.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(value.size()))
+               .ToLocal(&text) ||
+          !runtime->Set(context, environment, variable, text)) {
+        environment_ok = false;
+        break;
+      }
+    }
+#endif
     if (environment_ok) info.GetReturnValue().Set(environment);
   }
 
@@ -3460,9 +3702,10 @@ class Runtime {
     }
     const std::filesystem::path path = CallbackPath(info);
     const std::string flags = ToUtf8(isolate, info[1]);
+    bool append = false;
+#if defined(_WIN32)
     DWORD access = 0;
     DWORD creation = OPEN_EXISTING;
-    bool append = false;
     if (flags == "r") {
       access = GENERIC_READ;
     } else if (flags == "r+") {
@@ -3485,11 +3728,33 @@ class Runtime {
       ThrowTypeError(isolate, "unsupported file open flags");
       return;
     }
-    HANDLE handle = CreateFileW(
+    NativeFile handle = CreateFileW(
         ExtendedPath(path).native().c_str(), access,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, creation,
         FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
+#else
+    int posix_flags = 0;
+    if (flags == "r") {
+      posix_flags = O_RDONLY;
+    } else if (flags == "r+") {
+      posix_flags = O_RDWR;
+    } else if (flags == "w" || flags == "wx") {
+      posix_flags = O_WRONLY | O_CREAT | O_TRUNC | (flags == "wx" ? O_EXCL : 0);
+    } else if (flags == "w+" || flags == "wx+") {
+      posix_flags = O_RDWR | O_CREAT | O_TRUNC | (flags == "wx+" ? O_EXCL : 0);
+    } else if (flags == "a" || flags == "ax") {
+      posix_flags = O_WRONLY | O_CREAT | O_APPEND | (flags == "ax" ? O_EXCL : 0);
+      append = true;
+    } else if (flags == "a+" || flags == "ax+") {
+      posix_flags = O_RDWR | O_CREAT | O_APPEND | (flags == "ax+" ? O_EXCL : 0);
+      append = true;
+    } else {
+      ThrowTypeError(isolate, "unsupported file open flags");
+      return;
+    }
+    NativeFile handle = open(ExtendedPath(path).c_str(), posix_flags, 0644);
+#endif
+    if (handle == kInvalidFile) {
       ThrowFileError(isolate, "open", path);
       return;
     }
@@ -3509,9 +3774,14 @@ class Runtime {
     if (file == nullptr) return;
     v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
     const int descriptor = info[0]->Int32Value(context).FromMaybe(-1);
-    const HANDLE handle = file->handle;
+    const NativeFile handle = file->handle;
     runtime->file_descriptors_.erase(descriptor);
-    if (!CloseHandle(handle)) {
+#if defined(_WIN32)
+    const bool closed = CloseHandle(handle) != 0;
+#else
+    const bool closed = close(handle) == 0;
+#endif
+    if (!closed) {
       info.GetIsolate()->ThrowException(v8::Exception::Error(
           v8::String::NewFromUtf8Literal(info.GetIsolate(), "close failed")));
     }
@@ -3519,7 +3789,7 @@ class Runtime {
 
   static bool DescriptorTransferArguments(
       const v8::FunctionCallbackInfo<v8::Value>& info, uint8_t** bytes,
-      DWORD* length, bool* positioned, LARGE_INTEGER* position) {
+      size_t* length, bool* positioned, int64_t* position) {
     v8::Isolate* isolate = info.GetIsolate();
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
     const uint8_t* data = nullptr;
@@ -3530,7 +3800,8 @@ class Runtime {
     }
     const int64_t offset = info[2]->IntegerValue(context).FromMaybe(-1);
     const int64_t requested = info[3]->IntegerValue(context).FromMaybe(-1);
-    if (offset < 0 || requested < 0 || requested > MAXDWORD ||
+    if (offset < 0 || requested < 0 ||
+        requested > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
         static_cast<uint64_t>(offset) > byte_length ||
         static_cast<uint64_t>(requested) > byte_length - offset) {
       isolate->ThrowException(v8::Exception::RangeError(
@@ -3538,9 +3809,9 @@ class Runtime {
       return false;
     }
     *bytes = const_cast<uint8_t*>(data) + offset;
-    *length = static_cast<DWORD>(requested);
+    *length = static_cast<size_t>(requested);
     *positioned = info.Length() > 4 && !info[4]->IsNullOrUndefined();
-    position->QuadPart = 0;
+    *position = 0;
     if (*positioned) {
       const int64_t value = info[4]->IntegerValue(context).FromMaybe(-1);
       if (value < 0) {
@@ -3548,7 +3819,7 @@ class Runtime {
             v8::String::NewFromUtf8Literal(isolate, "file position is invalid")));
         return false;
       }
-      position->QuadPart = value;
+      *position = value;
     }
     return true;
   }
@@ -3557,24 +3828,29 @@ class Runtime {
     FileDescriptor* file = FindFileDescriptor(FromCallback(info), info);
     if (file == nullptr) return;
     uint8_t* bytes = nullptr;
-    DWORD length = 0;
+    size_t length = 0;
     bool positioned = false;
-    LARGE_INTEGER position{};
+    int64_t position = 0;
     if (!DescriptorTransferArguments(info, &bytes, &length, &positioned,
                                      &position)) {
       return;
     }
+#if defined(_WIN32)
+    LARGE_INTEGER win_position{};
+    win_position.QuadPart = position;
     LARGE_INTEGER saved{};
     LARGE_INTEGER zero{};
     if (positioned &&
         (!SetFilePointerEx(file->handle, zero, &saved, FILE_CURRENT) ||
-         !SetFilePointerEx(file->handle, position, nullptr, FILE_BEGIN))) {
+         !SetFilePointerEx(file->handle, win_position, nullptr, FILE_BEGIN))) {
       info.GetIsolate()->ThrowException(v8::Exception::Error(
           v8::String::NewFromUtf8Literal(info.GetIsolate(), "read seek failed")));
       return;
     }
     DWORD transferred = 0;
-    const BOOL succeeded = ::ReadFile(file->handle, bytes, length, &transferred, nullptr);
+    const BOOL succeeded = ::ReadFile(file->handle, bytes,
+                                      static_cast<DWORD>(length), &transferred,
+                                      nullptr);
     if (positioned) SetFilePointerEx(file->handle, saved, nullptr, FILE_BEGIN);
     if (!succeeded) {
       info.GetIsolate()->ThrowException(v8::Exception::Error(
@@ -3582,39 +3858,57 @@ class Runtime {
       return;
     }
     info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(info.GetIsolate(), transferred));
+#else
+    const ssize_t transferred =
+        positioned ? pread(file->handle, bytes, length,
+                          static_cast<off_t>(position))
+                   : read(file->handle, bytes, length);
+    if (transferred < 0) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "read failed")));
+      return;
+    }
+    info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(
+        info.GetIsolate(), static_cast<uint32_t>(transferred)));
+#endif
   }
 
   static void WriteSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
     FileDescriptor* file = FindFileDescriptor(FromCallback(info), info);
     if (file == nullptr) return;
     uint8_t* bytes = nullptr;
-    DWORD length = 0;
+    size_t length = 0;
     bool positioned = false;
-    LARGE_INTEGER position{};
+    int64_t position = 0;
     if (!DescriptorTransferArguments(info, &bytes, &length, &positioned,
                                      &position)) {
       return;
     }
+#if defined(_WIN32)
+    LARGE_INTEGER win_position{};
     LARGE_INTEGER saved{};
     LARGE_INTEGER zero{};
     if (file->append) {
-      position.QuadPart = 0;
-      if (!SetFilePointerEx(file->handle, position, nullptr, FILE_END)) {
+      win_position.QuadPart = 0;
+      if (!SetFilePointerEx(file->handle, win_position, nullptr, FILE_END)) {
         info.GetIsolate()->ThrowException(v8::Exception::Error(
             v8::String::NewFromUtf8Literal(info.GetIsolate(), "append seek failed")));
         return;
       }
       positioned = false;
-    } else if (positioned &&
-               (!SetFilePointerEx(file->handle, zero, &saved, FILE_CURRENT) ||
-                !SetFilePointerEx(file->handle, position, nullptr, FILE_BEGIN))) {
-      info.GetIsolate()->ThrowException(v8::Exception::Error(
-          v8::String::NewFromUtf8Literal(info.GetIsolate(), "write seek failed")));
-      return;
+    } else if (positioned) {
+      win_position.QuadPart = position;
+      if (!SetFilePointerEx(file->handle, zero, &saved, FILE_CURRENT) ||
+          !SetFilePointerEx(file->handle, win_position, nullptr, FILE_BEGIN)) {
+        info.GetIsolate()->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(info.GetIsolate(), "write seek failed")));
+        return;
+      }
     }
     DWORD transferred = 0;
     const BOOL succeeded =
-        ::WriteFile(file->handle, bytes, length, &transferred, nullptr);
+        ::WriteFile(file->handle, bytes, static_cast<DWORD>(length),
+                   &transferred, nullptr);
     if (positioned) SetFilePointerEx(file->handle, saved, nullptr, FILE_BEGIN);
     if (!succeeded) {
       info.GetIsolate()->ThrowException(v8::Exception::Error(
@@ -3622,6 +3916,22 @@ class Runtime {
       return;
     }
     info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(info.GetIsolate(), transferred));
+#else
+    // O_APPEND (set on the descriptor when it was opened with an append
+    // flag) makes the kernel append atomically on every write, so there is
+    // no separate seek-to-end step the way Windows needs one.
+    const ssize_t transferred =
+        (positioned && !file->append)
+            ? pwrite(file->handle, bytes, length, static_cast<off_t>(position))
+            : write(file->handle, bytes, length);
+    if (transferred < 0) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "write failed")));
+      return;
+    }
+    info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(
+        info.GetIsolate(), static_cast<uint32_t>(transferred)));
+#endif
   }
 
   static void HttpListen(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -4166,10 +4476,10 @@ class Runtime {
       if (next->second.deadline > now) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             next->second.deadline - now + std::chrono::milliseconds(1));
-        const int64_t wait_milliseconds =
-            std::min<int64_t>(remaining.count(), MAXDWORD);
+        const int64_t wait_milliseconds = std::min<int64_t>(
+            remaining.count(), std::numeric_limits<uint32_t>::max());
         if (http_servers_.empty()) {
-          Sleep(static_cast<DWORD>(wait_milliseconds));
+          std::this_thread::sleep_for(std::chrono::milliseconds(wait_milliseconds));
         } else if (!handled_http) {
           // A pending timer caps the wait, but socket activity still ends it
           // early because the completion port is what the loop blocks on.

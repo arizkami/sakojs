@@ -57,9 +57,11 @@ const promisedRead = Buffer.alloc(1);
 strictEqual((await promisedHandle.read(promisedRead, 0, 1, 0)).bytesRead, 1);
 strictEqual(promisedRead.toString(), "H");
 await promisedHandle.close();
-const extendedPath = `\\\\?\\${process.argv[2]}`;
-writeFileSync(extendedPath, "extended");
-strictEqual(readFileSync(extendedPath, "utf8"), "extended");
+if (process.platform === "win32") {
+  const extendedPath = `\\\\?\\${process.argv[2]}`;
+  writeFileSync(extendedPath, "extended");
+  strictEqual(readFileSync(extendedPath, "utf8"), "extended");
+}
 const watchEvent = await new Promise((resolve, reject) => {
   const watcher = fs.watch(process.argv[2], { interval: 25 }, (event) => {
     watcher.close();
@@ -99,7 +101,7 @@ const callbackEntries = await new Promise((resolve, reject) => {
 assert.ok(callbackEntries.includes("renamed.txt"));
 fs.rmSync(directory, { recursive: true });
 assert.ok(!fs.existsSync(directory));
-strictEqual(path.basename("C:\\work\\file.txt"), "file.txt");
+strictEqual(path.win32.basename("C:\\work\\file.txt"), "file.txt");
 strictEqual(path.extname("file.txt"), ".txt");
 strictEqual(querystring.stringify({ value: "hello world" }), "value=hello+world");
 strictEqual(querystring.parse("value=hello+world").value, "hello world");
@@ -107,20 +109,23 @@ const decoder = new StringDecoder("utf8");
 const euro = Buffer.from("EUR: €");
 strictEqual(decoder.write(euro.subarray(0, euro.length - 2)), "EUR: ");
 strictEqual(decoder.end(euro.subarray(euro.length - 2)), "€");
-strictEqual(os.platform(), "win32");
+strictEqual(os.platform(), process.platform);
 strictEqual(os.arch(), "x64");
 strictEqual(os.endianness(), "LE");
-strictEqual(os.EOL, "\r\n");
+strictEqual(os.EOL, process.platform === "win32" ? "\r\n" : "\n");
 const localhost = await dnsPromises.lookup("localhost", { family: 4 });
 strictEqual(net.isIP(localhost.address), 4);
 let unsupported = 0;
 try { https.createServer(); } catch { unsupported += 1; }
 strictEqual(unsupported, 1);
-const child = childProcess.spawnSync("cmd.exe", ["/d", "/c", "echo child-output"], { encoding: "utf8" });
+const [shellFile, shellFlags] = process.platform === "win32"
+  ? ["cmd.exe", ["/d", "/c"]]
+  : ["/bin/sh", ["-c"]];
+const child = childProcess.spawnSync(shellFile, [...shellFlags, "echo child-output"], { encoding: "utf8" });
 strictEqual(child.status, 0);
 assert.ok(child.stdout.includes("child-output"));
 const asyncChildOutput = await new Promise((resolve, reject) => {
-  const spawned = childProcess.spawn("cmd.exe", ["/d", "/c", "echo async-child"]);
+  const spawned = childProcess.spawn(shellFile, [...shellFlags, "echo async-child"]);
   let output = "";
   spawned.stdout.on("data", (chunk) => { output += chunk.toString(); });
   spawned.once("error", reject);
@@ -129,9 +134,10 @@ const asyncChildOutput = await new Promise((resolve, reject) => {
 assert.ok(asyncChildOutput.includes("async-child"));
 strictEqual(processModule, process);
 assert.ok(path.isAbsolute(process.cwd()));
-strictEqual(path.normalize("\\\\server\\share\\folder\\..\\file.txt"), "\\\\server\\share\\file.txt");
-strictEqual(path.normalize("\\\\?\\UNC\\server\\share\\folder\\..\\file.txt"), "\\\\?\\UNC\\server\\share\\file.txt");
-strictEqual(path.normalize("\\\\?\\C:\\folder\\..\\file.txt"), "\\\\?\\C:\\file.txt");
+strictEqual(path.win32.normalize("\\\\server\\share\\folder\\..\\file.txt"), "\\\\server\\share\\file.txt");
+strictEqual(path.win32.normalize("\\\\?\\UNC\\server\\share\\folder\\..\\file.txt"), "\\\\?\\UNC\\server\\share\\file.txt");
+strictEqual(path.win32.normalize("\\\\?\\C:\\folder\\..\\file.txt"), "\\\\?\\C:\\file.txt");
+strictEqual(path.posix.normalize("/a/b/folder/../file.txt"), "/a/b/file.txt");
 assert.ok(typeof process.env === "object");
 // process.env materializes on first read; it must then behave like the plain
 // object it replaced.
@@ -142,7 +148,7 @@ assert.ok(Object.keys(process.env).includes("SAKO_TEST_VARIABLE"));
 delete process.env.SAKO_TEST_VARIABLE;
 strictEqual(process.env.SAKO_TEST_VARIABLE, undefined);
 strictEqual(process.env, process.env);
-assert.ok(process.execPath.endsWith("sako.exe"));
+assert.ok(process.execPath.endsWith(process.platform === "win32" ? "sako.exe" : "sako"));
 strictEqual(timers.setTimeout, setTimeout);
 assert.ok(typeof util.promisify === "function");
 strictEqual(new TextDecoder().decode(new TextEncoder().encode("text")), "text");

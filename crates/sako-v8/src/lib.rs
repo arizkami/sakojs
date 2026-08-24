@@ -931,6 +931,29 @@ fn copy_utf8(value: NativeBytes, label: &str) -> Result<String, String> {
         .map_err(|_| format!("{label} is not UTF-8"))
 }
 
+/// Computes the SHA-1 digest of `bytes` and writes the 20-byte result to
+/// `digest`. Runs identically on every platform (RustCrypto's `sha1` crate),
+/// which removes the need for a native crypto API (BCrypt on Windows,
+/// OpenSSL/libcrypto on Linux) in the C++ bridge entirely.
+///
+/// # Safety
+/// `bytes` must describe a readable range for this call. `digest` must be
+/// writable for at least 20 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_sha1(bytes: NativeBytes, digest: *mut u8) {
+    use sha1::{Digest as _, Sha1};
+    let input = if bytes.length == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the caller promises a readable range for this call.
+        unsafe { std::slice::from_raw_parts(bytes.data, bytes.length) }
+    };
+    let output = Sha1::digest(input);
+    // SAFETY: the caller promises `digest` is writable for 20 bytes, which
+    // matches the fixed SHA-1 output size.
+    unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), digest, output.len()) };
+}
+
 fn write_native_error(output: *mut c_char, capacity: usize, message: &str) {
     if output.is_null() || capacity == 0 {
         return;
@@ -1070,7 +1093,15 @@ impl Runtime {
             .join("bin")
             .join("icudtl.dat");
         let executable = path_to_c_string(executable)?;
-        let icu_data = path_to_c_string(icu_data)?;
+        // An empty path tells the bridge to skip ICU-default-location
+        // initialization: a build with icu_use_data_file=false (the staged
+        // Linux V8 archive) has no external data file at all and already
+        // carries its ICU data compiled in.
+        let icu_data = if icu_data.is_file() {
+            path_to_c_string(icu_data)?
+        } else {
+            CString::new("").unwrap()
+        };
         let mut error = vec![0_u8; ERROR_BUFFER_CAPACITY];
 
         // SAFETY: Both C strings and the writable error buffer remain valid for the call.

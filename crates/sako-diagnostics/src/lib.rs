@@ -1,43 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-#[cfg(not(windows))]
-compile_error!("sako-diagnostics currently supports only Windows");
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("sako-diagnostics currently supports only Windows and Linux");
 
-use std::ffi::c_void;
 use std::io;
-use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-#[repr(C)]
-#[derive(Default)]
-struct ProcessMemoryCountersEx {
-    size: u32,
-    page_fault_count: u32,
-    peak_working_set_size: usize,
-    working_set_size: usize,
-    quota_peak_paged_pool_usage: usize,
-    quota_paged_pool_usage: usize,
-    quota_peak_non_paged_pool_usage: usize,
-    quota_non_paged_pool_usage: usize,
-    pagefile_usage: usize,
-    peak_pagefile_usage: usize,
-    private_usage: usize,
-}
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn GetCurrentProcess() -> *mut c_void;
-    fn GetProcessHandleCount(process: *mut c_void, count: *mut u32) -> i32;
-}
-
-#[link(name = "psapi")]
-unsafe extern "system" {
-    fn GetProcessMemoryInfo(
-        process: *mut c_void,
-        counters: *mut ProcessMemoryCountersEx,
-        size: u32,
-    ) -> i32;
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessStats {
@@ -46,35 +13,122 @@ pub struct ProcessStats {
     pub os_handles: u64,
 }
 
+#[cfg(windows)]
+mod windows_stats {
+    use super::ProcessStats;
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem::size_of;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCountersEx {
+        size: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetProcessHandleCount(process: *mut c_void, count: *mut u32) -> i32;
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            size: u32,
+        ) -> i32;
+    }
+
+    pub fn process_stats() -> io::Result<ProcessStats> {
+        // SAFETY: GetCurrentProcess returns a process-wide pseudo-handle that must
+        // not be closed and remains valid for both synchronous queries below.
+        let process = unsafe { GetCurrentProcess() };
+        let mut counters = ProcessMemoryCountersEx {
+            size: size_of::<ProcessMemoryCountersEx>() as u32,
+            ..ProcessMemoryCountersEx::default()
+        };
+        // SAFETY: counters points to writable storage with the exact declared size.
+        if unsafe {
+            GetProcessMemoryInfo(
+                process,
+                &raw mut counters,
+                size_of::<ProcessMemoryCountersEx>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut handles = 0_u32;
+        // SAFETY: handles points to initialized writable storage for this call.
+        if unsafe { GetProcessHandleCount(process, &raw mut handles) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ProcessStats {
+            resident_set_bytes: counters.working_set_size as u64,
+            private_bytes: counters.private_usage as u64,
+            os_handles: handles.into(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_stats {
+    use super::ProcessStats;
+    use std::fs;
+    use std::io;
+
+    /// Reads one `/proc/self/status` field's value in kibibytes (the kernel
+    /// always reports memory fields there as `<name>:  <kB value> kB`).
+    fn status_field_kib(status: &str, name: &str) -> Option<u64> {
+        status.lines().find_map(|line| {
+            let rest = line.strip_prefix(name)?.trim_start();
+            let rest = rest.strip_suffix("kB")?.trim();
+            rest.parse::<u64>().ok()
+        })
+    }
+
+    pub fn process_stats() -> io::Result<ProcessStats> {
+        let status = fs::read_to_string("/proc/self/status")?;
+        let resident_set_bytes = status_field_kib(&status, "VmRSS:")
+            .ok_or_else(|| io::Error::other("cannot read VmRSS from /proc/self/status"))?
+            * 1024;
+        // Linux has no exact analog of Windows' "private bytes" counter; RSS is
+        // the closest single-number approximation available without walking
+        // /proc/self/smaps, so it is reused here for both fields.
+        let private_bytes = resident_set_bytes;
+        // GetProcessHandleCount's closest Linux analog is the number of open
+        // file descriptors, which is also what the leak-detection tests care
+        // about (a descriptor that should have closed still showing up here).
+        let os_handles = fs::read_dir("/proc/self/fd")?.count() as u64;
+        Ok(ProcessStats {
+            resident_set_bytes,
+            private_bytes,
+            os_handles,
+        })
+    }
+}
+
 pub fn process_stats() -> io::Result<ProcessStats> {
-    // SAFETY: GetCurrentProcess returns a process-wide pseudo-handle that must
-    // not be closed and remains valid for both synchronous queries below.
-    let process = unsafe { GetCurrentProcess() };
-    let mut counters = ProcessMemoryCountersEx {
-        size: size_of::<ProcessMemoryCountersEx>() as u32,
-        ..ProcessMemoryCountersEx::default()
-    };
-    // SAFETY: counters points to writable storage with the exact declared size.
-    if unsafe {
-        GetProcessMemoryInfo(
-            process,
-            &raw mut counters,
-            size_of::<ProcessMemoryCountersEx>() as u32,
-        )
-    } == 0
+    #[cfg(windows)]
     {
-        return Err(io::Error::last_os_error());
+        windows_stats::process_stats()
     }
-    let mut handles = 0_u32;
-    // SAFETY: handles points to initialized writable storage for this call.
-    if unsafe { GetProcessHandleCount(process, &raw mut handles) } == 0 {
-        return Err(io::Error::last_os_error());
+    #[cfg(all(target_os = "linux", not(windows)))]
+    {
+        linux_stats::process_stats()
     }
-    Ok(ProcessStats {
-        resident_set_bytes: counters.working_set_size as u64,
-        private_bytes: counters.private_usage as u64,
-        os_handles: handles.into(),
-    })
 }
 
 #[derive(Debug, Default)]

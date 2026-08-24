@@ -6,3 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

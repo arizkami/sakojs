@@ -388,16 +388,21 @@ fn run_package_script(name: &str, arguments: &[OsString]) -> Result<(), String> 
     let mut command_line = script.to_owned();
     for argument in arguments {
         command_line.push(' ');
-        command_line.push_str(&quote_cmd_argument(&argument.to_string_lossy()));
+        #[cfg(windows)]
+        command_line.push_str(&quote_windows_argument(&argument.to_string_lossy()));
+        #[cfg(unix)]
+        command_line.push_str(&quote_posix_argument(&argument.to_string_lossy()));
     }
-    let command_arguments = [
-        "/d".to_owned(),
-        "/s".to_owned(),
-        "/c".to_owned(),
-        command_line,
-    ];
+    #[cfg(windows)]
+    let shell = "cmd.exe";
+    #[cfg(windows)]
+    let command_arguments = vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned(), command_line];
+    #[cfg(unix)]
+    let shell = "/bin/sh";
+    #[cfg(unix)]
+    let command_arguments = vec!["-c".to_owned(), command_line];
     let output = spawn_native_with_bounded_output(
-        "cmd.exe",
+        shell,
         &command_arguments,
         None,
         MAXIMUM_SCRIPT_OUTPUT_BYTES,
@@ -419,8 +424,18 @@ fn run_package_script(name: &str, arguments: &[OsString]) -> Result<(), String> 
     }
 }
 
-fn quote_cmd_argument(argument: &str) -> String {
+#[cfg(windows)]
+fn quote_windows_argument(argument: &str) -> String {
     format!("\"{}\"", argument.replace('"', "\"\""))
+}
+
+/// Wraps an argument in single quotes for `/bin/sh -c`, matching how npm
+/// itself passes extra `run` arguments through on POSIX. Embedded single
+/// quotes are closed, escaped, and reopened (`'`, `\'`, `'`), the standard
+/// POSIX shell-quoting trick since a single-quoted string cannot contain one.
+#[cfg(unix)]
+fn quote_posix_argument(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
 }
 
 fn print_stats(stats: MemoryStats) {

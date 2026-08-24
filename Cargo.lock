@@ -1244,6 +1244,9 @@ dependencies = [
 [[package]]
 name = "sako-platform"
 version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "sako-process"
@@ -1271,6 +1274,7 @@ dependencies = [
  "sako-net",
  "sako-process",
  "sako-typescript",
+ "sha1",
  "ureq",
 ]
 

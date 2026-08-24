@@ -399,7 +399,7 @@
   console.info = console.info || console.log;
 
   const separators = /[\\/]+/g;
-  const path = {
+  const pathWin32 = {
     sep: "\\",
     delimiter: ";",
     normalize(value) {
@@ -442,14 +442,14 @@
       const result = root + parts.join("\\");
       return result ? result + (trailing && parts.length ? "\\" : "") : ".";
     },
-    join(...parts) { return path.normalize(parts.filter(Boolean).join("\\")); },
+    join(...parts) { return pathWin32.normalize(parts.filter(Boolean).join("\\")); },
     resolve(...parts) {
       let value = "";
       for (let index = parts.length - 1; index >= -1; --index) {
         value = `${index < 0 ? __sakoCwd : parts[index]}\\${value}`;
-        if (path.isAbsolute(value)) break;
+        if (pathWin32.isAbsolute(value)) break;
       }
-      return path.normalize(value);
+      return pathWin32.normalize(value);
     },
     isAbsolute(value) { return /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(String(value)); },
     basename(value, suffix = "") {
@@ -464,12 +464,63 @@
       return normalized.slice(0, index) || "\\";
     },
     extname(value) {
-      const name = path.basename(value);
+      const name = pathWin32.basename(value);
       const index = name.lastIndexOf(".");
       return index <= 0 ? "" : name.slice(index);
     },
   };
-  path.win32 = path;
+
+  const posixSeparators = /\/+/g;
+  const pathPosix = {
+    sep: "/",
+    delimiter: ":",
+    normalize(value) {
+      value = String(value);
+      const rooted = value.startsWith("/");
+      const trailing = value.length > 1 && value.endsWith("/");
+      const parts = [];
+      for (const part of value.split(posixSeparators)) {
+        if (!part || part === ".") continue;
+        if (part === ".." && parts.length && parts[parts.length - 1] !== "..") parts.pop();
+        else if (part !== ".." || !rooted) parts.push(part);
+      }
+      const result = (rooted ? "/" : "") + parts.join("/");
+      return result ? result + (trailing && parts.length ? "/" : "") : ".";
+    },
+    join(...parts) { return pathPosix.normalize(parts.filter(Boolean).join("/")); },
+    resolve(...parts) {
+      let value = "";
+      for (let index = parts.length - 1; index >= -1; --index) {
+        value = `${index < 0 ? __sakoCwd : parts[index]}/${value}`;
+        if (pathPosix.isAbsolute(value)) break;
+      }
+      return pathPosix.normalize(value);
+    },
+    isAbsolute(value) { return String(value).startsWith("/"); },
+    basename(value, suffix = "") {
+      const name = String(value).replace(/\/+$/, "").split("/").pop() || "";
+      return suffix && name.endsWith(suffix) && name !== suffix ? name.slice(0, -suffix.length) : name;
+    },
+    dirname(value) {
+      const normalized = String(value).replace(/\/+$/, "");
+      const index = normalized.lastIndexOf("/");
+      if (index < 0) return ".";
+      if (index === 0) return "/";
+      return normalized.slice(0, index);
+    },
+    extname(value) {
+      const name = pathPosix.basename(value);
+      const index = name.lastIndexOf(".");
+      return index <= 0 ? "" : name.slice(index);
+    },
+  };
+
+  // `__sakoPlatform` is set before this script runs (see bridge.cc), so the
+  // right flavor is already known at bootstrap-eval time, before `process`
+  // itself exists.
+  const path = globalThis.__sakoPlatform === "win32" ? pathWin32 : pathPosix;
+  path.win32 = pathWin32;
+  path.posix = pathPosix;
 
   class Stats {
     constructor(value) { Object.assign(this, value); }
@@ -1036,22 +1087,31 @@
     resolve6(hostname) { return new Promise((resolve, reject) => dns.resolve6(hostname, (error, value) => error ? reject(error) : resolve(value))); },
   };
 
+  const isWindows = globalThis.__sakoPlatform === "win32";
   const os = {
-    EOL: "\r\n",
-    devNull: "\\\\.\\nul",
+    EOL: isWindows ? "\r\n" : "\n",
+    devNull: isWindows ? "\\\\.\\nul" : "/dev/null",
     arch: () => process.arch,
     platform: () => process.platform,
-    type: () => "Windows_NT",
+    type: () => isWindows ? "Windows_NT" : "Linux",
     endianness: () => "LE",
-    homedir: () => process.env.USERPROFILE || "",
-    tmpdir: () => process.env.TEMP || process.env.TMP || "",
-    hostname: () => process.env.COMPUTERNAME || "",
-    release: () => process.env.OS || "Windows_NT",
+    homedir: () => (isWindows ? process.env.USERPROFILE : process.env.HOME) || "",
+    tmpdir: () => (isWindows
+      ? process.env.TEMP || process.env.TMP
+      : process.env.TMPDIR) || (isWindows ? "" : "/tmp"),
+    hostname: () => (isWindows ? process.env.COMPUTERNAME : process.env.HOSTNAME) || "",
+    release: () => (isWindows ? process.env.OS || "Windows_NT" : "Linux"),
     availableParallelism: () => Math.max(1, Number(process.env.NUMBER_OF_PROCESSORS) || 1),
     cpus: () => Array.from({ length: Math.max(1, Number(process.env.NUMBER_OF_PROCESSORS) || 1) }, () => ({ model: "unknown", speed: 0, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } })),
     freemem: () => 0,
     totalmem: () => 0,
-    userInfo: () => ({ username: process.env.USERNAME || "", uid: -1, gid: -1, shell: null, homedir: process.env.USERPROFILE || "" }),
+    userInfo: () => ({
+      username: (isWindows ? process.env.USERNAME : process.env.USER) || "",
+      uid: -1,
+      gid: -1,
+      shell: isWindows ? null : process.env.SHELL || "/bin/sh",
+      homedir: (isWindows ? process.env.USERPROFILE : process.env.HOME) || "",
+    }),
   };
 
   class HttpsServer extends Server {
@@ -1148,9 +1208,16 @@
     if (typeof callback === "function") child.once("close", (code) => callback(code === 0 ? null : new Error(`Command failed with status ${code}: ${file}`), stdout, stderr));
     return child;
   };
+  // cmd.exe's /d /s /c flags have no POSIX sh equivalent (they disable
+  // AutoRun scripts and quote-strip the command line); sh -c just takes the
+  // command string directly.
+  const shellInvocation = (command) => globalThis.__sakoPlatform === "win32"
+    ? ["cmd.exe", ["/d", "/s", "/c", String(command)]]
+    : ["/bin/sh", ["-c", String(command)]];
   childProcess.exec = (command, options, callback) => {
     if (typeof options === "function") { callback = options; options = {}; }
-    return childProcess.execFile("cmd.exe", ["/d", "/s", "/c", String(command)], options || {}, callback);
+    const [file, args] = shellInvocation(command);
+    return childProcess.execFile(file, args, options || {}, callback);
   };
   childProcess.execFileSync = (file, args, options) => {
     const result = childProcess.spawnSync(file, args, options);
@@ -1161,11 +1228,10 @@
     }
     return result.stdout;
   };
-  childProcess.execSync = (command, options) => childProcess.execFileSync(
-    "cmd.exe",
-    ["/d", "/s", "/c", String(command)],
-    options,
-  );
+  childProcess.execSync = (command, options) => {
+    const [file, args] = shellInvocation(command);
+    return childProcess.execFileSync(file, args, options);
+  };
 
   const plainSocket = { remoteAddress: "127.0.0.1", encrypted: false };
   const secureSocket = { remoteAddress: "127.0.0.1", encrypted: true };

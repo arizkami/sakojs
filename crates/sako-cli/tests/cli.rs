@@ -79,7 +79,11 @@ fn supports_runtime_commands_and_scheduling() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("win32 x64 argument\n"), "stdout: {stdout}");
+    let expected_platform = if cfg!(windows) { "win32" } else { "linux" };
+    assert!(
+        stdout.contains(&format!("{expected_platform} x64 argument\n")),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("microtask\n"), "stdout: {stdout}");
     assert!(stdout.contains("timeout\n"), "stdout: {stdout}");
     assert!(stdout.contains("interval-1\n"), "stdout: {stdout}");
@@ -415,6 +419,7 @@ console.log(response.status, response.ok, response.statusText, response.headers.
 }
 
 #[test]
+#[cfg(windows)]
 fn respects_windows_file_sharing_violations() {
     use std::os::windows::fs::OpenOptionsExt as _;
 

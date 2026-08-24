@@ -37,8 +37,13 @@ bool WriteHeader(const char* path, const uint8_t* data, size_t length) {
   }
   if (length % 32 != 0) header += "\n";
   header += "};\n";
+#if defined(_WIN32)
   FILE* file = nullptr;
   if (fopen_s(&file, path, "wb") != 0 || file == nullptr) return false;
+#else
+  FILE* file = fopen(path, "wb");
+  if (file == nullptr) return false;
+#endif
   const bool written =
       fwrite(header.data(), 1, header.size(), file) == header.size();
   fclose(file);
@@ -49,10 +54,12 @@ bool WriteHeader(const char* path, const uint8_t* data, size_t length) {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    fprintf(stderr, "usage: bootstrap_cache <icudtl.dat> <output header>\n");
+    fprintf(stderr, "usage: bootstrap_cache <icudtl.dat|empty> <output header>\n");
     return 1;
   }
-  if (!v8::V8::InitializeICUDefaultLocation(argv[0], argv[1])) {
+  // An empty path means the V8 build already has ICU data compiled in
+  // (icu_use_data_file=false), so there is no external file to point at.
+  if (argv[1][0] != '\0' && !v8::V8::InitializeICUDefaultLocation(argv[0], argv[1])) {
     fprintf(stderr, "cannot initialize ICU from %s\n", argv[1]);
     return 1;
   }
