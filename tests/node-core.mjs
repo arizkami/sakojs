@@ -33,6 +33,17 @@ strictEqual(received, 42);
 
 writeFileSync(process.argv[2], encoded);
 strictEqual(readFileSync(process.argv[2]).toString(), "h\u00e9llo");
+const readBytes = readFileSync(process.argv[2]);
+assert.ok(Buffer.isBuffer(readBytes));
+assert.ok(readBytes instanceof Uint8Array);
+strictEqual(readBytes.byteLength, encoded.byteLength);
+strictEqual(readBytes.subarray(0, 1).toString(), "h");
+strictEqual(readFileSync(process.argv[2], "utf8"), "h\u00e9llo");
+strictEqual(readFileSync(process.argv[2], { encoding: "utf8" }), "h\u00e9llo");
+assert.ok(Buffer.isBuffer(readFileSync(process.argv[2], {})));
+// Every read owns its own storage; writing one must not disturb the next.
+readBytes[0] = 0x48;
+strictEqual(readFileSync(process.argv[2]).subarray(0, 1).toString(), "h");
 strictEqual((await readFile(process.argv[2], "utf8")), "h\u00e9llo");
 assert.ok(fs.existsSync(process.argv[2]));
 const descriptor = fs.openSync(process.argv[2], "r+");

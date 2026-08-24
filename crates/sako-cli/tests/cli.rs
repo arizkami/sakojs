@@ -296,6 +296,29 @@ fn supports_initial_node_modules_and_web_globals() {
 }
 
 #[test]
+fn reads_large_files_byte_for_byte() {
+    let directory =
+        std::env::temp_dir().join(format!("sako-filesystem-large-{}", std::process::id()));
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("filesystem-large.mjs"))
+        .arg(&directory)
+        .output()
+        .expect("sako should start");
+    let _ = std::fs::remove_dir_all(&directory);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "filesystem-large ok
+"
+    );
+}
+
+#[test]
 fn fetches_bounded_http_responses_through_the_native_bridge() {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::net::TcpListener;

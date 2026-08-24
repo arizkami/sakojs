@@ -498,9 +498,19 @@
     });
   };
   const fs = {
-    readFileSync(...args) {
-      const value = __sakoReadFileSync(...args);
-      return typeof value === "string" ? value : Buffer.from(value);
+    readFileSync(target, options) {
+      // The native read already owns a fresh backing store sized to the file,
+      // so the bytes become a Buffer by retagging the view. Handing them to
+      // Buffer.from would copy the whole file a second time.
+      const encoding = typeof options === "string"
+        ? options
+        : options && typeof options === "object" ? options.encoding : undefined;
+      const value = encoding === undefined || encoding === null
+        ? __sakoReadFileSync(target)
+        : __sakoReadFileSync(target, encoding);
+      if (typeof value === "string") return value;
+      Object.setPrototypeOf(value, Buffer.prototype);
+      return value;
     },
     writeFileSync: __sakoWriteFileSync,
     existsSync: __sakoExistsSync,
