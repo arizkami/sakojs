@@ -118,7 +118,7 @@ fn executes_relative_es_modules() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "modules 42 argument\n"
+        "modules 42 import-target wildcard-target commonjs-namespace commonjs-namespace argument\n"
     );
 }
 
@@ -136,7 +136,7 @@ fn executes_commonjs_modules() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "42 commonjs package-main true\n"
+        "42 commonjs package-main require-target true\n"
     );
 }
 
@@ -159,6 +159,25 @@ fn executes_commonjs_from_a_unicode_path() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
+fn supports_initial_node_modules_and_web_globals() {
+    let output_path =
+        std::env::temp_dir().join(format!("sako-node-core-{}.txt", std::process::id()));
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("node-core.mjs"))
+        .arg(&output_path)
+        .output()
+        .expect("sako should start");
+    let _ = std::fs::remove_file(output_path);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "node-core 6 42\n");
 }
 
 #[test]

@@ -435,6 +435,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sako-platform"
+version = "0.1.0"
+
+[[package]]
 name = "sako-v8"
 version = "0.1.0"
 dependencies = [

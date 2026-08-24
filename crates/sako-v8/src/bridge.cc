@@ -20,6 +20,7 @@
 
 #include "libplatform/libplatform.h"
 #include "v8.h"
+#include "bootstrap.generated.h"
 
 namespace {
 
@@ -104,6 +105,149 @@ void ConsoleLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
     }
   }
   WriteStdout("\n", 1);
+}
+
+void ThrowTypeError(v8::Isolate* isolate, const char* message) {
+  isolate->ThrowException(v8::Exception::TypeError(
+      v8::String::NewFromUtf8(isolate, message).ToLocalChecked()));
+}
+
+void EncodeUtf8(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  if (info.Length() == 0) {
+    ThrowTypeError(isolate, "UTF-8 encoder needs a value");
+    return;
+  }
+  v8::Local<v8::String> text;
+  if (!info[0]->ToString(context).ToLocal(&text)) return;
+  const size_t length = text->Utf8LengthV2(isolate);
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(isolate, static_cast<size_t>(length));
+  text->WriteUtf8V2(isolate, static_cast<char*>(backing->Data()), length,
+                    v8::String::WriteFlags::kReplaceInvalidUtf8);
+  v8::Local<v8::ArrayBuffer> buffer =
+      v8::ArrayBuffer::New(isolate, std::move(backing));
+  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, length));
+}
+
+bool ReadBytes(v8::Local<v8::Value> value, const uint8_t** bytes,
+               size_t* length) {
+  if (!value->IsArrayBufferView()) return false;
+  v8::Local<v8::ArrayBufferView> view = value.As<v8::ArrayBufferView>();
+  std::shared_ptr<v8::BackingStore> backing = view->Buffer()->GetBackingStore();
+  *bytes = static_cast<const uint8_t*>(backing->Data()) + view->ByteOffset();
+  *length = view->ByteLength();
+  return true;
+}
+
+void DecodeUtf8(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const uint8_t* bytes = nullptr;
+  size_t length = 0;
+  if (info.Length() == 0 || !ReadBytes(info[0], &bytes, &length) ||
+      length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    ThrowTypeError(isolate, "UTF-8 decoder needs a byte array");
+    return;
+  }
+  v8::Local<v8::String> text;
+  if (v8::String::NewFromUtf8(isolate,
+                              reinterpret_cast<const char*>(bytes),
+                              v8::NewStringType::kNormal,
+                              static_cast<int>(length))
+          .ToLocal(&text)) {
+    info.GetReturnValue().Set(text);
+  }
+}
+
+std::filesystem::path CallbackPath(
+    const v8::FunctionCallbackInfo<v8::Value>& info) {
+  if (info.Length() == 0 || !info[0]->IsString()) return {};
+  return std::filesystem::path(Utf8ToWide(ToUtf8(info.GetIsolate(), info[0])));
+}
+
+void ThrowFileError(v8::Isolate* isolate, const std::string& operation,
+                    const std::filesystem::path& path) {
+  const std::string message =
+      operation + " failed for " + PathToUtf8(path) + ": " +
+      std::system_category().message(static_cast<int>(GetLastError()));
+  isolate->ThrowException(v8::Exception::Error(
+      v8::String::NewFromUtf8(isolate, message.data(),
+                              v8::NewStringType::kNormal,
+                              static_cast<int>(message.size()))
+          .ToLocalChecked()));
+}
+
+void ReadFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  constexpr size_t kMaximumFileBytes = 256 * 1024 * 1024;
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "readFileSync needs a string path");
+    return;
+  }
+  std::string bytes;
+  if (!ReadFile(path, &bytes) || bytes.size() > kMaximumFileBytes) {
+    ThrowFileError(isolate, "read", path);
+    return;
+  }
+  const bool text =
+      info.Length() > 1 && info[1]->IsString() &&
+      (ToUtf8(isolate, info[1]) == "utf8" || ToUtf8(isolate, info[1]) == "utf-8");
+  if (text) {
+    v8::Local<v8::String> value;
+    if (v8::String::NewFromUtf8(isolate, bytes.data(),
+                                v8::NewStringType::kNormal,
+                                static_cast<int>(bytes.size()))
+            .ToLocal(&value)) {
+      info.GetReturnValue().Set(value);
+    }
+    return;
+  }
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(isolate, bytes.size());
+  if (!bytes.empty()) std::memcpy(backing->Data(), bytes.data(), bytes.size());
+  v8::Local<v8::ArrayBuffer> buffer =
+      v8::ArrayBuffer::New(isolate, std::move(backing));
+  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, bytes.size()));
+}
+
+void WriteFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  constexpr size_t kMaximumFileBytes = 256 * 1024 * 1024;
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty() || info.Length() < 2) {
+    ThrowTypeError(isolate, "writeFileSync needs a path and data");
+    return;
+  }
+  const uint8_t* bytes = nullptr;
+  size_t length = 0;
+  std::string text;
+  if (info[1]->IsString()) {
+    text = ToUtf8(isolate, info[1]);
+    bytes = reinterpret_cast<const uint8_t*>(text.data());
+    length = text.size();
+  } else if (!ReadBytes(info[1], &bytes, &length)) {
+    ThrowTypeError(isolate, "writeFileSync data must be a string or byte array");
+    return;
+  }
+  if (length > kMaximumFileBytes) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        v8::String::NewFromUtf8Literal(isolate, "file exceeds byte limit")));
+    return;
+  }
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output ||
+      (length != 0 &&
+       !output.write(reinterpret_cast<const char*>(bytes), length))) {
+    ThrowFileError(isolate, "write", path);
+  }
+}
+
+void ExistsSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  const std::filesystem::path path = CallbackPath(info);
+  std::error_code error;
+  info.GetReturnValue().Set(!path.empty() && std::filesystem::exists(path, error));
 }
 
 std::string FormatException(v8::Isolate* isolate,
@@ -201,6 +345,11 @@ class Runtime {
           module.Reset();
         }
         commonjs_modules_.clear();
+        for (auto& [id, module] : synthetic_commonjs_) {
+          (void)id;
+          module.exports.Reset();
+        }
+        synthetic_commonjs_.clear();
         context_.Reset();
         isolate_->SetData(0, nullptr);
       }
@@ -373,7 +522,8 @@ class Runtime {
     *heap_committed = statistics.total_heap_size();
     *heap_limit = statistics.heap_size_limit();
     uint64_t handles =
-        (context_.IsEmpty() ? 0 : 1) + modules_.size() + commonjs_modules_.size();
+        (context_.IsEmpty() ? 0 : 1) + modules_.size() +
+        commonjs_modules_.size() + synthetic_commonjs_.size();
     for (const auto& [id, timer] : timers_) {
       (void)id;
       handles += 1 + timer.arguments.size();
@@ -401,6 +551,11 @@ class Runtime {
     }
   };
 
+  struct SyntheticCommonJs {
+    v8::Global<v8::Value> exports;
+    std::vector<std::string> names;
+  };
+
   Runtime() = default;
 
   bool InitializeContext(std::string* error) {
@@ -424,12 +579,62 @@ class Runtime {
         !InstallFunction(context, "setInterval", SetInterval, data) ||
         !InstallFunction(context, "clearTimeout", ClearTimer, data) ||
         !InstallFunction(context, "clearInterval", ClearTimer, data) ||
-        !InstallFunction(context, "queueMicrotask", QueueMicrotask, data)) {
+        !InstallFunction(context, "queueMicrotask", QueueMicrotask, data) ||
+        !InstallFunction(context, "__sakoEncodeUtf8", EncodeUtf8,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoDecodeUtf8", DecodeUtf8,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoReadFileSync", ReadFileSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoWriteFileSync", WriteFileSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoExistsSync", ExistsSync,
+                         v8::Undefined(isolate_))) {
       *error = "failed to install runtime scheduling globals";
       return false;
     }
 
+    const DWORD cwd_length = GetCurrentDirectoryW(0, nullptr);
+    std::wstring cwd(cwd_length, L'\0');
+    const DWORD cwd_written =
+        cwd_length == 0 ? 0 : GetCurrentDirectoryW(cwd_length, cwd.data());
+    if (cwd_written != 0) cwd.resize(cwd_written);
+    const std::string cwd_utf8 = WideToUtf8(cwd);
+    if (cwd_written == 0 ||
+        !Set(context, context->Global(), "__sakoCwd",
+             v8::String::NewFromUtf8(isolate_, cwd_utf8.data(),
+                                     v8::NewStringType::kNormal,
+                                     static_cast<int>(cwd_utf8.size()))
+                 .ToLocalChecked()) ||
+        !RunBootstrap(context, error)) {
+      if (error->empty()) *error = "failed to install runtime bootstrap";
+      return false;
+    }
+
     context_.Reset(isolate_, context);
+    return true;
+  }
+
+  bool RunBootstrap(v8::Local<v8::Context> context, std::string* error) {
+    v8::TryCatch try_catch(isolate_);
+    v8::Local<v8::String> source;
+    if (!v8::String::NewFromUtf8(isolate_, kSakoBootstrap,
+                                 v8::NewStringType::kNormal,
+                                 static_cast<int>(sizeof(kSakoBootstrap) - 1))
+             .ToLocal(&source)) {
+      *error = "runtime bootstrap exceeds V8 string limits";
+      return false;
+    }
+    v8::Local<v8::String> name =
+        v8::String::NewFromUtf8Literal(isolate_, "[sako:bootstrap]");
+    v8::ScriptOrigin origin(name);
+    v8::Local<v8::Script> script;
+    v8::Local<v8::Value> ignored;
+    if (!v8::Script::Compile(context, source, &origin).ToLocal(&script) ||
+        !script->Run(context).ToLocal(&ignored)) {
+      *error = FormatException(isolate_, context, try_catch);
+      return false;
+    }
     return true;
   }
 
@@ -498,9 +703,24 @@ class Runtime {
 
     const std::string request = ToUtf8(isolate, specifier);
     const std::string referrer_name = ToUtf8(isolate, referrer->GetResourceName());
+    if (request.starts_with("node:")) {
+      v8::Local<v8::Module> builtin;
+      std::string builtin_error;
+      if (runtime->CompileSyntheticBuiltin(context, request, &builtin,
+                                           &builtin_error)) {
+        return builtin;
+      }
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, builtin_error.data(),
+                                  v8::NewStringType::kNormal,
+                                  static_cast<int>(builtin_error.size()))
+              .ToLocalChecked()));
+      return {};
+    }
     std::filesystem::path resolved;
     std::string message;
-    if (!runtime->ResolvePath(request, referrer_name, &resolved, &message)) {
+    if (!runtime->ResolvePath(context, request, referrer_name, &resolved,
+                              &message)) {
       isolate->ThrowException(v8::Exception::Error(
           v8::String::NewFromUtf8(isolate, message.data(),
                                   v8::NewStringType::kNormal,
@@ -510,7 +730,12 @@ class Runtime {
     }
 
     v8::Local<v8::Module> module;
-    if (!runtime->CompileModule(context, resolved, &module, &message)) {
+    const bool compiled = runtime->IsCommonJsPath(context, resolved)
+                              ? runtime->CompileSyntheticCommonJs(
+                                    context, resolved, &module, &message)
+                              : runtime->CompileModule(context, resolved,
+                                                       &module, &message);
+    if (!compiled) {
       isolate->ThrowException(v8::Exception::Error(
           v8::String::NewFromUtf8(isolate, message.data(),
                                   v8::NewStringType::kNormal,
@@ -521,11 +746,207 @@ class Runtime {
     return module;
   }
 
-  bool ResolvePath(const std::string& request, const std::string& referrer,
+  bool IsCommonJsPath(v8::Local<v8::Context> context,
+                      const std::filesystem::path& path) {
+    if (path.extension() == L".cjs" || path.extension() == L".json") {
+      return true;
+    }
+    if (path.extension() == L".mjs") return false;
+    std::filesystem::path directory = path.parent_path();
+    while (!directory.empty()) {
+      v8::Local<v8::Object> manifest;
+      if (ReadJsonObject(context, directory / L"package.json", &manifest)) {
+        v8::Local<v8::Value> type;
+        return !(GetProperty(context, manifest, "type", &type) &&
+                 type->IsString() && ToUtf8(isolate_, type) == "module");
+      }
+      const auto parent = directory.parent_path();
+      if (parent == directory) break;
+      directory = parent;
+    }
+    return true;
+  }
+
+  bool CompileSyntheticCommonJs(v8::Local<v8::Context> context,
+                                const std::filesystem::path& path,
+                                v8::Local<v8::Module>* output,
+                                std::string* error) {
+    const std::string cache_key = "commonjs:" + PathToUtf8(path);
+    auto cached = modules_.find(cache_key);
+    if (cached != modules_.end()) {
+      *output = cached->second.Get(isolate_);
+      return true;
+    }
+    if (modules_.size() >= kMaximumModules) {
+      *error = "module cache capacity exceeded";
+      return false;
+    }
+    v8::Local<v8::Value> exports;
+    if (!LoadCommonJs(context, path, &exports, error)) return false;
+    return CompileSyntheticValue(context, cache_key, exports, output, error);
+  }
+
+  bool CompileSyntheticBuiltin(v8::Local<v8::Context> context,
+                               const std::string& request,
+                               v8::Local<v8::Module>* output,
+                               std::string* error) {
+    const std::string cache_key = "builtin:" + request;
+    auto cached = modules_.find(cache_key);
+    if (cached != modules_.end()) {
+      *output = cached->second.Get(isolate_);
+      return true;
+    }
+    v8::Local<v8::Value> exports;
+    if (!LoadBuiltin(context, request, &exports)) {
+      *error = "unsupported built-in module: " + request;
+      return false;
+    }
+    return CompileSyntheticValue(context, cache_key, exports, output, error);
+  }
+
+  bool CompileSyntheticValue(v8::Local<v8::Context> context,
+                             const std::string& cache_key,
+                             v8::Local<v8::Value> exports,
+                             v8::Local<v8::Module>* output,
+                             std::string* error) {
+    auto cached = modules_.find(cache_key);
+    if (cached != modules_.end()) {
+      *output = cached->second.Get(isolate_);
+      return true;
+    }
+    if (modules_.size() >= kMaximumModules) {
+      *error = "module cache capacity exceeded";
+      return false;
+    }
+    std::vector<std::string> names = {"default"};
+    if (exports->IsObject()) {
+      v8::Local<v8::Array> properties;
+      if (!exports.As<v8::Object>()
+               ->GetOwnPropertyNames(context)
+               .ToLocal(&properties)) {
+        *error = "cannot enumerate synthetic module exports: " + cache_key;
+        return false;
+      }
+      for (uint32_t index = 0; index < properties->Length(); ++index) {
+        v8::Local<v8::Value> property;
+        if (properties->Get(context, index).ToLocal(&property) &&
+            property->IsString()) {
+          const std::string name = ToUtf8(isolate_, property);
+          if (name != "default") names.push_back(name);
+        }
+      }
+    }
+
+    std::vector<v8::Local<v8::String>> export_names;
+    export_names.reserve(names.size());
+    for (const std::string& name : names) {
+      v8::Local<v8::String> export_name;
+      if (!v8::String::NewFromUtf8(isolate_, name.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(name.size()))
+               .ToLocal(&export_name)) {
+        *error = "synthetic export name exceeds V8 string limits";
+        return false;
+      }
+      export_names.push_back(export_name);
+    }
+    v8::Local<v8::String> module_name =
+        v8::String::NewFromUtf8(isolate_, cache_key.data(),
+                                v8::NewStringType::kNormal,
+                                static_cast<int>(cache_key.size()))
+            .ToLocalChecked();
+    v8::Local<v8::Module> module = v8::Module::CreateSyntheticModule(
+        isolate_, module_name,
+        v8::MemorySpan<const v8::Local<v8::String>>(export_names.data(),
+                                                    export_names.size()),
+        EvaluateSyntheticCommonJs);
+    const int identity = module->GetIdentityHash();
+    synthetic_commonjs_.emplace(
+        identity,
+        SyntheticCommonJs{v8::Global<v8::Value>(isolate_, exports), names});
+    modules_.emplace(cache_key, v8::Global<v8::Module>(isolate_, module));
+    *output = module;
+    return true;
+  }
+
+  static v8::MaybeLocal<v8::Value> EvaluateSyntheticCommonJs(
+      v8::Local<v8::Context> context, v8::Local<v8::Module> module) {
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    Runtime* runtime = static_cast<Runtime*>(isolate->GetData(0));
+    if (runtime == nullptr) return {};
+    auto found = runtime->synthetic_commonjs_.find(module->GetIdentityHash());
+    if (found == runtime->synthetic_commonjs_.end()) return {};
+    v8::Local<v8::Value> exports = found->second.exports.Get(isolate);
+    for (const std::string& name : found->second.names) {
+      v8::Local<v8::String> export_name =
+          v8::String::NewFromUtf8(isolate, name.data(),
+                                  v8::NewStringType::kNormal,
+                                  static_cast<int>(name.size()))
+              .ToLocalChecked();
+      v8::Local<v8::Value> value = exports;
+      if (name != "default" &&
+          !exports.As<v8::Object>()
+               ->Get(context, export_name)
+               .ToLocal(&value)) {
+        return {};
+      }
+      if (!module
+               ->SetSyntheticModuleExport(isolate, export_name, value)
+               .FromMaybe(false)) {
+        return {};
+      }
+    }
+    v8::Local<v8::Promise::Resolver> resolver;
+    if (!v8::Promise::Resolver::New(context).ToLocal(&resolver) ||
+        !resolver->Resolve(context, v8::Undefined(isolate)).FromMaybe(false)) {
+      return {};
+    }
+    return resolver->GetPromise();
+  }
+
+  bool LoadEsModuleNamespace(v8::Local<v8::Context> context,
+                             const std::filesystem::path& path,
+                             v8::Local<v8::Value>* output,
+                             std::string* error) {
+    v8::Local<v8::Module> module;
+    if (!CompileModule(context, path, &module, error)) return false;
+    if (module->GetStatus() == v8::Module::kUninstantiated &&
+        !module->InstantiateModule(context, ResolveModule).FromMaybe(false)) {
+      *error = "failed to instantiate ES module: " + PathToUtf8(path);
+      return false;
+    }
+    if (module->GetStatus() == v8::Module::kInstantiated) {
+      v8::Local<v8::Value> evaluation;
+      if (!module->Evaluate(context).ToLocal(&evaluation)) {
+        *error = "failed to evaluate ES module: " + PathToUtf8(path);
+        return false;
+      }
+      isolate_->PerformMicrotaskCheckpoint();
+      if (evaluation->IsPromise() &&
+          evaluation.As<v8::Promise>()->State() ==
+              v8::Promise::PromiseState::kPending) {
+        *error = "require cannot load an ES module with pending top-level await";
+        return false;
+      }
+    }
+    if (module->GetStatus() == v8::Module::kErrored) {
+      isolate_->ThrowException(module->GetException());
+      return false;
+    }
+    *output = module->GetModuleNamespace();
+    return true;
+  }
+
+  bool ResolvePath(v8::Local<v8::Context> context,
+                   const std::string& request, const std::string& referrer,
                    std::filesystem::path* output, std::string* error) {
     if (request.starts_with("node:")) {
       *error = "unsupported built-in module: " + request;
       return false;
+    }
+    if (request.starts_with('#')) {
+      return ResolvePackageImport(context, request, referrer, "require",
+                                  output, error);
     }
     const std::wstring request_wide = Utf8ToWide(request);
     const std::wstring referrer_wide = Utf8ToWide(referrer);
@@ -534,12 +955,17 @@ class Runtime {
       return false;
     }
 
+    if (request.starts_with('#')) {
+      return ResolvePackageImport(context, request, referrer, "import", output,
+                                  error);
+    }
+
     std::filesystem::path candidate(request_wide);
     if (!candidate.is_absolute()) {
       if (!(request.starts_with("./") || request.starts_with("../") ||
             request.starts_with(".\\") || request.starts_with("..\\"))) {
-        *error = "bare package imports are not supported yet: " + request;
-        return false;
+        return ResolvePackage(context, request, referrer, "import", output,
+                              error);
       }
       candidate = std::filesystem::path(referrer_wide).parent_path() / candidate;
     }
@@ -559,6 +985,258 @@ class Runtime {
       }
     }
     *error = "module not found: " + request + " imported from " + referrer;
+    return false;
+  }
+
+  bool ReadJsonObject(v8::Local<v8::Context> context,
+                      const std::filesystem::path& path,
+                      v8::Local<v8::Object>* output) {
+    std::string source;
+    if (!ReadFile(path, &source)) return false;
+    v8::Local<v8::String> json;
+    v8::Local<v8::Value> value;
+    if (!v8::String::NewFromUtf8(isolate_, source.data(),
+                                 v8::NewStringType::kNormal,
+                                 static_cast<int>(source.size()))
+             .ToLocal(&json) ||
+        !v8::JSON::Parse(context, json).ToLocal(&value) ||
+        !value->IsObject()) {
+      return false;
+    }
+    *output = value.As<v8::Object>();
+    return true;
+  }
+
+  bool GetProperty(v8::Local<v8::Context> context,
+                   v8::Local<v8::Object> object, const std::string& name,
+                   v8::Local<v8::Value>* output) {
+    v8::Local<v8::String> key;
+    return v8::String::NewFromUtf8(isolate_, name.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(name.size()))
+               .ToLocal(&key) &&
+           object->Get(context, key).ToLocal(output);
+  }
+
+  bool SelectPackageTarget(v8::Local<v8::Context> context,
+                           v8::Local<v8::Value> value,
+                           const std::string& condition,
+                           std::string* output) {
+    if (value->IsString()) {
+      *output = ToUtf8(isolate_, value);
+      return true;
+    }
+    if (value->IsArray()) {
+      v8::Local<v8::Array> alternatives = value.As<v8::Array>();
+      for (uint32_t index = 0; index < alternatives->Length(); ++index) {
+        v8::Local<v8::Value> alternative;
+        if (alternatives->Get(context, index).ToLocal(&alternative) &&
+            SelectPackageTarget(context, alternative, condition, output)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (!value->IsObject()) return false;
+    v8::Local<v8::Object> conditions = value.As<v8::Object>();
+    for (const std::string& name : {condition, std::string("node"),
+                                    std::string("default")}) {
+      v8::Local<v8::Value> target;
+      if (GetProperty(context, conditions, name, &target) &&
+          !target->IsUndefined() &&
+          SelectPackageTarget(context, target, condition, output)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool SelectPackageMap(v8::Local<v8::Context> context,
+                        v8::Local<v8::Value> map, const std::string& key,
+                        const std::string& condition, std::string* output) {
+    if (!map->IsObject()) return false;
+    v8::Local<v8::Object> object = map.As<v8::Object>();
+    v8::Local<v8::Value> exact;
+    if (GetProperty(context, object, key, &exact) && !exact->IsUndefined() &&
+        SelectPackageTarget(context, exact, condition, output)) {
+      return true;
+    }
+
+    v8::Local<v8::Array> names;
+    if (!object->GetOwnPropertyNames(context).ToLocal(&names)) return false;
+    size_t best_prefix = 0;
+    std::string best_target;
+    for (uint32_t index = 0; index < names->Length(); ++index) {
+      v8::Local<v8::Value> name_value;
+      if (!names->Get(context, index).ToLocal(&name_value) ||
+          !name_value->IsString()) {
+        continue;
+      }
+      const std::string name = ToUtf8(isolate_, name_value);
+      const size_t wildcard = name.find('*');
+      if (wildcard == std::string::npos) continue;
+      const std::string prefix = name.substr(0, wildcard);
+      const std::string suffix = name.substr(wildcard + 1);
+      if (!key.starts_with(prefix) || !key.ends_with(suffix) ||
+          key.size() < prefix.size() + suffix.size() ||
+          prefix.size() < best_prefix) {
+        continue;
+      }
+      v8::Local<v8::Value> candidate;
+      std::string target;
+      if (!object->Get(context, name_value).ToLocal(&candidate) ||
+          !SelectPackageTarget(context, candidate, condition, &target)) {
+        continue;
+      }
+      const std::string replacement = key.substr(
+          prefix.size(), key.size() - prefix.size() - suffix.size());
+      const size_t target_wildcard = target.find('*');
+      if (target_wildcard != std::string::npos) {
+        target.replace(target_wildcard, 1, replacement);
+      }
+      best_prefix = prefix.size();
+      best_target = std::move(target);
+    }
+    if (best_target.empty()) return false;
+    *output = std::move(best_target);
+    return true;
+  }
+
+  bool ResolvePackageTarget(v8::Local<v8::Context> context,
+                            const std::filesystem::path& package_root,
+                            const std::string& target,
+                            std::filesystem::path* output) {
+    if (!target.starts_with("./")) return false;
+    const std::filesystem::path candidate =
+        package_root / Utf8ToWide(target.substr(2));
+    std::error_code root_error;
+    std::error_code target_error;
+    const std::filesystem::path canonical_root =
+        std::filesystem::weakly_canonical(package_root, root_error);
+    const std::filesystem::path canonical_target =
+        std::filesystem::weakly_canonical(candidate, target_error);
+    if (root_error || target_error ||
+        !canonical_target.native().starts_with(canonical_root.native())) {
+      return false;
+    }
+    return ResolveCommonJsCandidate(context, canonical_target, output);
+  }
+
+  bool ResolvePackageImport(v8::Local<v8::Context> context,
+                            const std::string& request,
+                            const std::string& referrer,
+                            const std::string& condition,
+                            std::filesystem::path* output,
+                            std::string* error) {
+    std::filesystem::path directory =
+        std::filesystem::path(Utf8ToWide(referrer)).parent_path();
+    while (!directory.empty()) {
+      const std::filesystem::path manifest_path = directory / L"package.json";
+      v8::Local<v8::Object> manifest;
+      if (ReadJsonObject(context, manifest_path, &manifest)) {
+        v8::Local<v8::Value> imports;
+        std::string target;
+        if (GetProperty(context, manifest, "imports", &imports) &&
+            SelectPackageMap(context, imports, request, condition, &target) &&
+            ResolvePackageTarget(context, directory, target, output)) {
+          return true;
+        }
+        *error = "package import is not defined: " + request;
+        return false;
+      }
+      const auto parent = directory.parent_path();
+      if (parent == directory) break;
+      directory = parent;
+    }
+    *error = "package import has no package scope: " + request;
+    return false;
+  }
+
+  bool ResolvePackage(v8::Local<v8::Context> context,
+                      const std::string& request,
+                      const std::string& referrer,
+                      const std::string& condition,
+                      std::filesystem::path* output, std::string* error) {
+    std::string package_name;
+    std::string package_subpath;
+    if (request.starts_with('@')) {
+      const size_t first = request.find('/');
+      const size_t second = first == std::string::npos
+                                ? std::string::npos
+                                : request.find('/', first + 1);
+      package_name =
+          second == std::string::npos ? request : request.substr(0, second);
+      package_subpath =
+          second == std::string::npos ? "" : request.substr(second + 1);
+    } else {
+      const size_t slash = request.find('/');
+      package_name = request.substr(0, slash);
+      package_subpath =
+          slash == std::string::npos ? "" : request.substr(slash + 1);
+    }
+    if (package_name.empty()) {
+      *error = "invalid package specifier: " + request;
+      return false;
+    }
+
+    std::filesystem::path directory =
+        std::filesystem::path(Utf8ToWide(referrer)).parent_path();
+    while (!directory.empty()) {
+      const std::filesystem::path package_root =
+          directory / L"node_modules" / Utf8ToWide(package_name);
+      std::error_code directory_error;
+      if (std::filesystem::is_directory(package_root, directory_error)) {
+        v8::Local<v8::Object> manifest;
+        if (ReadJsonObject(context, package_root / L"package.json", &manifest)) {
+          v8::Local<v8::Value> exports;
+          if (GetProperty(context, manifest, "exports", &exports) &&
+              !exports->IsUndefined()) {
+            const std::string key = package_subpath.empty()
+                                        ? "."
+                                        : "./" + package_subpath;
+            std::string target;
+            bool selected = false;
+            if (package_subpath.empty() &&
+                (exports->IsString() || exports->IsArray())) {
+              selected = SelectPackageTarget(context, exports, condition,
+                                             &target);
+            } else if (package_subpath.empty() && exports->IsObject()) {
+              v8::Local<v8::Array> keys;
+              if (exports.As<v8::Object>()
+                      ->GetOwnPropertyNames(context)
+                      .ToLocal(&keys) &&
+                  keys->Length() != 0) {
+                v8::Local<v8::Value> first;
+                if (keys->Get(context, 0).ToLocal(&first) &&
+                    !ToUtf8(isolate_, first).starts_with('.')) {
+                  selected = SelectPackageTarget(context, exports, condition,
+                                                 &target);
+                }
+              }
+            }
+            if (!selected) {
+              selected = SelectPackageMap(context, exports, key, condition,
+                                          &target);
+            }
+            if (selected &&
+                ResolvePackageTarget(context, package_root, target, output)) {
+              return true;
+            }
+            *error = "package export is not defined: " + request;
+            return false;
+          }
+        }
+        const std::filesystem::path candidate =
+            package_subpath.empty()
+                ? package_root
+                : package_root / Utf8ToWide(package_subpath);
+        if (ResolveCommonJsCandidate(context, candidate, output)) return true;
+      }
+      const auto parent = directory.parent_path();
+      if (parent == directory) break;
+      directory = parent;
+    }
+    *error = "module not found: " + request + " from " + referrer;
     return false;
   }
 
@@ -746,7 +1424,12 @@ class Runtime {
       return;
     }
     v8::Local<v8::Value> exports;
-    if (!runtime->LoadCommonJs(context, resolved, &exports, &error)) {
+    const bool loaded = runtime->IsCommonJsPath(context, resolved)
+                            ? runtime->LoadCommonJs(context, resolved, &exports,
+                                                    &error)
+                            : runtime->LoadEsModuleNamespace(context, resolved,
+                                                             &exports, &error);
+    if (!loaded) {
       if (!isolate->HasPendingException()) {
         isolate->ThrowException(v8::Exception::Error(
             v8::String::NewFromUtf8(isolate, error.data(),
@@ -833,6 +1516,19 @@ class Runtime {
   bool LoadBuiltin(v8::Local<v8::Context> context,
                    const std::string& request,
                    v8::Local<v8::Value>* output) {
+    v8::Local<v8::Value> builtins;
+    if (context->Global()
+            ->Get(context,
+                  v8::String::NewFromUtf8Literal(isolate_, "__sakoBuiltins"))
+            .ToLocal(&builtins) &&
+        builtins->IsObject()) {
+      v8::Local<v8::Value> builtin;
+      if (GetProperty(context, builtins.As<v8::Object>(), request, &builtin) &&
+          !builtin->IsUndefined()) {
+        *output = builtin;
+        return true;
+      }
+    }
     if (request == "node:assert") {
       v8::Local<v8::Function> assert;
       v8::Local<v8::Function> strict_equal;
@@ -905,32 +1601,8 @@ class Runtime {
       }
       if (ResolveCommonJsCandidate(context, candidate, output)) return true;
     } else {
-      std::string package_name;
-      std::string package_subpath;
-      if (request.starts_with('@')) {
-        const size_t first = request.find('/');
-        const size_t second = first == std::string::npos
-                                  ? std::string::npos
-                                  : request.find('/', first + 1);
-        package_name = second == std::string::npos ? request : request.substr(0, second);
-        package_subpath = second == std::string::npos ? "" : request.substr(second + 1);
-      } else {
-        const size_t slash = request.find('/');
-        package_name = request.substr(0, slash);
-        package_subpath = slash == std::string::npos ? "" : request.substr(slash + 1);
-      }
-      std::filesystem::path directory = referrer_path.parent_path();
-      while (!directory.empty()) {
-        std::filesystem::path package_root =
-            directory / L"node_modules" / Utf8ToWide(package_name);
-        candidate = package_subpath.empty()
-                        ? package_root
-                        : package_root / Utf8ToWide(package_subpath);
-        if (ResolveCommonJsCandidate(context, candidate, output)) return true;
-        const auto parent = directory.parent_path();
-        if (parent == directory) break;
-        directory = parent;
-      }
+      return ResolvePackage(context, request, referrer, "require", output,
+                            error);
     }
     *error = "module not found: " + request + " required from " + referrer;
     return false;
@@ -1191,6 +1863,7 @@ class Runtime {
   std::unordered_map<uint64_t, Timer> timers_;
   std::unordered_map<std::string, v8::Global<v8::Module>> modules_;
   std::unordered_map<std::string, v8::Global<v8::Object>> commonjs_modules_;
+  std::unordered_map<int, SyntheticCommonJs> synthetic_commonjs_;
   size_t module_source_bytes_ = 0;
   uint64_t next_timer_id_ = 1;
   bool v8_initialized_ = false;

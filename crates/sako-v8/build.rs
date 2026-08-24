@@ -34,16 +34,23 @@ fn main() {
     let lib_dir = v8_root.join("lib");
     let v8_monolith = lib_dir.join("v8_monolith.lib");
     let bridge = manifest_dir.join("src").join("bridge.cc");
+    let bootstrap = workspace_root
+        .join("runtime")
+        .join("js")
+        .join("bootstrap.js");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let embedder_library = out_dir.join("v8_embedder.lib");
+    let bootstrap_header = out_dir.join("bootstrap.generated.h");
 
     create_embedder_library(&v8_monolith, &embedder_library);
+    generate_bootstrap_header(&bootstrap, &bootstrap_header);
 
     cc::Build::new()
         .cpp(true)
         .std("c++20")
         .static_crt(true)
         .include(&include_dir)
+        .include(&out_dir)
         .file(&bridge)
         .define("V8_COMPRESS_POINTERS", None)
         .flag_if_supported("/EHsc")
@@ -60,7 +67,23 @@ fn main() {
     println!("cargo:rustc-env=SAKO_V8_ROOT={}", v8_root.display());
     println!("cargo:rerun-if-env-changed=SAKO_V8_ROOT");
     println!("cargo:rerun-if-changed={}", bridge.display());
+    println!("cargo:rerun-if-changed={}", bootstrap.display());
     println!("cargo:rerun-if-changed={}", v8_monolith.display());
+}
+
+fn generate_bootstrap_header(source_path: &Path, output_path: &Path) {
+    let source = fs::read_to_string(source_path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", source_path.display()));
+    const DELIMITER: &str = "SAKO_BOOT_7D9C";
+    assert!(
+        !source.contains(DELIMITER),
+        "bootstrap contains raw-string delimiter"
+    );
+    let header = format!(
+        "// Generated from runtime/js/bootstrap.js.\nstatic constexpr const char kSakoBootstrap[] = R\"{DELIMITER}({source}){DELIMITER}\";\n"
+    );
+    fs::write(output_path, header)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", output_path.display()));
 }
 
 fn create_embedder_library(source: &Path, output: &Path) {

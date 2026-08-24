@@ -29,6 +29,75 @@ const MAXIMUM_STORE_FILES: usize = 50_000;
 const MAXIMUM_STORE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
+struct RegistryConfig {
+    registry: String,
+    scoped_registries: BTreeMap<String, String>,
+    auth_tokens: BTreeMap<String, String>,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            registry: DEFAULT_REGISTRY.into(),
+            scoped_registries: BTreeMap::new(),
+            auth_tokens: BTreeMap::new(),
+        }
+    }
+}
+
+fn read_npmrc(path: &Path, config: &mut RegistryConfig) -> Result<(), PackageError> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for line in source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = expand_environment(value.trim());
+        if key == "registry" {
+            config.registry = value;
+        } else if let Some(scope) = key.strip_suffix(":registry") {
+            if scope.starts_with('@') {
+                config.scoped_registries.insert(scope.into(), value);
+            }
+        } else if let Some(prefix) = key.strip_suffix(":_authToken") {
+            config.auth_tokens.insert(registry_auth_key(prefix), value);
+        }
+    }
+    Ok(())
+}
+
+fn expand_environment(value: &str) -> String {
+    let mut output = value.to_owned();
+    while let Some(start) = output.find("${") {
+        let Some(relative_end) = output[start + 2..].find('}') else {
+            break;
+        };
+        let end = start + 2 + relative_end;
+        let name = &output[start + 2..end];
+        let replacement = env::var(name).unwrap_or_default();
+        output.replace_range(start..=end, &replacement);
+    }
+    output
+}
+
+fn registry_auth_key(url: &str) -> String {
+    url.trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))
+        .or_else(|| url.trim().strip_prefix("//"))
+        .unwrap_or(url.trim())
+        .to_ascii_lowercase()
+}
+
+#[derive(Debug)]
 pub struct PackageError(String);
 
 impl fmt::Display for PackageError {
@@ -55,6 +124,8 @@ impl From<serde_json::Error> for PackageError {
 pub struct PackageManager {
     root: PathBuf,
     registry: String,
+    scoped_registries: BTreeMap<String, String>,
+    auth_tokens: BTreeMap<String, String>,
     cache_root: PathBuf,
     metadata: HashMap<String, Metadata>,
     ignore_scripts: bool,
@@ -65,7 +136,19 @@ pub struct PackageManager {
 impl PackageManager {
     pub fn new(root: impl Into<PathBuf>, ignore_scripts: bool) -> Result<Self, PackageError> {
         let root = root.into();
-        let registry = env::var("SAKO_NPM_REGISTRY").unwrap_or_else(|_| DEFAULT_REGISTRY.into());
+        let mut registry_config = RegistryConfig::default();
+        if let Some(home) = env::var_os("USERPROFILE") {
+            read_npmrc(&PathBuf::from(home).join(".npmrc"), &mut registry_config)?;
+        }
+        read_npmrc(&root.join(".npmrc"), &mut registry_config)?;
+        if let Ok(registry) = env::var("SAKO_NPM_REGISTRY") {
+            registry_config.registry = registry;
+        }
+        if let Ok(token) = env::var("SAKO_NPM_TOKEN") {
+            registry_config
+                .auth_tokens
+                .insert(registry_auth_key(&registry_config.registry), token);
+        }
         let cache_root = env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| PackageError("LOCALAPPDATA is not set".into()))?
@@ -74,7 +157,9 @@ impl PackageManager {
             .join("sha512");
         Ok(Self {
             root,
-            registry: registry.trim_end_matches('/').into(),
+            registry: registry_config.registry.trim_end_matches('/').into(),
+            scoped_registries: registry_config.scoped_registries,
+            auth_tokens: registry_config.auth_tokens,
             cache_root,
             metadata: HashMap::new(),
             ignore_scripts,
@@ -91,8 +176,10 @@ impl PackageManager {
         for (name, requirement) in manifest_dependencies(&manifest, "devDependencies")? {
             dependencies.entry(name).or_insert(requirement);
         }
-        for (name, requirement) in manifest_dependencies(&manifest, "optionalDependencies")? {
-            dependencies.entry(name).or_insert(requirement);
+        let optional_dependencies = manifest_dependencies(&manifest, "optionalDependencies")?;
+
+        if self.install_from_lock(&dependencies, &optional_dependencies)? {
+            return Ok(());
         }
 
         let node_modules = self.root.join("node_modules");
@@ -105,6 +192,17 @@ impl PackageManager {
                 &format!("node_modules/{name}"),
             )?;
         }
+        for (name, requirement) in optional_dependencies {
+            if let Err(error) = self.install_dependency(
+                &name,
+                &requirement,
+                &node_modules,
+                &format!("node_modules/{name}"),
+            ) {
+                eprintln!("sako: skipping optional dependency {name}: {error}");
+            }
+        }
+        validate_peer_dependencies(&self.installed)?;
         self.write_lockfile()
     }
 
@@ -198,6 +296,15 @@ impl PackageManager {
                 resolved: package.dist.tarball.clone(),
                 integrity: package.dist.integrity.clone(),
                 dependencies: package.dependencies.clone(),
+                optional_dependencies: package.optional_dependencies.clone(),
+                peer_dependencies: package.peer_dependencies.clone(),
+                optional_peers: package
+                    .peer_dependencies_meta
+                    .iter()
+                    .filter(|(_, metadata)| metadata.optional)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                scripts: package.scripts.clone(),
             },
         );
 
@@ -210,6 +317,108 @@ impl PackageManager {
                 &child_node_modules,
                 &child_lock_path,
             )?;
+        }
+        for (dependency, child_requirement) in package.optional_dependencies.clone() {
+            let child_lock_path = format!("{lock_path}/node_modules/{dependency}");
+            if let Err(error) = self.install_dependency(
+                &dependency,
+                &child_requirement,
+                &child_node_modules,
+                &child_lock_path,
+            ) {
+                eprintln!("sako: skipping optional dependency {dependency}: {error}");
+            }
+        }
+        if !self.ignore_scripts {
+            run_lifecycle_scripts(&destination, &package.scripts)?;
+        }
+        self.active.remove(&identity);
+        Ok(())
+    }
+
+    fn install_from_lock(
+        &mut self,
+        root_dependencies: &BTreeMap<String, String>,
+        root_optional_dependencies: &BTreeMap<String, String>,
+    ) -> Result<bool, PackageError> {
+        let path = self.root.join("sako.lock");
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let source = fs::read_to_string(&path)?;
+        let lockfile: Lockfile = serde_json::from_str(&source)
+            .map_err(|error| PackageError(format!("invalid {}: {error}", path.display())))?;
+        if lockfile.lockfile_version != 2
+            || !lock_matches_manifest(&lockfile, root_dependencies, root_optional_dependencies)
+        {
+            return Ok(false);
+        }
+
+        self.installed = lockfile.packages.clone();
+        self.active.clear();
+        let node_modules = self.root.join("node_modules");
+        fs::create_dir_all(&node_modules)?;
+        for name in root_dependencies.keys() {
+            self.install_locked_dependency(
+                &lockfile,
+                &format!("node_modules/{name}"),
+                &node_modules,
+            )?;
+        }
+        for name in root_optional_dependencies.keys() {
+            let lock_path = format!("node_modules/{name}");
+            if lockfile.packages.contains_key(&lock_path) {
+                if let Err(error) =
+                    self.install_locked_dependency(&lockfile, &lock_path, &node_modules)
+                {
+                    eprintln!("sako: skipping optional dependency {name}: {error}");
+                }
+            }
+        }
+        validate_peer_dependencies(&self.installed)?;
+        Ok(true)
+    }
+
+    fn install_locked_dependency(
+        &mut self,
+        lockfile: &Lockfile,
+        lock_path: &str,
+        parent_node_modules: &Path,
+    ) -> Result<(), PackageError> {
+        let package = lockfile.packages.get(lock_path).cloned().ok_or_else(|| {
+            PackageError(format!("lockfile is missing dependency entry {lock_path}"))
+        })?;
+        let identity = format!("{}@{}", package.name, package.version);
+        if !self.active.insert(identity.clone()) {
+            return Ok(());
+        }
+
+        let destination = package_install_path(parent_node_modules, &package.name)?;
+        let archive = self.fetch_archive(&Distribution {
+            tarball: package.resolved.clone(),
+            integrity: package.integrity.clone(),
+        })?;
+        extract_archive(&archive, &destination)?;
+        let child_node_modules = destination.join("node_modules");
+        for (dependency, requirement) in &package.dependencies {
+            let child_path = format!("{lock_path}/node_modules/{dependency}");
+            if lockfile.packages.contains_key(&child_path) {
+                self.install_locked_dependency(lockfile, &child_path, &child_node_modules)?;
+            } else if !lock_has_ancestor_dependency(lockfile, lock_path, dependency, requirement) {
+                return Err(PackageError(format!(
+                    "lockfile is missing transitive dependency {dependency} for {lock_path}"
+                )));
+            }
+        }
+        for dependency in package.optional_dependencies.keys() {
+            let child_path = format!("{lock_path}/node_modules/{dependency}");
+            if lockfile.packages.contains_key(&child_path) {
+                if let Err(error) =
+                    self.install_locked_dependency(lockfile, &child_path, &child_node_modules)
+                {
+                    eprintln!("sako: skipping optional dependency {dependency}: {error}");
+                }
+            }
         }
         if !self.ignore_scripts {
             run_lifecycle_scripts(&destination, &package.scripts)?;
@@ -226,8 +435,10 @@ impl PackageManager {
                 ));
             }
             let encoded = name.replace('/', "%2f");
-            let url = format!("{}/{encoded}", self.registry);
-            let response = ureq::get(&url)
+            let registry = self.registry_for(name);
+            let url = format!("{}/{encoded}", registry.trim_end_matches('/'));
+            let response = self
+                .request(&url)
                 .set("Accept", "application/vnd.npm.install-v1+json")
                 .call()
                 .map_err(|error| {
@@ -264,7 +475,8 @@ impl PackageManager {
             return Ok(bytes);
         }
 
-        let response = ureq::get(&distribution.tarball)
+        let response = self
+            .request(&distribution.tarball)
             .call()
             .map_err(|error| PackageError(format!("tarball download failed: {error}")))?;
         let mut bytes = Vec::new();
@@ -284,6 +496,33 @@ impl PackageManager {
         fs::rename(temporary, cache_path)?;
         prune_store(&self.cache_root)?;
         Ok(bytes)
+    }
+
+    fn registry_for(&self, name: &str) -> &str {
+        if let Some(scope) = name
+            .strip_prefix('@')
+            .and_then(|name| name.split('/').next())
+        {
+            let scope = format!("@{scope}");
+            if let Some(registry) = self.scoped_registries.get(&scope) {
+                return registry;
+            }
+        }
+        &self.registry
+    }
+
+    fn request(&self, url: &str) -> ureq::Request {
+        let mut request = ureq::get(url);
+        let key = registry_auth_key(url);
+        if let Some((_, token)) = self
+            .auth_tokens
+            .iter()
+            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+        {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        request
     }
 
     fn read_manifest(&self) -> Result<serde_json::Value, PackageError> {
@@ -312,7 +551,7 @@ impl PackageManager {
 
     fn write_lockfile(&self) -> Result<(), PackageError> {
         let lockfile = Lockfile {
-            lockfile_version: 1,
+            lockfile_version: 2,
             packages: self.installed.clone(),
         };
         let mut source = serde_json::to_string_pretty(&lockfile)?;
@@ -336,8 +575,20 @@ struct PackageVersion {
     dist: Distribution,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
+    #[serde(rename = "optionalDependencies", default)]
+    optional_dependencies: BTreeMap<String, String>,
+    #[serde(rename = "peerDependencies", default)]
+    peer_dependencies: BTreeMap<String, String>,
+    #[serde(rename = "peerDependenciesMeta", default)]
+    peer_dependencies_meta: BTreeMap<String, PeerDependencyMetadata>,
     #[serde(default)]
     scripts: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PeerDependencyMetadata {
+    #[serde(default)]
+    optional: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -346,20 +597,137 @@ struct Distribution {
     integrity: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Lockfile {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: u32,
     packages: BTreeMap<String, LockedPackage>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LockedPackage {
     name: String,
     version: String,
     resolved: String,
     integrity: String,
     dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    optional_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    peer_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    optional_peers: Vec<String>,
+    #[serde(default)]
+    scripts: BTreeMap<String, String>,
+}
+
+fn requirement_matches(version: &str, requirement: &str) -> bool {
+    if requirement == "latest" || requirement.is_empty() {
+        return true;
+    }
+    if requirement == version {
+        return true;
+    }
+    VersionReq::parse(requirement)
+        .ok()
+        .zip(Version::parse(version).ok())
+        .is_some_and(|(requirement, version)| requirement.matches(&version))
+}
+
+fn lock_matches_manifest(
+    lockfile: &Lockfile,
+    root_dependencies: &BTreeMap<String, String>,
+    root_optional_dependencies: &BTreeMap<String, String>,
+) -> bool {
+    let required_match = root_dependencies.iter().all(|(name, requirement)| {
+        lockfile
+            .packages
+            .get(&format!("node_modules/{name}"))
+            .is_some_and(|package| {
+                package.name == *name && requirement_matches(&package.version, requirement)
+            })
+    });
+    required_match
+        && root_optional_dependencies
+            .iter()
+            .all(|(name, requirement)| {
+                lockfile
+                    .packages
+                    .get(&format!("node_modules/{name}"))
+                    .is_none_or(|package| {
+                        package.name == *name && requirement_matches(&package.version, requirement)
+                    })
+            })
+}
+
+fn validate_peer_dependencies(
+    packages: &BTreeMap<String, LockedPackage>,
+) -> Result<(), PackageError> {
+    for (lock_path, package) in packages {
+        for (peer, requirement) in &package.peer_dependencies {
+            let resolved = find_ancestor_dependency(packages, lock_path, peer);
+            if resolved.is_none() && package.optional_peers.contains(peer) {
+                continue;
+            }
+            let Some(resolved) = resolved else {
+                return Err(PackageError(format!(
+                    "{}@{} requires peer {peer}@{requirement}",
+                    package.name, package.version
+                )));
+            };
+            if !requirement_matches(&resolved.version, requirement) {
+                return Err(PackageError(format!(
+                    "{}@{} requires peer {peer}@{requirement}, but {} is installed",
+                    package.name, package.version, resolved.version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_ancestor_dependency<'a>(
+    packages: &'a BTreeMap<String, LockedPackage>,
+    lock_path: &str,
+    dependency: &str,
+) -> Option<&'a LockedPackage> {
+    let direct = format!("{lock_path}/node_modules/{dependency}");
+    if let Some(package) = packages.get(&direct) {
+        return Some(package);
+    }
+    let mut ancestor = lock_path;
+    while let Some(index) = ancestor.rfind("/node_modules/") {
+        let candidate = format!("{}/node_modules/{dependency}", &ancestor[..index]);
+        if let Some(package) = packages.get(&candidate) {
+            return Some(package);
+        }
+        ancestor = &ancestor[..index];
+    }
+    packages.get(&format!("node_modules/{dependency}"))
+}
+
+fn lock_has_ancestor_dependency(
+    lockfile: &Lockfile,
+    lock_path: &str,
+    dependency: &str,
+    requirement: &str,
+) -> bool {
+    let mut ancestor = lock_path;
+    while let Some(index) = ancestor.rfind("/node_modules/") {
+        let candidate = format!("{}/node_modules/{dependency}", &ancestor[..index]);
+        if lockfile.packages.get(&candidate).is_some_and(|package| {
+            package.name == dependency && requirement_matches(&package.version, requirement)
+        }) {
+            return true;
+        }
+        ancestor = &ancestor[..index];
+    }
+    lockfile
+        .packages
+        .get(&format!("node_modules/{dependency}"))
+        .is_some_and(|package| {
+            package.name == dependency && requirement_matches(&package.version, requirement)
+        })
 }
 
 fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersion, PackageError> {
@@ -599,6 +967,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     #[test]
     fn parses_scoped_and_unscoped_specifiers() {
@@ -645,6 +1015,132 @@ mod tests {
         let expected = parse_sha512_integrity(&integrity).unwrap();
         assert!(verify_integrity(bytes, &expected).is_ok());
         assert!(verify_integrity(b"changed", &expected).is_err());
+    }
+
+    #[test]
+    fn replays_a_compatible_lockfile_without_registry_metadata() {
+        let root = env::temp_dir().join(format!("sako-lock-replay-{}", std::process::id()));
+        let cache_root = root.join("cache");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"fixture":"^1.0.0"}}"#,
+        )
+        .unwrap();
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let source = b"module.exports = 42;\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("package/index.js").unwrap();
+        header.set_size(source.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append(&header, &source[..]).unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let digest = Sha512::digest(&bytes).to_vec();
+        let digest_hex = hex(&digest);
+        let cache_path = cache_root
+            .join(&digest_hex[..2])
+            .join(format!("{digest_hex}.tgz"));
+        fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        fs::write(cache_path, &bytes).unwrap();
+
+        let lockfile = Lockfile {
+            lockfile_version: 2,
+            packages: BTreeMap::from([(
+                "node_modules/fixture".into(),
+                LockedPackage {
+                    name: "fixture".into(),
+                    version: "1.2.3".into(),
+                    resolved: "https://invalid.example/fixture.tgz".into(),
+                    integrity: format!("sha512-{}", BASE64.encode(&digest)),
+                    dependencies: BTreeMap::new(),
+                    optional_dependencies: BTreeMap::new(),
+                    peer_dependencies: BTreeMap::new(),
+                    optional_peers: Vec::new(),
+                    scripts: BTreeMap::new(),
+                },
+            )]),
+        };
+        fs::write(
+            root.join("sako.lock"),
+            serde_json::to_string_pretty(&lockfile).unwrap(),
+        )
+        .unwrap();
+
+        let mut manager = PackageManager {
+            root: root.clone(),
+            registry: "https://invalid.example".into(),
+            scoped_registries: BTreeMap::new(),
+            auth_tokens: BTreeMap::new(),
+            cache_root,
+            metadata: HashMap::new(),
+            ignore_scripts: true,
+            installed: BTreeMap::new(),
+            active: HashSet::new(),
+        };
+        manager.install().unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("node_modules/fixture/index.js")).unwrap(),
+            "module.exports = 42;\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validates_peer_requirements_against_ancestor_packages() {
+        let empty = || LockedPackage {
+            name: String::new(),
+            version: String::new(),
+            resolved: String::new(),
+            integrity: String::new(),
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            optional_peers: Vec::new(),
+            scripts: BTreeMap::new(),
+        };
+        let mut peer = empty();
+        peer.name = "peer".into();
+        peer.version = "2.0.0".into();
+        let mut plugin = empty();
+        plugin.name = "plugin".into();
+        plugin.version = "1.0.0".into();
+        plugin.peer_dependencies.insert("peer".into(), "^2".into());
+        let mut packages = BTreeMap::from([
+            ("node_modules/peer".into(), peer),
+            ("node_modules/plugin".into(), plugin),
+        ]);
+        assert!(validate_peer_dependencies(&packages).is_ok());
+        packages.get_mut("node_modules/peer").unwrap().version = "3.0.0".into();
+        assert!(validate_peer_dependencies(&packages).is_err());
+    }
+
+    #[test]
+    fn reads_default_scoped_and_token_npmrc_settings() {
+        let root = env::temp_dir().join(format!("sako-npmrc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(".npmrc");
+        fs::write(
+            &path,
+            "registry=https://packages.example/npm/\n@private:registry=https://private.example/\n//private.example/:_authToken=secret\n",
+        )
+        .unwrap();
+        let mut config = RegistryConfig::default();
+        read_npmrc(&path, &mut config).unwrap();
+        assert_eq!(config.registry, "https://packages.example/npm/");
+        assert_eq!(
+            config.scoped_registries.get("@private").unwrap(),
+            "https://private.example/"
+        );
+        assert_eq!(
+            config.auth_tokens.get("private.example/").unwrap(),
+            "secret"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn package_version(version: &str) -> serde_json::Value {
