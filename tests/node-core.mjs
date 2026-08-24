@@ -133,6 +133,15 @@ strictEqual(path.normalize("\\\\server\\share\\folder\\..\\file.txt"), "\\\\serv
 strictEqual(path.normalize("\\\\?\\UNC\\server\\share\\folder\\..\\file.txt"), "\\\\?\\UNC\\server\\share\\file.txt");
 strictEqual(path.normalize("\\\\?\\C:\\folder\\..\\file.txt"), "\\\\?\\C:\\file.txt");
 assert.ok(typeof process.env === "object");
+// process.env materializes on first read; it must then behave like the plain
+// object it replaced.
+assert.ok(Object.keys(process.env).length > 0);
+process.env.SAKO_TEST_VARIABLE = "set";
+strictEqual(process.env.SAKO_TEST_VARIABLE, "set");
+assert.ok(Object.keys(process.env).includes("SAKO_TEST_VARIABLE"));
+delete process.env.SAKO_TEST_VARIABLE;
+strictEqual(process.env.SAKO_TEST_VARIABLE, undefined);
+strictEqual(process.env, process.env);
 assert.ok(process.execPath.endsWith("sako.exe"));
 strictEqual(timers.setTimeout, setTimeout);
 assert.ok(typeof util.promisify === "function");

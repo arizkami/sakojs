@@ -3256,7 +3256,6 @@ class Runtime {
 
     v8::Local<v8::Object> process = v8::Object::New(isolate_);
     v8::Local<v8::Object> versions = v8::Object::New(isolate_);
-    v8::Local<v8::Object> environment = v8::Object::New(isolate_);
     v8::Local<v8::Object> stdout_stream = v8::Object::New(isolate_);
     v8::Local<v8::Object> stderr_stream = v8::Object::New(isolate_);
     v8::Local<v8::Function> stdout_write;
@@ -3275,31 +3274,6 @@ class Runtime {
         !Set(context, stderr_stream, "write", stderr_write)) {
       return false;
     }
-    LPWCH environment_block = GetEnvironmentStringsW();
-    if (environment_block == nullptr) return false;
-    bool environment_ok = true;
-    for (const wchar_t* entry = environment_block; *entry != L'\0';) {
-      const std::wstring item(entry);
-      entry += item.size() + 1;
-      if (item.starts_with(L'=')) continue;
-      const size_t equals = item.find(L'=');
-      if (equals == std::wstring::npos) continue;
-      const std::string name = WideToUtf8(item.substr(0, equals));
-      const std::string value = WideToUtf8(item.substr(equals + 1));
-      v8::Local<v8::String> text;
-      if (name.empty() ||
-          !v8::String::NewFromUtf8(isolate_, value.data(),
-                                   v8::NewStringType::kNormal,
-                                   static_cast<int>(value.size()))
-               .ToLocal(&text) ||
-          !Set(context, environment, name, text)) {
-        environment_ok = false;
-        break;
-      }
-    }
-    FreeEnvironmentStringsW(environment_block);
-    if (!environment_ok) return false;
-
     v8::Local<v8::Function> cwd;
     v8::Local<v8::Value> next_tick;
     if (!v8::Function::New(context, ProcessCwd).ToLocal(&cwd) ||
@@ -3313,8 +3287,19 @@ class Runtime {
         argument_count == 0
             ? v8::String::Empty(isolate_).As<v8::Value>()
             : arguments->Get(context, 0).ToLocalChecked();
+    // Reading the environment block builds one JavaScript string per variable,
+    // which on a developer machine is a hundred strings a script that never
+    // looks at process.env would never touch. The property materializes the
+    // object on its first read and becomes an ordinary data property after,
+    // so writes, deletes, and enumeration behave as they did.
+    if (!process
+             ->SetLazyDataProperty(
+                 context, v8::String::NewFromUtf8Literal(isolate_, "env"),
+                 ProcessEnvironment)
+             .FromMaybe(false)) {
+      return false;
+    }
     return Set(context, process, "argv", arguments) &&
-           Set(context, process, "env", environment) &&
            Set(context, process, "execPath", executable) &&
            Set(context, process, "cwd", cwd) &&
            Set(context, process, "nextTick", next_tick) &&
@@ -3335,6 +3320,44 @@ class Runtime {
            Set(context, process, "versions", versions) &&
            Set(context, context->Global(), "process", process) &&
            Set(context, context->Global(), "global", context->Global());
+  }
+
+  // Materializes process.env from the live environment block on first read.
+  static void ProcessEnvironment(
+      v8::Local<v8::Name> name,
+      const v8::PropertyCallbackInfo<v8::Value>& info) {
+    (void)name;
+    v8::Isolate* isolate = info.GetIsolate();
+    Runtime* runtime = static_cast<Runtime*>(isolate->GetData(0));
+    if (runtime == nullptr) return;
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    v8::Local<v8::Object> environment = v8::Object::New(isolate);
+    LPWCH environment_block = GetEnvironmentStringsW();
+    if (environment_block == nullptr) return;
+    bool environment_ok = true;
+    for (const wchar_t* entry = environment_block; *entry != L'\0';) {
+      const std::wstring item(entry);
+      entry += item.size() + 1;
+      // Windows hides per-drive current directories as entries whose name is
+      // empty; they are not environment variables.
+      if (item.starts_with(L'=')) continue;
+      const size_t equals = item.find(L'=');
+      if (equals == std::wstring::npos) continue;
+      const std::string variable = WideToUtf8(item.substr(0, equals));
+      const std::string value = WideToUtf8(item.substr(equals + 1));
+      v8::Local<v8::String> text;
+      if (variable.empty() ||
+          !v8::String::NewFromUtf8(isolate, value.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(value.size()))
+               .ToLocal(&text) ||
+          !runtime->Set(context, environment, variable, text)) {
+        environment_ok = false;
+        break;
+      }
+    }
+    FreeEnvironmentStringsW(environment_block);
+    if (environment_ok) info.GetReturnValue().Set(environment);
   }
 
   bool InstallFunction(v8::Local<v8::Context> context, const char* name,

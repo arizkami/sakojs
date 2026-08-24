@@ -653,7 +653,14 @@ impl IocpReactor {
     /// Only correct for a socket the kernel granted
     /// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS: without it the packet still
     /// arrives and the operation would be reported twice.
+    ///
+    /// An operation that owns its handle keeps it alive only while it is
+    /// registered, so one is registered normally rather than filed here, where
+    /// dropping the operation would close the caller's connection.
     fn complete_inline(&mut self, operation: PendingOperation, transferred: u32) -> u64 {
+        if !matches!(operation.owner, OperationOwner::BorrowedSocket(_)) {
+            return self.register_operation(operation);
+        }
         let id = operation.id;
         self.recycle_overlapped(operation.overlapped);
         self.completed_operations.insert(
