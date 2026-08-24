@@ -41,9 +41,19 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let embedder_library = out_dir.join("v8_embedder.lib");
     let bootstrap_header = out_dir.join("bootstrap.generated.h");
+    let bootstrap_cache_header = out_dir.join("bootstrap_cache.generated.h");
+    let cache_generator = manifest_dir.join("src").join("bootstrap_cache.cc");
 
     create_embedder_library(&v8_monolith, &embedder_library);
     generate_bootstrap_header(&bootstrap, &bootstrap_header);
+    generate_bootstrap_cache(
+        &cache_generator,
+        &include_dir,
+        &out_dir,
+        &embedder_library,
+        &v8_root.join("bin").join("icudtl.dat"),
+        &bootstrap_cache_header,
+    );
 
     cc::Build::new()
         .cpp(true)
@@ -67,6 +77,7 @@ fn main() {
     println!("cargo:rustc-env=SAKO_V8_ROOT={}", v8_root.display());
     println!("cargo:rerun-if-env-changed=SAKO_V8_ROOT");
     println!("cargo:rerun-if-changed={}", bridge.display());
+    println!("cargo:rerun-if-changed={}", cache_generator.display());
     println!("cargo:rerun-if-changed={}", bootstrap.display());
     println!("cargo:rerun-if-changed={}", v8_monolith.display());
 }
@@ -87,6 +98,63 @@ fn generate_bootstrap_header(source_path: &Path, output_path: &Path) {
     header.push_str("  0,\n};\n");
     fs::write(output_path, header)
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", output_path.display()));
+}
+
+// Compiles and runs the code cache producer so the bridge can embed V8's
+// compiled form of the bootstrap instead of parsing the source on every run.
+fn generate_bootstrap_cache(
+    source: &Path,
+    include_dir: &Path,
+    out_dir: &Path,
+    embedder_library: &Path,
+    icu_data: &Path,
+    output_header: &Path,
+) {
+    let target = env::var("TARGET").unwrap();
+    let generator = out_dir.join("sako_bootstrap_cache.exe");
+    let mut compiler = cc::windows_registry::find(&target, "cl.exe")
+        .unwrap_or_else(|| Command::new("cl.exe"));
+    let status = compiler
+        .current_dir(out_dir)
+        .args([
+            "/nologo",
+            "/MT",
+            "/O2",
+            "/EHsc",
+            "/std:c++20",
+            "/Zc:__cplusplus",
+            "/utf-8",
+        ])
+        .arg("/DV8_COMPRESS_POINTERS")
+        .arg(format!("/I{}", include_dir.display()))
+        .arg(format!("/I{}", out_dir.display()))
+        .arg(source)
+        .arg(format!("/Fe:{}", generator.display()))
+        .arg("/link")
+        .arg(embedder_library)
+        .args([
+            "advapi32.lib",
+            "bcrypt.lib",
+            "dbghelp.lib",
+            "kernel32.lib",
+            "uuid.lib",
+            "winmm.lib",
+        ])
+        .status()
+        .unwrap_or_else(|error| panic!("failed to start the MSVC compiler: {error}"));
+    if !status.success() {
+        panic!("failed to build the bootstrap code cache producer");
+    }
+    let status = Command::new(&generator)
+        .arg(icu_data)
+        .arg(output_header)
+        .status()
+        .unwrap_or_else(|error| {
+            panic!("failed to run {}: {error}", generator.display())
+        });
+    if !status.success() {
+        panic!("the bootstrap code cache producer failed");
+    }
 }
 
 fn create_embedder_library(source: &Path, output: &Path) {

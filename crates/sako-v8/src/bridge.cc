@@ -27,6 +27,7 @@
 #include "libplatform/libplatform.h"
 #include "v8.h"
 #include "bootstrap.generated.h"
+#include "bootstrap_cache.generated.h"
 
 // --- Startup phase instrumentation -----------------------------------------
 //
@@ -1959,13 +1960,25 @@ class Runtime {
     v8::Local<v8::String> name =
         v8::String::NewFromUtf8Literal(isolate_, "[sako:bootstrap]");
     v8::ScriptOrigin origin(name);
+    // The build compiled this exact source with this exact V8, so hand V8 its
+    // own compiled form instead of the parser. A cache that does not match the
+    // running V8 or its flags is rejected and V8 compiles the source normally,
+    // which costs the parse it would have cost anyway.
+    v8::ScriptCompiler::CachedData* cached =
+        new v8::ScriptCompiler::CachedData(
+            kSakoBootstrapCache, static_cast<int>(sizeof(kSakoBootstrapCache)),
+            v8::ScriptCompiler::CachedData::BufferNotOwned);
+    v8::ScriptCompiler::Source compiler_source(source, origin, cached);
     v8::Local<v8::Script> script;
     v8::Local<v8::Value> ignored;
-    if (!v8::Script::Compile(context, source, &origin).ToLocal(&script)) {
+    if (!v8::ScriptCompiler::Compile(context, &compiler_source,
+                                     v8::ScriptCompiler::kConsumeCodeCache)
+             .ToLocal(&script)) {
       *error = FormatException(isolate_, context, try_catch);
       return false;
     }
-    SAKO_PERF_MARK("bootstrap.compile");
+    SAKO_PERF_MARK(cached->rejected ? "bootstrap.compile-uncached"
+                                    : "bootstrap.compile");
     if (!script->Run(context).ToLocal(&ignored)) {
       *error = FormatException(isolate_, context, try_catch);
       return false;
