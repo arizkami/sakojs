@@ -1,0 +1,19 @@
+[package]
+name = "sako-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sako-accel = { path = "../sako-accel" }
+sako-net = { path = "../sako-net" }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
+
+[dev-dependencies]
+rcgen = "0.14.9"
+
+[[bench]]
+name = "parser"
+harness = false

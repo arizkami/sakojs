@@ -9,6 +9,7 @@ const assert = require("node:assert");
 const processModule = require("node:process");
 const consoleModule = require("node:console");
 const timers = require("node:timers");
+const packageImport = require("#condition");
 
 assert.strictEqual(value.answer, 42);
 assert.ok(require.resolve("./value").endsWith("value.js"));
@@ -18,6 +19,7 @@ assert.strictEqual(consoleModule, console);
 assert.strictEqual(timers.setTimeout, setTimeout);
 assert.strictEqual(esm.esmAnswer, 84);
 assert.strictEqual(esm.default, "esm-namespace");
+assert.strictEqual(packageImport, "require-import-map");
 
 console.log(
   value.answer,

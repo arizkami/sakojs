@@ -74,14 +74,17 @@ fn main() {
 fn generate_bootstrap_header(source_path: &Path, output_path: &Path) {
     let source = fs::read_to_string(source_path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", source_path.display()));
-    const DELIMITER: &str = "SAKO_BOOT_7D9C";
-    assert!(
-        !source.contains(DELIMITER),
-        "bootstrap contains raw-string delimiter"
+    let mut header = String::from(
+        "// Generated from runtime/js/bootstrap.js.\nstatic constexpr unsigned char kSakoBootstrap[] = {\n",
     );
-    let header = format!(
-        "// Generated from runtime/js/bootstrap.js.\nstatic constexpr const char kSakoBootstrap[] = R\"{DELIMITER}({source}){DELIMITER}\";\n"
-    );
+    for chunk in source.as_bytes().chunks(32) {
+        header.push_str("  ");
+        for byte in chunk {
+            header.push_str(&format!("{byte},"));
+        }
+        header.push('\n');
+    }
+    header.push_str("  0,\n};\n");
     fs::write(output_path, header)
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", output_path.display()));
 }

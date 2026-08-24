@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p sako-accel -p sako-diagnostics -p sako-http -p sako-net -p sako-package -p sako-platform -p sako-process --all-targets -- -D warnings
+      - run: cargo test -p sako-accel -p sako-diagnostics -p sako-http -p sako-net -p sako-package -p sako-platform -p sako-process
+
+  runtime:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - name: Install V8 artifact
+        shell: pwsh
+        env:
+          V8_URL: ${{ secrets.SAKO_V8_ARTIFACT_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:V8_URL)) {
+            throw "SAKO_V8_ARTIFACT_URL must be configured for runtime gates."
+          }
+          ./.github/scripts/install-v8.ps1 -Url $env:V8_URL
+      - run: cargo clippy -p sako-v8 -p sako-cli --all-targets -- -D warnings
+      - run: cargo test -p sako-v8 -p sako-cli
+
+  memory-soak:
+    if: github.event_name == 'schedule'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install V8 artifact
+        shell: pwsh
+        env:
+          V8_URL: ${{ secrets.SAKO_V8_ARTIFACT_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:V8_URL)) {
+            throw "SAKO_V8_ARTIFACT_URL must be configured for memory-soak gates."
+          }
+          ./.github/scripts/install-v8.ps1 -Url $env:V8_URL
+      - env:
+          SAKO_SOAK_CYCLES: "1000"
+        run: cargo test -p sako-v8 --test lifecycle scheduled_runtime_memory_soak_converges -- --ignored --exact --nocapture

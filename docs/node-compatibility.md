@@ -4,19 +4,33 @@ Sako.js compatibility is experimental and intentionally reported per API. A modu
 
 | Area | Status | Current behavior |
 | --- | --- | --- |
-| CommonJS wrapper | Partial | `exports`, `module`, `require`, `require.resolve`, `__filename`, and `__dirname` work for local and installed JavaScript packages. |
-| CommonJS resolution | Partial | Relative, absolute, JSON, directory `main`, directory `index`, scoped package, and bare `node_modules` lookup work. Package `exports` and `imports` do not. |
-| ESM | Partial | V8-native compilation/linking/evaluation and relative or absolute imports work. Dynamic import, package imports, and CJS interoperability do not. |
-| `node:assert` | Partial | CommonJS `require` supports callable `assert`, `assert.ok`, and `assert.strictEqual`. ESM import is unsupported. |
-| `node:buffer` | Unsupported | Import/require fails explicitly. |
-| `node:console` | Partial | Global `console.log` and CommonJS `require("node:console")` work. Other console methods and ESM import are unsupported. |
-| `node:events` | Unsupported | Import/require fails explicitly. |
-| `node:fs` | Unsupported | Import/require fails explicitly. |
-| `node:fs/promises` | Unsupported | Import/require fails explicitly. |
-| `node:path` | Unsupported | Import/require fails explicitly. |
-| `node:process` | Partial | Global and CommonJS module `process.argv`, `platform`, `arch`, and `versions` work. Other APIs and ESM import are unsupported. |
-| `node:timers` | Partial | Global and CommonJS module bounded timeout/interval scheduling and cancellation work. ESM import is unsupported. |
-| `node:url` | Unsupported | Import/require fails explicitly. |
-| `node:util` | Unsupported | Import/require fails explicitly. |
+| CommonJS wrapper | Partial | `exports`, `module`, `require`, `require.resolve`, `__filename`, and `__dirname` work. Synchronous ESM namespace loading works when no top-level await remains pending. |
+| CommonJS resolution | Partial | Relative, absolute, JSON, `main`, `index`, scoped/bare packages, exact/wildcard `exports` and `imports`, and conditional import/require targets work. Full Node error and self-resolution semantics remain incomplete. |
+| ESM | Partial | V8-native linking/evaluation, dynamic import, timer-backed top-level await, packages, conditional maps, `node:` synthetic modules, and CJS synthetic namespaces work. CJS named exports use Node-compatible snapshots while the default retains the live exports object. Import attributes, concurrent evaluation edge cases, and full Node error semantics remain incomplete. |
+| RegExp | Partial | Standard V8 regular expressions work. The supplied V8 artifact rejects Unicode `ID_Start`/`ID_Continue` property escapes, which currently blocks the Express 5 router; the Express baseline therefore uses 4.21.2. |
+| Fetch globals | Partial | Bounded `fetch`, `Headers`, `Request`, and `Response` support HTTP/HTTPS methods, headers, byte/string request bodies, response cloning, and text/JSON/ArrayBuffer consumption. Transport and body reads currently block underneath, request/response bodies are limited to 16 MiB, and streaming, mid-flight abort, credentials, cache, and advanced redirect controls are unsupported. |
+| `node:assert` | Partial | Callable `assert`, `assert.ok`, and `assert.strictEqual` work through ESM and CommonJS. |
+| `node:buffer` | Partial | `Buffer.from`, `alloc`, `isBuffer`, UTF-8 `toString`, and the global `Buffer` work. Other encodings and advanced Buffer APIs are unsupported. |
+| `node:console` | Partial | Global and module `console.log` work. Other console methods are unsupported. |
+| `node:events` | Partial | EventEmitter add/remove, once, emit, listener listing/counting, and error behavior work. Advanced capture/rejection APIs are unsupported. |
+| `node:fs` | Partial | Bounded file reads and directory enumeration plus runtime-owned descriptors, sync/callback read/write/open/close, stat/lstat, mkdir, rename, realpath, hard/symbolic links, readlink, unlink, recursive removal, and bounded polling `watch`/`watchFile` work with native Windows paths. Unicode, extended, UNC, link, and sharing-violation behavior is covered. Callback operations and watchers are synchronous/polling underneath; recursive native change notifications, permissions, and timestamps remain incomplete. |
+| `node:fs/promises` | Partial | Promise wrappers cover file-handle open/read/write/close, path read/write, stat/lstat, readdir, mkdir, rename, realpath, hard/symbolic links, readlink, unlink, and removal; operations are currently synchronous underneath. |
+| `node:http` | Partial | Rust-owned bounded HTTP/1 servers expose `Server`, `IncomingMessage`, `ServerResponse`, standard methods/status codes, headers, bounded Content-Length request bodies, sync writes, keep-alive, graceful close, and address basics. Chunked requests, trailers, upgrades, clients, and long-lived asynchronous responses do not. |
+| `node:net` | Partial | `isIP`, `isIPv4`, and `isIPv6` are available. JavaScript socket/server APIs are not yet exposed. |
+| `node:dns` | Partial | Bounded native `lookup`, `resolve4`, and `resolve6` callback/promise forms work. Resolution currently blocks underneath and advanced record types are unsupported. |
+| `node:https` | Partial | `createServer({ key, cert }, handler)` uses bounded rustls TLS 1.2/1.3 records over the same IOCP-backed HTTP owner and marks request sockets encrypted. HTTPS client APIs, SNI certificate selection, client certificates, and advanced TLS controls remain unsupported. |
+| `node:child_process` | Partial | Direct `CreateProcessW`/`STARTUPINFOEX` launch restricts inheritance to named-pipe standard handles; Job Object-owned, 16 MiB-bounded `spawnSync`, `execFileSync`, and `execSync` capture output. Deferred `spawn`, `execFile`, and `exec` expose ChildProcess and stdout/stderr event shapes but currently block the event loop underneath and deliver output at process completion; true streaming pipes, signals, IPC, and running-child cancellation are unsupported. |
+| `node:os` | Partial | Windows platform, architecture, paths, hostname, user, CPU count, and stable constants are exposed. Detailed CPU and memory statistics are placeholders. |
+| `node:path` | Partial | Initial Windows `normalize`, `join`, `resolve`, `isAbsolute`, `basename`, `dirname`, and `extname` work, including UNC and extended roots. Edge cases remain incomplete. |
+| `node:process` | Partial | `argv`, `env`, `execPath`, `cwd`, `nextTick`, `platform`, `arch`, `version`, `versions`, and `exitCode` are exposed. Exit/signals and many process APIs remain unsupported. |
+| `node:querystring` | Partial | Basic `parse` and `stringify` work. Custom codec hooks and limits are incomplete. |
+| `node:string_decoder` | Partial | UTF-8 `StringDecoder.write/end` preserve partial multibyte sequences across chunks. Other encodings are unsupported. |
+| `node:stream` | Partial | Initial EventEmitter-backed Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, and finished shapes work. Full buffering, backpressure, async iteration, and destroy semantics are incomplete. |
+| `node:timers` | Partial | Bounded timeout/interval scheduling and cancellation work through globals, ESM, and CommonJS. |
+| `node:url` | Partial | Initial URL, URLSearchParams, pathToFileURL, and fileURLToPath behavior works for common HTTP/file URLs. Full WHATWG conformance is not claimed. |
+| `node:util` | Partial | `inherits`, `promisify`, formatting, basic inspection, and deprecation wrappers work. Advanced inspection and type helpers are unsupported. |
+| `node:crypto` | Partial | Bounded SHA-1 `createHash` runs through Windows CNG with Buffer/hex/base64 digests. Other hashes, random generation, keys, and TLS primitives are unsupported. |
+| `node:tty` | Partial | `isatty` uses the native Windows console handle state; stream constructors are compatibility placeholders. |
+| `node:zlib` | Stub | Decompression entry points exist so unused body-parser paths load, but throw clearly when invoked. |
 
-All other Node modules, native addons, and N-API are unsupported at this stage.
+Express 4.21.2 installs through Sako and serves its unmodified plaintext example over the native HTTP bridge. Express 5.1 is currently blocked by the supplied V8 artifact's missing Unicode `ID_Start`/`ID_Continue` regular-expression properties. All other unlisted Node modules, native addons, and N-API are unsupported at this stage.

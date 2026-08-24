@@ -6,33 +6,45 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::read::GzDecoder;
+use sako_process::spawn_native_with_bounded_output;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
+const SAKO_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAXIMUM_PACKAGES: usize = 10_000;
 const MAXIMUM_METADATA_ENTRIES: usize = 1_024;
 const MAXIMUM_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_TARBALL_BYTES: u64 = 512 * 1024 * 1024;
 const MAXIMUM_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAXIMUM_ARCHIVE_ENTRIES: usize = 100_000;
+const MAXIMUM_WORKSPACE_FILES: usize = 100_000;
+const MAXIMUM_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAXIMUM_STORE_FILES: usize = 50_000;
 const MAXIMUM_STORE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const MAXIMUM_SCRIPT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 struct RegistryConfig {
     registry: String,
     scoped_registries: BTreeMap<String, String>,
     auth_tokens: BTreeMap<String, String>,
+    basic_auth: BTreeMap<String, String>,
+    default_auth_token: Option<String>,
+    default_basic_auth: Option<String>,
+    auth_usernames: BTreeMap<String, String>,
+    auth_passwords: BTreeMap<String, Vec<u8>>,
+    default_username: Option<String>,
+    default_password: Option<Vec<u8>>,
+    proxy: Option<String>,
 }
 
 impl Default for RegistryConfig {
@@ -41,6 +53,14 @@ impl Default for RegistryConfig {
             registry: DEFAULT_REGISTRY.into(),
             scoped_registries: BTreeMap::new(),
             auth_tokens: BTreeMap::new(),
+            basic_auth: BTreeMap::new(),
+            default_auth_token: None,
+            default_basic_auth: None,
+            auth_usernames: BTreeMap::new(),
+            auth_passwords: BTreeMap::new(),
+            default_username: None,
+            default_password: None,
+            proxy: None,
         }
     }
 }
@@ -60,16 +80,93 @@ fn read_npmrc(path: &Path, config: &mut RegistryConfig) -> Result<(), PackageErr
             continue;
         };
         let key = key.trim();
-        let value = expand_environment(value.trim());
+        let value = expand_environment(value.trim().trim_matches(['"', '\'']));
         if key == "registry" {
             config.registry = value;
+        } else if key == "https-proxy" || key == "proxy" {
+            config.proxy = match value.to_ascii_lowercase().as_str() {
+                "" | "false" | "null" => None,
+                _ => Some(value),
+            };
         } else if let Some(scope) = key.strip_suffix(":registry") {
             if scope.starts_with('@') {
                 config.scoped_registries.insert(scope.into(), value);
             }
+        } else if key == "_authToken" {
+            config.default_auth_token = Some(value);
+        } else if key == "_auth" {
+            validate_basic_auth(&value)?;
+            config.default_basic_auth = Some(value);
+            config.default_username = None;
+            config.default_password = None;
+        } else if key == "username" {
+            config.default_username = Some(value);
+            update_default_user_password(config);
+        } else if key == "_password" {
+            config.default_password = Some(decode_password(&value)?);
+            update_default_user_password(config);
         } else if let Some(prefix) = key.strip_suffix(":_authToken") {
             config.auth_tokens.insert(registry_auth_key(prefix), value);
+        } else if let Some(prefix) = key.strip_suffix(":_auth") {
+            validate_basic_auth(&value)?;
+            let key = registry_auth_key(prefix);
+            config.basic_auth.insert(key.clone(), value);
+            config.auth_usernames.remove(&key);
+            config.auth_passwords.remove(&key);
+        } else if let Some(prefix) = key.strip_suffix(":username") {
+            let key = registry_auth_key(prefix);
+            config.auth_usernames.insert(key.clone(), value);
+            update_scoped_user_password(config, &key);
+        } else if let Some(prefix) = key.strip_suffix(":_password") {
+            let key = registry_auth_key(prefix);
+            config
+                .auth_passwords
+                .insert(key.clone(), decode_password(&value)?);
+            update_scoped_user_password(config, &key);
         }
+    }
+    Ok(())
+}
+
+fn decode_password(value: &str) -> Result<Vec<u8>, PackageError> {
+    BASE64
+        .decode(value)
+        .map_err(|_| PackageError("npm _password is not valid base64".into()))
+}
+
+fn encode_user_password(username: &str, password: &[u8]) -> String {
+    let mut credentials = Vec::with_capacity(username.len() + password.len() + 1);
+    credentials.extend_from_slice(username.as_bytes());
+    credentials.push(b':');
+    credentials.extend_from_slice(password);
+    BASE64.encode(credentials)
+}
+
+fn update_default_user_password(config: &mut RegistryConfig) {
+    if let (Some(username), Some(password)) = (&config.default_username, &config.default_password) {
+        config.default_basic_auth = Some(encode_user_password(username, password));
+    }
+}
+
+fn update_scoped_user_password(config: &mut RegistryConfig, key: &str) {
+    if let (Some(username), Some(password)) = (
+        config.auth_usernames.get(key),
+        config.auth_passwords.get(key),
+    ) {
+        config
+            .basic_auth
+            .insert(key.to_owned(), encode_user_password(username, password));
+    }
+}
+
+fn validate_basic_auth(value: &str) -> Result<(), PackageError> {
+    let decoded = BASE64
+        .decode(value)
+        .map_err(|_| PackageError("npm basic authentication is not valid base64".into()))?;
+    if !decoded.contains(&b':') {
+        return Err(PackageError(
+            "npm basic authentication must encode username:password".into(),
+        ));
     }
     Ok(())
 }
@@ -126,28 +223,107 @@ pub struct PackageManager {
     registry: String,
     scoped_registries: BTreeMap<String, String>,
     auth_tokens: BTreeMap<String, String>,
+    basic_auth: BTreeMap<String, String>,
+    agent: ureq::Agent,
     cache_root: PathBuf,
     metadata: HashMap<String, Metadata>,
+    workspaces: BTreeMap<String, WorkspacePackage>,
     ignore_scripts: bool,
     installed: BTreeMap<String, LockedPackage>,
     active: HashSet<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PackageManagerOptions {
+    pub ignore_scripts: bool,
+    pub registry: Option<String>,
+    pub auth_token: Option<String>,
+    pub proxy: Option<String>,
+}
+
 impl PackageManager {
     pub fn new(root: impl Into<PathBuf>, ignore_scripts: bool) -> Result<Self, PackageError> {
+        Self::new_with_options(
+            root,
+            PackageManagerOptions {
+                ignore_scripts,
+                ..PackageManagerOptions::default()
+            },
+        )
+    }
+
+    pub fn new_with_options(
+        root: impl Into<PathBuf>,
+        options: PackageManagerOptions,
+    ) -> Result<Self, PackageError> {
         let root = root.into();
         let mut registry_config = RegistryConfig::default();
-        if let Some(home) = env::var_os("USERPROFILE") {
+        if let Some(global_config) = env::var_os("NPM_CONFIG_GLOBALCONFIG") {
+            read_npmrc(&PathBuf::from(global_config), &mut registry_config)?;
+        }
+        if let Some(user_config) = env::var_os("NPM_CONFIG_USERCONFIG") {
+            read_npmrc(&PathBuf::from(user_config), &mut registry_config)?;
+        } else if let Some(home) = env::var_os("USERPROFILE") {
             read_npmrc(&PathBuf::from(home).join(".npmrc"), &mut registry_config)?;
         }
         read_npmrc(&root.join(".npmrc"), &mut registry_config)?;
+        if let Ok(registry) = env::var("NPM_CONFIG_REGISTRY") {
+            registry_config.registry = registry;
+        }
         if let Ok(registry) = env::var("SAKO_NPM_REGISTRY") {
             registry_config.registry = registry;
         }
-        if let Ok(token) = env::var("SAKO_NPM_TOKEN") {
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NPM_CONFIG_PROXY",
+            "NPM_CONFIG_HTTPS_PROXY",
+        ] {
+            if let Ok(proxy) = env::var(name) {
+                registry_config.proxy = Some(proxy);
+            }
+        }
+        if let Ok(credentials) = env::var("NPM_CONFIG__AUTH") {
+            validate_basic_auth(&credentials)?;
+            registry_config.default_basic_auth = Some(credentials);
+            registry_config.default_username = None;
+            registry_config.default_password = None;
+        }
+        if let Ok(username) = env::var("NPM_CONFIG_USERNAME") {
+            registry_config.default_username = Some(username);
+            update_default_user_password(&mut registry_config);
+        }
+        if let Ok(password) = env::var("NPM_CONFIG__PASSWORD") {
+            registry_config.default_password = Some(decode_password(&password)?);
+            update_default_user_password(&mut registry_config);
+        }
+        for name in [
+            "NPM_CONFIG__AUTH_TOKEN",
+            "NODE_AUTH_TOKEN",
+            "NPM_TOKEN",
+            "SAKO_NPM_TOKEN",
+        ] {
+            if let Ok(token) = env::var(name) {
+                registry_config.default_auth_token = Some(token);
+            }
+        }
+        if let Some(registry) = options.registry {
+            registry_config.registry = registry;
+        }
+        if let Some(token) = options.auth_token {
+            registry_config.default_auth_token = Some(token);
+        }
+        if let Some(proxy) = options.proxy {
+            registry_config.proxy = Some(proxy);
+        }
+        let default_auth_key = registry_auth_key(&registry_config.registry);
+        if let Some(credentials) = registry_config.default_basic_auth.take() {
             registry_config
-                .auth_tokens
-                .insert(registry_auth_key(&registry_config.registry), token);
+                .basic_auth
+                .insert(default_auth_key.clone(), credentials);
+        }
+        if let Some(token) = registry_config.default_auth_token.take() {
+            registry_config.auth_tokens.insert(default_auth_key, token);
         }
         let cache_root = env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -155,14 +331,24 @@ impl PackageManager {
             .join("Sako")
             .join("Store")
             .join("sha512");
+        let mut agent = ureq::AgentBuilder::new();
+        if let Some(proxy) = registry_config.proxy {
+            agent = agent.proxy(
+                ureq::Proxy::new(proxy)
+                    .map_err(|error| PackageError(format!("invalid npm proxy: {error}")))?,
+            );
+        }
         Ok(Self {
             root,
             registry: registry_config.registry.trim_end_matches('/').into(),
             scoped_registries: registry_config.scoped_registries,
             auth_tokens: registry_config.auth_tokens,
+            basic_auth: registry_config.basic_auth,
+            agent: agent.build(),
             cache_root,
             metadata: HashMap::new(),
-            ignore_scripts,
+            workspaces: BTreeMap::new(),
+            ignore_scripts: options.ignore_scripts,
             installed: BTreeMap::new(),
             active: HashSet::new(),
         })
@@ -172,9 +358,17 @@ impl PackageManager {
         self.installed.clear();
         self.active.clear();
         let manifest = self.read_manifest()?;
+        let root_engines = manifest_engines(&manifest)?;
+        validate_sako_engine("root package", &root_engines)?;
+        self.workspaces = discover_workspaces(&self.root, &manifest)?;
         let mut dependencies = manifest_dependencies(&manifest, "dependencies")?;
         for (name, requirement) in manifest_dependencies(&manifest, "devDependencies")? {
             dependencies.entry(name).or_insert(requirement);
+        }
+        for name in self.workspaces.keys() {
+            dependencies
+                .entry(name.clone())
+                .or_insert_with(|| "workspace:*".into());
         }
         let optional_dependencies = manifest_dependencies(&manifest, "optionalDependencies")?;
 
@@ -278,7 +472,26 @@ impl PackageManager {
             return Err(PackageError("package graph capacity exceeded".into()));
         }
         validate_package_name(name)?;
+        if let Some(workspace) = self.workspaces.get(name).cloned() {
+            if workspace_requirement_matches(&workspace.version, requirement) {
+                return self.install_workspace(workspace, parent_node_modules, lock_path);
+            }
+            if requirement.starts_with("workspace:") {
+                return Err(PackageError(format!(
+                    "workspace {name}@{} does not satisfy {requirement}",
+                    workspace.version
+                )));
+            }
+        } else if requirement.starts_with("workspace:") {
+            return Err(PackageError(format!(
+                "workspace package {name} was not found"
+            )));
+        }
         let package = self.resolve(name, requirement)?;
+        validate_sako_engine(
+            &format!("{}@{}", package.name, package.version),
+            &package.engines,
+        )?;
         let identity = format!("{}@{}", package.name, package.version);
         if !self.active.insert(identity.clone()) {
             return Ok(());
@@ -305,6 +518,7 @@ impl PackageManager {
                     .map(|(name, _)| name.clone())
                     .collect(),
                 scripts: package.scripts.clone(),
+                engines: package.engines.clone(),
             },
         );
 
@@ -331,6 +545,62 @@ impl PackageManager {
         }
         if !self.ignore_scripts {
             run_lifecycle_scripts(&destination, &package.scripts)?;
+        }
+        self.active.remove(&identity);
+        Ok(())
+    }
+
+    fn install_workspace(
+        &mut self,
+        workspace: WorkspacePackage,
+        parent_node_modules: &Path,
+        lock_path: &str,
+    ) -> Result<(), PackageError> {
+        if self.installed.len() >= MAXIMUM_PACKAGES {
+            return Err(PackageError("package graph capacity exceeded".into()));
+        }
+        let identity = format!("{}@{}", workspace.name, workspace.version);
+        if !self.active.insert(identity.clone()) {
+            return Ok(());
+        }
+        let destination = package_install_path(parent_node_modules, &workspace.name)?;
+        copy_workspace(&workspace.path, &destination)?;
+        self.installed.insert(
+            lock_path.into(),
+            LockedPackage {
+                name: workspace.name.clone(),
+                version: workspace.version.clone(),
+                resolved: format!("workspace:{}", workspace.relative_path),
+                integrity: "workspace".into(),
+                dependencies: workspace.dependencies.clone(),
+                optional_dependencies: workspace.optional_dependencies.clone(),
+                peer_dependencies: workspace.peer_dependencies.clone(),
+                optional_peers: workspace.optional_peers.clone(),
+                scripts: workspace.scripts.clone(),
+                engines: workspace.engines.clone(),
+            },
+        );
+        let child_node_modules = destination.join("node_modules");
+        for (dependency, requirement) in workspace.dependencies.clone() {
+            self.install_dependency(
+                &dependency,
+                &requirement,
+                &child_node_modules,
+                &format!("{lock_path}/node_modules/{dependency}"),
+            )?;
+        }
+        for (dependency, requirement) in workspace.optional_dependencies.clone() {
+            if let Err(error) = self.install_dependency(
+                &dependency,
+                &requirement,
+                &child_node_modules,
+                &format!("{lock_path}/node_modules/{dependency}"),
+            ) {
+                eprintln!("sako: skipping optional dependency {dependency}: {error}");
+            }
+        }
+        if !self.ignore_scripts {
+            run_lifecycle_scripts(&destination, &workspace.scripts)?;
         }
         self.active.remove(&identity);
         Ok(())
@@ -367,12 +637,11 @@ impl PackageManager {
         }
         for name in root_optional_dependencies.keys() {
             let lock_path = format!("node_modules/{name}");
-            if lockfile.packages.contains_key(&lock_path) {
-                if let Err(error) =
+            if lockfile.packages.contains_key(&lock_path)
+                && let Err(error) =
                     self.install_locked_dependency(&lockfile, &lock_path, &node_modules)
-                {
-                    eprintln!("sako: skipping optional dependency {name}: {error}");
-                }
+            {
+                eprintln!("sako: skipping optional dependency {name}: {error}");
             }
         }
         validate_peer_dependencies(&self.installed)?;
@@ -388,17 +657,34 @@ impl PackageManager {
         let package = lockfile.packages.get(lock_path).cloned().ok_or_else(|| {
             PackageError(format!("lockfile is missing dependency entry {lock_path}"))
         })?;
+        validate_sako_engine(
+            &format!("{}@{}", package.name, package.version),
+            &package.engines,
+        )?;
         let identity = format!("{}@{}", package.name, package.version);
         if !self.active.insert(identity.clone()) {
             return Ok(());
         }
 
         let destination = package_install_path(parent_node_modules, &package.name)?;
-        let archive = self.fetch_archive(&Distribution {
-            tarball: package.resolved.clone(),
-            integrity: package.integrity.clone(),
-        })?;
-        extract_archive(&archive, &destination)?;
+        if package.resolved.starts_with("workspace:") {
+            let workspace = self.workspaces.get(&package.name).ok_or_else(|| {
+                PackageError(format!("locked workspace {} was not found", package.name))
+            })?;
+            if workspace.version != package.version {
+                return Err(PackageError(format!(
+                    "locked workspace {}@{} does not match local version {}",
+                    package.name, package.version, workspace.version
+                )));
+            }
+            copy_workspace(&workspace.path, &destination)?;
+        } else {
+            let archive = self.fetch_archive(&Distribution {
+                tarball: package.resolved.clone(),
+                integrity: package.integrity.clone(),
+            })?;
+            extract_archive(&archive, &destination)?;
+        }
         let child_node_modules = destination.join("node_modules");
         for (dependency, requirement) in &package.dependencies {
             let child_path = format!("{lock_path}/node_modules/{dependency}");
@@ -412,12 +698,11 @@ impl PackageManager {
         }
         for dependency in package.optional_dependencies.keys() {
             let child_path = format!("{lock_path}/node_modules/{dependency}");
-            if lockfile.packages.contains_key(&child_path) {
-                if let Err(error) =
+            if lockfile.packages.contains_key(&child_path)
+                && let Err(error) =
                     self.install_locked_dependency(lockfile, &child_path, &child_node_modules)
-                {
-                    eprintln!("sako: skipping optional dependency {dependency}: {error}");
-                }
+            {
+                eprintln!("sako: skipping optional dependency {dependency}: {error}");
             }
         }
         if !self.ignore_scripts {
@@ -512,15 +797,24 @@ impl PackageManager {
     }
 
     fn request(&self, url: &str) -> ureq::Request {
-        let mut request = ureq::get(url);
+        let mut request = self.agent.get(url);
         let key = registry_auth_key(url);
-        if let Some((_, token)) = self
+        let bearer = self
             .auth_tokens
             .iter()
             .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len())
-        {
+            .max_by_key(|(prefix, _)| prefix.len());
+        let basic = self
+            .basic_auth
+            .iter()
+            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len());
+        if let Some((_, token)) = bearer.filter(|(prefix, _)| {
+            basic.is_none_or(|(basic_prefix, _)| prefix.len() >= basic_prefix.len())
+        }) {
             request = request.set("Authorization", &format!("Bearer {token}"));
+        } else if let Some((_, credentials)) = basic {
+            request = request.set("Authorization", &format!("Basic {credentials}"));
         }
         request
     }
@@ -561,6 +855,213 @@ impl PackageManager {
     }
 }
 
+#[derive(Clone, Debug)]
+struct WorkspacePackage {
+    name: String,
+    version: String,
+    path: PathBuf,
+    relative_path: String,
+    dependencies: BTreeMap<String, String>,
+    optional_dependencies: BTreeMap<String, String>,
+    peer_dependencies: BTreeMap<String, String>,
+    optional_peers: Vec<String>,
+    scripts: BTreeMap<String, String>,
+    engines: BTreeMap<String, String>,
+}
+
+fn discover_workspaces(
+    root: &Path,
+    manifest: &serde_json::Value,
+) -> Result<BTreeMap<String, WorkspacePackage>, PackageError> {
+    let Some(workspaces) = manifest.get("workspaces") else {
+        return Ok(BTreeMap::new());
+    };
+    let patterns = if let Some(patterns) = workspaces.as_array() {
+        patterns
+    } else if let Some(patterns) = workspaces
+        .get("packages")
+        .and_then(|value| value.as_array())
+    {
+        patterns
+    } else {
+        return Err(PackageError(
+            "package.json workspaces must be an array or contain a packages array".into(),
+        ));
+    };
+    let canonical_root = fs::canonicalize(root)?;
+    let mut packages = BTreeMap::new();
+    for pattern in patterns {
+        let pattern = pattern
+            .as_str()
+            .ok_or_else(|| PackageError("workspace patterns must be strings".into()))?;
+        for path in expand_workspace_pattern(&canonical_root, pattern)? {
+            if packages.len() >= MAXIMUM_PACKAGES {
+                return Err(PackageError("workspace count exceeds package limit".into()));
+            }
+            let manifest_path = path.join("package.json");
+            let source = fs::read_to_string(&manifest_path).map_err(|error| {
+                PackageError(format!("cannot read {}: {error}", manifest_path.display()))
+            })?;
+            let manifest: serde_json::Value = serde_json::from_str(&source).map_err(|error| {
+                PackageError(format!("invalid {}: {error}", manifest_path.display()))
+            })?;
+            let name = manifest
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    PackageError(format!("workspace {} has no package name", path.display()))
+                })?
+                .to_owned();
+            validate_package_name(&name)?;
+            let version = manifest
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("0.0.0")
+                .to_owned();
+            Version::parse(&version).map_err(|error| {
+                PackageError(format!("workspace {name} has invalid version: {error}"))
+            })?;
+            let peer_dependencies = manifest_dependencies(&manifest, "peerDependencies")?;
+            let optional_peers = manifest
+                .get("peerDependenciesMeta")
+                .and_then(serde_json::Value::as_object)
+                .map(|metadata| {
+                    metadata
+                        .iter()
+                        .filter(|(_, value)| {
+                            value.get("optional").and_then(serde_json::Value::as_bool) == Some(true)
+                        })
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let relative_path = path
+                .strip_prefix(&canonical_root)
+                .map_err(|_| PackageError("workspace path escapes project root".into()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let workspace = WorkspacePackage {
+                name: name.clone(),
+                version,
+                path,
+                relative_path,
+                dependencies: manifest_dependencies(&manifest, "dependencies")?,
+                optional_dependencies: manifest_dependencies(&manifest, "optionalDependencies")?,
+                peer_dependencies,
+                optional_peers,
+                scripts: manifest_dependencies(&manifest, "scripts")?,
+                engines: manifest_engines(&manifest)?,
+            };
+            validate_sako_engine(
+                &format!("workspace {name}@{}", workspace.version),
+                &workspace.engines,
+            )?;
+            if packages.insert(name.clone(), workspace).is_some() {
+                return Err(PackageError(format!(
+                    "duplicate workspace package name {name}"
+                )));
+            }
+        }
+    }
+    Ok(packages)
+}
+
+fn expand_workspace_pattern(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, PackageError> {
+    if pattern.contains("..") || Path::new(pattern).is_absolute() {
+        return Err(PackageError(format!("unsafe workspace pattern {pattern}")));
+    }
+    let wildcard_count = pattern.bytes().filter(|byte| *byte == b'*').count();
+    if wildcard_count == 0 {
+        let path = fs::canonicalize(root.join(pattern))?;
+        return Ok(if path.starts_with(root) && path.is_dir() {
+            vec![path]
+        } else {
+            Vec::new()
+        });
+    }
+    if wildcard_count != 1 {
+        return Err(PackageError(format!(
+            "workspace pattern supports one '*' segment: {pattern}"
+        )));
+    }
+    let path = Path::new(pattern);
+    let file_pattern = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| PackageError(format!("invalid workspace pattern {pattern}")))?;
+    let (prefix, suffix) = file_pattern
+        .split_once('*')
+        .ok_or_else(|| PackageError(format!("invalid workspace pattern {pattern}")))?;
+    let parent = root.join(path.parent().unwrap_or(Path::new("")));
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_dir() && name.starts_with(prefix) && name.ends_with(suffix) {
+            let candidate = fs::canonicalize(entry.path())?;
+            if candidate.starts_with(root) {
+                matches.push(candidate);
+            }
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+fn workspace_requirement_matches(version: &str, requirement: &str) -> bool {
+    let Some(workspace_requirement) = requirement.strip_prefix("workspace:") else {
+        return requirement_matches(version, requirement);
+    };
+    match workspace_requirement {
+        "" | "*" | "^" | "~" => true,
+        requirement => requirement_matches(version, requirement),
+    }
+}
+
+fn copy_workspace(source: &Path, destination: &Path) -> Result<(), PackageError> {
+    if destination.exists() {
+        fs::remove_dir_all(destination)?;
+    }
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    copy_workspace_directory(source, destination, &mut files, &mut bytes)
+}
+
+fn copy_workspace_directory(
+    source: &Path,
+    destination: &Path,
+    files: &mut usize,
+    bytes: &mut u64,
+) -> Result<(), PackageError> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(name.to_str(), Some("node_modules" | "target" | ".git")) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(PackageError(format!(
+                "workspace links are unsupported: {}",
+                entry.path().display()
+            )));
+        }
+        let output = destination.join(&name);
+        if file_type.is_dir() {
+            copy_workspace_directory(&entry.path(), &output, files, bytes)?;
+        } else if file_type.is_file() {
+            *files += 1;
+            *bytes = bytes.saturating_add(entry.metadata()?.len());
+            if *files > MAXIMUM_WORKSPACE_FILES || *bytes > MAXIMUM_WORKSPACE_BYTES {
+                return Err(PackageError("workspace exceeds copy limits".into()));
+            }
+            fs::copy(entry.path(), output)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct Metadata {
     #[serde(rename = "dist-tags", default)]
@@ -583,6 +1084,8 @@ struct PackageVersion {
     peer_dependencies_meta: BTreeMap<String, PeerDependencyMetadata>,
     #[serde(default)]
     scripts: BTreeMap<String, String>,
+    #[serde(default)]
+    engines: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -619,6 +1122,50 @@ struct LockedPackage {
     optional_peers: Vec<String>,
     #[serde(default)]
     scripts: BTreeMap<String, String>,
+    #[serde(default)]
+    engines: BTreeMap<String, String>,
+}
+
+fn manifest_engines(
+    manifest: &serde_json::Value,
+) -> Result<BTreeMap<String, String>, PackageError> {
+    let Some(engines) = manifest.get("engines") else {
+        return Ok(BTreeMap::new());
+    };
+    let engines = engines
+        .as_object()
+        .ok_or_else(|| PackageError("package.json engines must be an object".into()))?;
+    engines
+        .iter()
+        .map(|(name, requirement)| {
+            requirement
+                .as_str()
+                .map(|requirement| (name.clone(), requirement.to_owned()))
+                .ok_or_else(|| PackageError(format!("engine {name} must be a string")))
+        })
+        .collect()
+}
+
+fn validate_sako_engine(
+    package: &str,
+    engines: &BTreeMap<String, String>,
+) -> Result<(), PackageError> {
+    let Some(requirement) = engines.get("sako") else {
+        return Ok(());
+    };
+    let requirements = npm_version_requirements(requirement)?;
+    let version = Version::parse(SAKO_VERSION)
+        .map_err(|error| PackageError(format!("invalid Sako version: {error}")))?;
+    if requirements
+        .iter()
+        .any(|requirement| requirement.matches(&version))
+    {
+        Ok(())
+    } else {
+        Err(PackageError(format!(
+            "{package} requires Sako {requirement}, current version is {SAKO_VERSION}"
+        )))
+    }
 }
 
 fn requirement_matches(version: &str, requirement: &str) -> bool {
@@ -628,10 +1175,88 @@ fn requirement_matches(version: &str, requirement: &str) -> bool {
     if requirement == version {
         return true;
     }
-    VersionReq::parse(requirement)
+    npm_version_requirements(requirement)
         .ok()
         .zip(Version::parse(version).ok())
-        .is_some_and(|(requirement, version)| requirement.matches(&version))
+        .is_some_and(|(requirements, version)| {
+            requirements
+                .iter()
+                .any(|requirement| requirement.matches(&version))
+        })
+}
+
+fn npm_version_requirements(requirement: &str) -> Result<Vec<VersionReq>, PackageError> {
+    let mut parsed = Vec::new();
+    for alternative in requirement.split("||") {
+        let alternative = alternative.trim();
+        if alternative.is_empty() {
+            return Err(PackageError(format!(
+                "unsupported semver requirement '{requirement}'"
+            )));
+        }
+        let normalized = normalize_npm_range(alternative)?;
+        parsed.push(VersionReq::parse(&normalized).map_err(|error| {
+            PackageError(format!(
+                "unsupported semver requirement '{requirement}': {error}"
+            ))
+        })?);
+    }
+    Ok(parsed)
+}
+
+fn normalize_npm_range(requirement: &str) -> Result<String, PackageError> {
+    if let Some((minimum, maximum)) = requirement.split_once(" - ") {
+        let minimum = Version::parse(minimum.trim())
+            .map_err(|error| PackageError(format!("invalid hyphen range lower bound: {error}")))?;
+        let maximum = Version::parse(maximum.trim())
+            .map_err(|error| PackageError(format!("invalid hyphen range upper bound: {error}")))?;
+        return Ok(format!(">={minimum}, <={maximum}"));
+    }
+
+    let raw = requirement.split_ascii_whitespace().collect::<Vec<_>>();
+    let mut comparators = Vec::new();
+    let mut index = 0;
+    while index < raw.len() {
+        let token = raw[index].trim_matches(',');
+        if matches!(token, ">" | ">=" | "<" | "<=" | "=" | "~" | "^") {
+            let Some(version) = raw.get(index + 1) else {
+                return Err(PackageError(format!(
+                    "semver comparator '{token}' has no version"
+                )));
+            };
+            comparators.push(format!("{token}{}", version.trim_matches(',')));
+            index += 2;
+            continue;
+        }
+        comparators.push(normalize_npm_comparator(token));
+        index += 1;
+    }
+    Ok(comparators.join(", "))
+}
+
+fn normalize_npm_comparator(comparator: &str) -> String {
+    let comparator = comparator.replace(['x', 'X'], "*");
+    if comparator == "*"
+        || comparator.starts_with(['>', '<', '=', '~', '^'])
+        || comparator.contains('*')
+    {
+        return comparator;
+    }
+    if Version::parse(&comparator).is_ok() {
+        return format!("={comparator}");
+    }
+    match comparator.bytes().filter(|byte| *byte == b'.').count() {
+        0 if comparator.bytes().all(|byte| byte.is_ascii_digit()) => {
+            format!("^{comparator}")
+        }
+        1 if comparator
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.') =>
+        {
+            format!("~{comparator}")
+        }
+        _ => comparator,
+    }
 }
 
 fn lock_matches_manifest(
@@ -644,7 +1269,7 @@ fn lock_matches_manifest(
             .packages
             .get(&format!("node_modules/{name}"))
             .is_some_and(|package| {
-                package.name == *name && requirement_matches(&package.version, requirement)
+                package.name == *name && locked_requirement_matches(package, requirement)
             })
     });
     required_match
@@ -655,9 +1280,17 @@ fn lock_matches_manifest(
                     .packages
                     .get(&format!("node_modules/{name}"))
                     .is_none_or(|package| {
-                        package.name == *name && requirement_matches(&package.version, requirement)
+                        package.name == *name && locked_requirement_matches(package, requirement)
                     })
             })
+}
+
+fn locked_requirement_matches(package: &LockedPackage, requirement: &str) -> bool {
+    if package.resolved.starts_with("workspace:") {
+        workspace_requirement_matches(&package.version, requirement)
+    } else {
+        requirement_matches(&package.version, requirement)
+    }
 }
 
 fn validate_peer_dependencies(
@@ -743,11 +1376,7 @@ fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersi
     } else {
         requirement
     };
-    let parsed = VersionReq::parse(requirement).map_err(|error| {
-        PackageError(format!(
-            "unsupported semver requirement '{requirement}': {error}"
-        ))
-    })?;
+    let parsed = npm_version_requirements(requirement)?;
     metadata
         .versions
         .iter()
@@ -756,7 +1385,11 @@ fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersi
                 .ok()
                 .map(|version| (version, package))
         })
-        .filter(|(version, _)| parsed.matches(version))
+        .filter(|(version, _)| {
+            parsed
+                .iter()
+                .any(|requirement| requirement.matches(version))
+        })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, package)| package.clone())
         .ok_or_else(|| PackageError(format!("no version satisfies '{requirement}'")))
@@ -943,13 +1576,26 @@ fn run_lifecycle_scripts(
         let Some(script) = scripts.get(name) else {
             continue;
         };
-        let status = Command::new("cmd.exe")
-            .args(["/d", "/s", "/c", script])
-            .current_dir(package_root)
-            .status()
-            .map_err(|error| PackageError(format!("cannot start {name} script: {error}")))?;
-        if !status.success() {
-            return Err(PackageError(format!("{name} script exited with {status}")));
+        let arguments = [
+            "/d".to_owned(),
+            "/s".to_owned(),
+            "/c".to_owned(),
+            script.to_owned(),
+        ];
+        let output = spawn_native_with_bounded_output(
+            "cmd.exe",
+            &arguments,
+            Some(package_root),
+            MAXIMUM_SCRIPT_OUTPUT_BYTES,
+        )
+        .map_err(|error| PackageError(format!("cannot run {name} script: {error}")))?;
+        io::stdout().write_all(&output.stdout)?;
+        io::stderr().write_all(&output.stderr)?;
+        if !output.status.success() {
+            return Err(PackageError(format!(
+                "{name} script exited with {}",
+                output.status
+            )));
         }
     }
     Ok(())
@@ -1009,6 +1655,23 @@ mod tests {
     }
 
     #[test]
+    fn supports_npm_comparator_or_hyphen_and_x_ranges() {
+        let matches = |version, requirement| requirement_matches(version, requirement);
+        assert!(matches("2.4.0", ">= 2.1.2 < 3.0.0"));
+        assert!(!matches("3.0.0", ">= 2.1.2 < 3.0.0"));
+        assert!(matches("3.2.1", "^1.0.0 || ^3.0.0"));
+        assert!(matches("1.4.5", "1.4.x"));
+        assert!(!matches("1.5.0", "1.4.x"));
+        assert!(matches("1.2.3", "1.2.3 - 2.0.0"));
+        assert!(matches("2.0.0", "1.2.3 - 2.0.0"));
+        assert!(!matches("2.0.1", "1.2.3 - 2.0.0"));
+        assert!(matches("1.2.9", "1.2"));
+        assert!(!matches("1.3.0", "1.2"));
+        assert!(matches("1.2.3", "1.2.3"));
+        assert!(!matches("1.2.4", "1.2.3"));
+    }
+
+    #[test]
     fn verifies_sha512_integrity() {
         let bytes = b"package bytes";
         let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
@@ -1061,6 +1724,7 @@ mod tests {
                     peer_dependencies: BTreeMap::new(),
                     optional_peers: Vec::new(),
                     scripts: BTreeMap::new(),
+                    engines: BTreeMap::new(),
                 },
             )]),
         };
@@ -1075,8 +1739,11 @@ mod tests {
             registry: "https://invalid.example".into(),
             scoped_registries: BTreeMap::new(),
             auth_tokens: BTreeMap::new(),
+            basic_auth: BTreeMap::new(),
+            agent: ureq::AgentBuilder::new().build(),
             cache_root,
             metadata: HashMap::new(),
+            workspaces: BTreeMap::new(),
             ignore_scripts: true,
             installed: BTreeMap::new(),
             active: HashSet::new(),
@@ -1101,6 +1768,7 @@ mod tests {
             peer_dependencies: BTreeMap::new(),
             optional_peers: Vec::new(),
             scripts: BTreeMap::new(),
+            engines: BTreeMap::new(),
         };
         let mut peer = empty();
         peer.name = "peer".into();
@@ -1126,7 +1794,7 @@ mod tests {
         let path = root.join(".npmrc");
         fs::write(
             &path,
-            "registry=https://packages.example/npm/\n@private:registry=https://private.example/\n//private.example/:_authToken=secret\n",
+            "registry=https://packages.example/npm/\n@private:registry=https://private.example/\n//private.example/:_authToken=secret\n//packages.example/npm/:username=user\n//packages.example/npm/:_password=cGFzcw==\nusername=default-user\n_password=ZGVmYXVsdC1wYXNz\n//override.example/:username=ignored\n//override.example/:_password=aWdub3JlZA==\n//override.example/:_auth=ZmluYWw6c2VjcmV0\n",
         )
         .unwrap();
         let mut config = RegistryConfig::default();
@@ -1140,6 +1808,68 @@ mod tests {
             config.auth_tokens.get("private.example/").unwrap(),
             "secret"
         );
+        assert_eq!(
+            config.basic_auth.get("packages.example/npm/").unwrap(),
+            "dXNlcjpwYXNz"
+        );
+        assert_eq!(
+            config.default_basic_auth.as_deref(),
+            Some("ZGVmYXVsdC11c2VyOmRlZmF1bHQtcGFzcw==")
+        );
+        assert_eq!(
+            config.basic_auth.get("override.example/").unwrap(),
+            "ZmluYWw6c2VjcmV0"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validates_sako_engine_ranges() {
+        let compatible = BTreeMap::from([("sako".into(), "^0.1.0".into())]);
+        assert!(validate_sako_engine("fixture", &compatible).is_ok());
+
+        let incompatible = BTreeMap::from([("sako".into(), ">=2.0.0".into())]);
+        let error = validate_sako_engine("fixture", &incompatible).unwrap_err();
+        assert!(error.to_string().contains("requires Sako >=2.0.0"));
+
+        let node_only = BTreeMap::from([("node".into(), ">=22".into())]);
+        assert!(validate_sako_engine("fixture", &node_only).is_ok());
+    }
+
+    #[test]
+    fn installs_and_replays_local_workspaces() {
+        let root = env::temp_dir().join(format!("sako-workspaces-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("packages/tool")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("packages/tool/package.json"),
+            r#"{"name":"workspace-tool","version":"1.2.3","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("packages/tool/index.js"),
+            "module.exports = 42;\n",
+        )
+        .unwrap();
+
+        let mut manager = PackageManager::new(&root, true).unwrap();
+        manager.install().unwrap();
+        let installed = root.join("node_modules/workspace-tool/index.js");
+        assert_eq!(
+            fs::read_to_string(&installed).unwrap(),
+            "module.exports = 42;\n"
+        );
+        let lock_source = fs::read_to_string(root.join("sako.lock")).unwrap();
+        assert!(lock_source.contains("workspace:packages/tool"));
+
+        fs::remove_dir_all(root.join("node_modules")).unwrap();
+        manager.install().unwrap();
+        assert!(installed.is_file());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -25,7 +25,7 @@ Phase 1 exit criterion: Sako boots the supplied V8 build on Windows x64, runs th
 
 - [x] Support `sako app.js` and `sako run app.js` with script arguments.
 - [x] Support `sako eval`, `sako repl`, `sako --version`, and package-script dispatch.
-- [x] Establish the runtime bootstrap JS layer and basic globals.
+- [x] Establish the runtime bootstrap JS layer and basic globals, including bounded `fetch`, `Headers`, `Request`, and `Response` over native HTTP/HTTPS transport.
 - [x] Implement correct timers, cancellation, queued microtasks, and event-loop draining.
 - [x] Add structured JS/system error mapping and stable stack traces.
 - [x] Add startup, exception, timer, and microtask integration tests.
@@ -35,18 +35,21 @@ Phase 1 exit criterion: Sako boots the supplied V8 build on Windows x64, runs th
 
 - [x] Implement V8-native ESM compilation, linking, evaluation, and relative/absolute resolution.
 - [x] Select `.js` entry mode from the nearest `package.json` `type`.
-- [ ] Implement package `exports`, `imports`, and conditional resolution.
+- [x] Implement exact/wildcard package `exports`, `imports`, and `import`/`require`/`node`/`default` conditional resolution.
 - [x] Implement cached CommonJS loading, JSON modules, package `main`, `node_modules` lookup, and `require.resolve`.
-- [ ] Implement the CJS/ESM interoperability rules.
-- [ ] Add the first `node:` modules: assert, buffer, console, events, fs, fs/promises, path, process, timers, URL, and util. (`assert`, `console`, `process`, and `timers` have an initial CommonJS surface.)
+- [x] Implement basic CJS-to-ESM synthetic namespaces and synchronous ESM-to-CJS namespaces.
+- [x] Complete Node-compatible named CJS export snapshots and the targeted module edge cases. (Default exports retain the live `module.exports` object; conditional maps, dynamic import, missing-import rejection, and timer-backed top-level await are covered.)
+- [x] Add initial partial `node:` modules for assert, buffer, console, events, fs, fs/promises, path, process, timers, URL, and util.
 - [x] Track each API honestly in `docs/node-compatibility.md`.
-- [ ] Cover Windows paths, Unicode paths, UNC paths, extended paths, links, and locking behavior. (Normal and Unicode local paths are covered.)
+- [x] Cover Windows paths, Unicode paths, UNC paths, extended paths, links, and locking behavior. (Automated tests cover Unicode, extended roots, hard/symbolic links, and sharing violations; a real `\\localhost\c$` read was validated on the development host.)
 
 ## Phase 4: npm packages
 
 - [x] Implement npm registry metadata and tarball fetching with integrity verification.
-- [x] Implement semver ranges, dist-tags, dependency classes, and scoped packages.
-- [ ] Implement peer constraints, workspaces, registry auth, and private registry configuration.
+- [x] Implement semver ranges, dist-tags, dependency classes, scoped packages, and reproducible `engines.sako` validation.
+- [x] Validate peer constraints and support default/scoped `.npmrc` registries with path-scoped bearer tokens.
+- [x] Discover, bounded-copy, install, and replay local workspace packages.
+- [x] Implement richer npm authentication modes and complete precedence for the supported configuration surface. (Path-scoped Bearer, encoded Basic, username/password pairs, proxies, environment settings, and explicit CLI overrides are ordered and tested.)
 - [x] Implement a bounded content-addressed Windows package store.
 - [x] Design and implement deterministic `sako.lock` serialization.
 - [x] Implement `install`, `add`, `remove`, and `update`.
@@ -55,30 +58,31 @@ Phase 1 exit criterion: Sako boots the supplied V8 build on Windows x64, runs th
 
 ## Phase 5: Windows I/O, networking, and Express
 
-- [ ] Implement the Windows platform reactor with IOCP and bounded completion queues.
-- [ ] Implement filesystem and process APIs with native Windows semantics and resource ownership.
-- [ ] Implement TCP, DNS, HTTP, HTTPS, and stream compatibility incrementally.
-- [ ] Build the allocation-conscious native HTTP parser and response path.
-- [ ] Materialize request headers and bodies lazily across the Rust/V8 boundary.
-- [ ] Run unmodified Express through compatible Node HTTP APIs.
-- [ ] Add overload/backpressure, cancellation, keep-alive, invalid-input, and resource-lifetime tests.
+- [x] Add an owned Windows IOCP reactor with bounded posted completions and drain tests.
+- [x] Integrate overlapped socket/file operations, cancellation, and backpressure with the IOCP reactor. (Owned file operations and completion-driven TCP receive/send retain stable handles, buffers, and `OVERLAPPED` storage; admission and retained completions are bounded, and `CancelIoEx` completions drain before release.)
+- [x] Implement filesystem and process APIs with native Windows semantics and resource ownership. (Bounded Windows path/directory/link APIs, runtime-owned descriptors, polling watchers, direct `CreateProcessW`/`STARTUPINFOEX` launch with an explicit inherited-handle list, named capture pipes, Job Object ownership, deferred ChildProcess event shapes, and lifecycle tests are implemented; native change notifications and nonblocking incremental child streams remain compatibility extensions.)
+- [x] Implement TCP, DNS, HTTP, HTTPS, and stream compatibility incrementally. (Completion-driven TCP, native DNS, owned HTTP/1, bounded request bodies, keep-alive/graceful close, TLS 1.2/1.3 HTTPS servers, and initial stream shapes are implemented; raw public sockets and HTTP/HTTPS clients remain compatibility extensions.)
+- [x] Build a bounded zero-copy HTTP/1 request-head parser and validated response encoder.
+- [x] Materialize request headers and bodies lazily across the Rust/V8 boundary. (The bridge transfers bounded owned byte buffers/ranges; header strings/maps and body Buffers are created only when consumed.)
+- [x] Run unmodified Express 4.21.2 through compatible Node HTTP APIs.
+- [x] Add overload/backpressure, cancellation, keep-alive, invalid-input, and resource-lifetime tests. (Tests cover retained-completion backpressure, socket receive cancellation/drain, connection overload, fragmented bodies, framing rejection, keep-alive, graceful close, Job Objects, descriptors, and isolate lifetime.)
 
 ## Phase 6: Stability, profiling, and measured acceleration
 
-- [ ] Add component-level diagnostics for V8 heap, native memory, external memory, handles, sockets, timers, queues, and RSS/private bytes.
-- [ ] Add heavy development leak detection and scheduled memory soak tests.
-- [ ] Require bounded caches, queues, pools, slabs, and registries with explicit eviction/backpressure.
-- [ ] Establish reproducible startup, HTTP, Express, filesystem, package-cache, install, worker, and memory benchmarks.
-- [ ] Profile Rust/V8 crossings, allocations, syscalls, parsing, and I/O before optimizing.
-- [ ] Add scalar acceleration baselines and only then measured SSE4.2/AVX2 paths with differential tests.
-- [ ] Add optional worker-per-isolate multicore scaling without global hot-path locks.
-- [ ] Publish benchmark methodology and results without unsupported performance claims.
+- [x] Add component-level diagnostics for V8 heap, native memory, external memory, handles, sockets, timers, queues, and RSS/private bytes. (CLI snapshots also report module entries, HTTP owners/buffers, and OS handles.)
+- [x] Add heavy development leak detection and scheduled memory soak tests. (`--detect-leaks`, repeated isolate/HTTP/child cycles, and a weekly configurable plateau soak are implemented.)
+- [x] Require bounded caches, queues, pools, slabs, and registries with explicit eviction/backpressure. (Limits and rejection/eviction paths are documented in code and exercised by capacity tests.)
+- [x] Establish reproducible startup, HTTP, Express, filesystem, package-cache/install, worker, and memory benchmarks. (`oha` is an explicit prerequisite for load runs; no throughput result is claimed on the current host.)
+- [x] Profile Rust/V8 crossings, allocations, syscalls, parsing, and I/O before optimizing. (The native-crossing inventory, component memory counters, parser experiments, and reproducible WPR/`xperf` startup and filesystem traces are documented.)
+- [x] Add scalar acceleration baselines and only then measured SSE4.2/AVX2 paths with differential tests. (AVX2 is selected after a measured improvement; the measured SSE4.2 path regressed and remains benchmark-only with scalar fallback.)
+- [x] Add optional worker-per-isolate multicore scaling without global hot-path locks.
+- [x] Publish benchmark methodology and measured local results without unsupported performance claims.
 
 ## Cross-cutting release gates
 
-- [ ] Every first-party source file carries the BSD-3-Clause SPDX identifier where appropriate.
-- [ ] Every native resource and persistent V8 handle has an explicit owner and teardown path.
-- [ ] No cache, queue, channel, callback registry, or connection table is unbounded.
-- [ ] Every `unsafe` Rust block and native pointer lifetime has a documented invariant and targeted tests.
-- [ ] Memory converges after repeated load cycles; monotonic growth blocks release.
-- [ ] Windows CI passes formatting, Clippy, unit/integration tests, runtime tests, module tests, npm resolver tests, HTTP tests, and memory sanity tests appropriate to the implemented phase.
+- [x] Every first-party source file carries the BSD-3-Clause SPDX identifier where appropriate.
+- [x] Every currently implemented native resource and persistent V8 handle has an explicit owner and teardown path.
+- [x] Every currently implemented cache, queue, callback registry, connection table, and pool is bounded.
+- [x] Every `unsafe` Rust block and native pointer lifetime has a documented invariant and targeted tests.
+- [x] Memory converges after repeated load cycles; monotonic growth blocks release. (Local lifecycle and 100-cycle scheduled-soak validation pass; CI uses 1,000 cycles and a plateau bound.)
+- [ ] Windows CI passes formatting, Clippy, unit/integration tests, runtime tests, module tests, npm resolver tests, HTTP tests, and memory sanity tests appropriate to the implemented phase. (The fail-closed workflow passes `actionlint` 1.7.12; the complete equivalent gate and a 100-cycle soak pass locally on Windows. A remote result requires committing/pushing the currently untracked workflow and configuring the `SAKO_V8_ARTIFACT_URL` repository secret.)

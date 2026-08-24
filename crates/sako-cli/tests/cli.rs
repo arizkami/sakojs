@@ -11,6 +11,33 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn module_project(name: &str) -> (PathBuf, PathBuf) {
+    let sandbox = std::env::temp_dir().join(format!("sako-{name}-{}", std::process::id()));
+    let root = sandbox.join(name);
+    let _ = std::fs::remove_dir_all(&sandbox);
+    copy_tree(&fixture(name), &root);
+    copy_tree(&fixture("fixtures/packages"), &root.join("node_modules"));
+    let entry = root.join(if name == "modules" {
+        "main.mjs"
+    } else {
+        "main.cjs"
+    });
+    (sandbox, entry)
+}
+
 #[test]
 fn executes_javascript_file() {
     let output = Command::new(env!("CARGO_BIN_EXE_sako"))
@@ -101,15 +128,44 @@ fn supports_eval_version_repl_and_memory_stats() {
     assert!(stdout.contains("V8 heap used"), "stdout: {stdout}");
     assert!(stdout.contains("Persistent handles  1"), "stdout: {stdout}");
     assert!(stdout.contains("Timers              0"), "stdout: {stdout}");
+    assert!(stdout.contains("Queued operations   0"), "stdout: {stdout}");
+
+    let leak_check = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .args(["--detect-leaks", "eval", "queueMicrotask(() => 42)"])
+        .output()
+        .expect("sako leak diagnostics should start");
+    assert!(
+        leak_check.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&leak_check.stderr)
+    );
+    assert!(String::from_utf8_lossy(&leak_check.stdout).contains("Sako leak check    clean"));
+
+    let module_output =
+        std::env::temp_dir().join(format!("sako-leak-module-{}.txt", std::process::id()));
+    let module_leak_check = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg("--detect-leaks")
+        .arg(fixture("node-core.mjs"))
+        .arg(&module_output)
+        .output()
+        .expect("sako module leak diagnostics should start");
+    let _ = std::fs::remove_file(module_output);
+    assert!(
+        module_leak_check.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&module_leak_check.stderr)
+    );
 }
 
 #[test]
 fn executes_relative_es_modules() {
+    let (root, entry) = module_project("modules");
     let output = Command::new(env!("CARGO_BIN_EXE_sako"))
-        .arg(fixture("modules/main.mjs"))
+        .arg(entry)
         .arg("argument")
         .output()
         .expect("sako should start");
+    std::fs::remove_dir_all(root).unwrap();
 
     assert!(
         output.status.success(),
@@ -118,16 +174,18 @@ fn executes_relative_es_modules() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "modules 42 import-target wildcard-target commonjs-namespace commonjs-namespace argument\n"
+        "modules 42 import-target wildcard-target commonjs-namespace commonjs-namespace argument dynamic-import file.js commonjs-namespace true import-map-condition\n"
     );
 }
 
 #[test]
 fn executes_commonjs_modules() {
+    let (root, entry) = module_project("commonjs");
     let output = Command::new(env!("CARGO_BIN_EXE_sako"))
-        .arg(fixture("commonjs/main.cjs"))
+        .arg(entry)
         .output()
         .expect("sako should start");
+    std::fs::remove_dir_all(root).unwrap();
 
     assert!(
         output.status.success(),
@@ -181,6 +239,186 @@ fn supports_initial_node_modules_and_web_globals() {
 }
 
 #[test]
+fn fetches_bounded_http_responses_through_the_native_bridge() {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (request_tx, request_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut headers = Vec::new();
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.trim_end().split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        request_tx.send((request_line, headers, body)).unwrap();
+
+        let response_body = br#"{"ok":true}"#;
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Fetch: yes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_body.len()
+        )
+        .unwrap();
+        stream.write_all(response_body).unwrap();
+    });
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let script = std::env::temp_dir().join(format!("sako-fetch-{nonce}.mjs"));
+    std::fs::write(
+        &script,
+        format!(
+            r#"const controller = new AbortController();
+controller.abort();
+let abortName = "missing";
+try {{ await fetch("http://127.0.0.1:{port}/aborted", {{ signal: controller.signal }}); }}
+catch (error) {{ abortName = error.name; }}
+const response = await fetch("http://127.0.0.1:{port}/native?value=1", {{
+  method: "POST",
+  headers: {{ "x-request": "sako" }},
+  body: "payload",
+}});
+const cloned = response.clone();
+const value = await response.json();
+const bytes = new Uint8Array(await cloned.arrayBuffer());
+console.log(response.status, response.ok, response.statusText, response.headers.get("x-fetch"), value.ok, bytes.length, abortName);
+"#
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(&script)
+        .output()
+        .expect("Sako fetch fixture should start");
+    let _ = std::fs::remove_file(script);
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "201 true Created yes true 11 AbortError\n"
+    );
+    let (request_line, headers, body) = request_rx.recv().unwrap();
+    assert_eq!(request_line, "POST /native?value=1 HTTP/1.1\r\n");
+    assert!(headers.contains(&("x-request".into(), "sako".into())));
+    assert_eq!(body, b"payload");
+}
+
+#[test]
+fn respects_windows_file_sharing_violations() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    let path = std::env::temp_dir().join(format!("sako-lock-test-{}.txt", std::process::id()));
+    std::fs::write(&path, "locked").unwrap();
+    let exclusive = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("file-lock.mjs"))
+        .arg(&path)
+        .output()
+        .expect("sako lock fixture should start");
+    drop(exclusive);
+    let _ = std::fs::remove_file(path);
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "locked\n");
+}
+
+#[test]
+fn serves_http_through_the_native_runtime_bridge() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("http-server.mjs"))
+        .arg(port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Sako HTTP fixture should start");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready, "http-ready\n");
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    client
+        .write_all(
+            b"POST /native HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+        )
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.ends_with("POST /native body"), "{response}");
+
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn runs_explicit_worker_local_isolates() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg("--workers=2")
+        .arg(fixture("worker.js"))
+        .output()
+        .expect("sako workers should start");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| *line == "worker-ready")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn dispatches_package_scripts() {
     let root = std::env::temp_dir().join(format!("sako-script-test-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -203,4 +441,40 @@ fn dispatches_package_scripts() {
         "stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+#[test]
+fn accepts_explicit_package_configuration() {
+    let root = std::env::temp_dir().join(format!("sako-config-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("package.json"), r#"{"private":true}"#).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .args([
+            "install",
+            "--ignore-scripts",
+            "--registry=https://registry.example/npm",
+            "--token",
+            "fixture-token",
+            "--proxy=http://127.0.0.1:9",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("sako install should parse package options");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(root.join("sako.lock").is_file());
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .args(["install", "--registry"])
+        .current_dir(&root)
+        .output()
+        .expect("sako install should reject a missing option value");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--registry needs a value"));
+    std::fs::remove_dir_all(root).unwrap();
 }

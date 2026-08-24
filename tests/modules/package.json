@@ -1,6 +1,10 @@
 {
   "type": "module",
   "imports": {
-    "#message": "./nested/message.mjs"
+    "#message": "./nested/message.mjs",
+    "#condition": {
+      "import": "./nested/import-condition.mjs",
+      "require": "./nested/require-condition.cjs"
+    }
   }
 }

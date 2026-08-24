@@ -9,6 +9,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -17,10 +18,69 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <bcrypt.h>
 
 #include "libplatform/libplatform.h"
 #include "v8.h"
 #include "bootstrap.generated.h"
+
+extern "C" {
+struct SakoNativeBytes {
+  const uint8_t* data;
+  size_t length;
+};
+
+struct SakoNativeHeader {
+  SakoNativeBytes name;
+  SakoNativeBytes value;
+};
+
+struct SakoNativeHttpResponse {
+  uint16_t status;
+  SakoNativeBytes reason;
+  const SakoNativeHeader* headers;
+  size_t header_count;
+  SakoNativeBytes body;
+};
+
+using SakoNativeHttpHandler = int (*)(
+    void*, SakoNativeBytes, SakoNativeBytes, SakoNativeBytes,
+    const SakoNativeHeader*, size_t, SakoNativeHttpResponse*);
+
+void* sako_http_server_new(uint16_t port, uint16_t* output_port, char* error,
+                           size_t error_capacity);
+void* sako_https_server_new(uint16_t port, SakoNativeBytes certificate,
+                            SakoNativeBytes private_key, uint16_t* output_port,
+                            char* error, size_t error_capacity);
+int sako_http_server_tick(void* server, SakoNativeHttpHandler handler,
+                          void* context, char* error, size_t error_capacity);
+void sako_http_server_delete(void* server);
+int sako_http_server_close(void* server);
+int sako_http_server_stats(void* server, uint64_t* connections,
+                           uint64_t* rejected_connections);
+int sako_dns_resolve(SakoNativeBytes host, int family, char* output,
+                     size_t output_capacity, char* error,
+                     size_t error_capacity);
+void* sako_process_spawn_sync(SakoNativeBytes executable,
+                              const SakoNativeBytes* arguments,
+                              size_t argument_count, SakoNativeBytes cwd,
+                              char* error, size_t error_capacity);
+int sako_process_output_status(const void* output);
+SakoNativeBytes sako_process_output_stdout(const void* output);
+SakoNativeBytes sako_process_output_stderr(const void* output);
+void sako_process_output_delete(void* output);
+void* sako_fetch_sync(SakoNativeBytes url, SakoNativeBytes method,
+                      const SakoNativeHeader* headers, size_t header_count,
+                      SakoNativeBytes body, char* error, size_t error_capacity);
+uint16_t sako_fetch_output_status(const void* output);
+SakoNativeBytes sako_fetch_output_status_text(const void* output);
+SakoNativeBytes sako_fetch_output_url(const void* output);
+size_t sako_fetch_output_header_count(const void* output);
+SakoNativeBytes sako_fetch_output_header_name(const void* output, size_t index);
+SakoNativeBytes sako_fetch_output_header_value(const void* output, size_t index);
+SakoNativeBytes sako_fetch_output_body(const void* output);
+void sako_fetch_output_delete(void* output);
+}
 
 namespace {
 
@@ -64,12 +124,68 @@ std::string WideToUtf8(const std::wstring& value) {
   return result;
 }
 
+std::filesystem::path ExtendedPath(const std::filesystem::path& path) {
+  std::error_code error;
+  std::filesystem::path absolute =
+      path.is_absolute() ? path : std::filesystem::absolute(path, error);
+  if (error) return path;
+  absolute = absolute.lexically_normal();
+  absolute.make_preferred();
+  const std::wstring& native = absolute.native();
+  if (native.starts_with(L"\\\\?\\")) return absolute;
+  if (native.starts_with(L"\\\\")) {
+    return std::filesystem::path(L"\\\\?\\UNC\\" + native.substr(2));
+  }
+  return std::filesystem::path(L"\\\\?\\" + native);
+}
+
+std::filesystem::path UserPath(const std::filesystem::path& path) {
+  const std::wstring& native = path.native();
+  if (native.starts_with(L"\\\\?\\UNC\\")) {
+    return std::filesystem::path(L"\\\\" + native.substr(8));
+  }
+  if (native.starts_with(L"\\\\?\\")) {
+    return std::filesystem::path(native.substr(4));
+  }
+  return path;
+}
+
+std::filesystem::path CanonicalPath(const std::filesystem::path& path,
+                                    std::error_code& error) {
+  return UserPath(std::filesystem::weakly_canonical(ExtendedPath(path), error));
+}
+
+bool IsRegularFile(const std::filesystem::path& path,
+                   std::error_code& error) {
+  const std::filesystem::path extended = ExtendedPath(path);
+  const DWORD attributes = GetFileAttributesW(extended.native().c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    error = std::error_code(static_cast<int>(GetLastError()),
+                            std::system_category());
+    return false;
+  }
+  error.clear();
+  return (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool IsDirectory(const std::filesystem::path& path, std::error_code& error) {
+  const std::filesystem::path extended = ExtendedPath(path);
+  const DWORD attributes = GetFileAttributesW(extended.native().c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) {
+    error = std::error_code(static_cast<int>(GetLastError()),
+                            std::system_category());
+    return false;
+  }
+  error.clear();
+  return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
 std::string PathToUtf8(const std::filesystem::path& path) {
-  return WideToUtf8(path.native());
+  return WideToUtf8(UserPath(path).native());
 }
 
 bool ReadFile(const std::filesystem::path& path, std::string* source) {
-  std::ifstream input(path, std::ios::binary);
+  std::ifstream input(ExtendedPath(path), std::ios::binary);
   if (!input) return false;
   input.seekg(0, std::ios::end);
   const std::streamoff size = input.tellg();
@@ -89,6 +205,366 @@ void WriteStdout(const char* bytes, size_t length) {
     bytes += written;
     length -= written;
   }
+}
+
+void WriteHandle(HANDLE output, const char* bytes, size_t length) {
+  while (output != INVALID_HANDLE_VALUE && output != nullptr && length != 0) {
+    const DWORD chunk = length > MAXDWORD ? MAXDWORD : static_cast<DWORD>(length);
+    DWORD written = 0;
+    if (!WriteFile(output, bytes, chunk, &written, nullptr) || written == 0) return;
+    bytes += written;
+    length -= written;
+  }
+}
+
+void ThrowTypeError(v8::Isolate* isolate, const char* message);
+bool ReadBytes(v8::Local<v8::Value> value, const uint8_t** bytes,
+               size_t* length);
+
+void WriteStream(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  if (info.Length() == 0) {
+    info.GetReturnValue().Set(v8::True(isolate));
+    return;
+  }
+  const uint8_t* bytes = nullptr;
+  size_t length = 0;
+  std::string text;
+  if (info[0]->IsString()) {
+    text = ToUtf8(isolate, info[0]);
+    bytes = reinterpret_cast<const uint8_t*>(text.data());
+    length = text.size();
+  } else if (!ReadBytes(info[0], &bytes, &length)) {
+    ThrowTypeError(isolate, "stream write needs a string or byte array");
+    return;
+  }
+  const DWORD stream = info.Data()->Int32Value(isolate->GetCurrentContext())
+                           .FromMaybe(STD_OUTPUT_HANDLE);
+  WriteHandle(GetStdHandle(stream), reinterpret_cast<const char*>(bytes),
+              length);
+  info.GetReturnValue().Set(v8::True(isolate));
+}
+
+void IsTty(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  const int descriptor =
+      info.Length() == 0 ? -1 : info[0]->Int32Value(context).FromMaybe(-1);
+  const DWORD stream = descriptor == 1   ? STD_OUTPUT_HANDLE
+                       : descriptor == 2 ? STD_ERROR_HANDLE
+                                         : STD_INPUT_HANDLE;
+  DWORD mode = 0;
+  info.GetReturnValue().Set(descriptor >= 0 &&
+                            GetConsoleMode(GetStdHandle(stream), &mode) != 0);
+}
+
+void ResolveHost(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  if (info.Length() == 0 || !info[0]->IsString()) {
+    ThrowTypeError(isolate, "DNS lookup needs a hostname");
+    return;
+  }
+  const std::string host = ToUtf8(isolate, info[0]);
+  if (host.empty() || host.size() > 253) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        v8::String::NewFromUtf8Literal(isolate, "DNS hostname length is invalid")));
+    return;
+  }
+  const int family = info.Length() > 1
+                         ? info[1]->Int32Value(context).FromMaybe(-1)
+                         : 0;
+  char output[2048] = {};
+  char error[512] = {};
+  const int count = sako_dns_resolve(
+      {reinterpret_cast<const uint8_t*>(host.data()), host.size()}, family,
+      output, sizeof(output), error, sizeof(error));
+  if (count < 0) {
+    isolate->ThrowException(v8::Exception::Error(
+        v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+    return;
+  }
+  v8::Local<v8::Array> addresses = v8::Array::New(isolate, count);
+  std::string values(output);
+  size_t start = 0;
+  uint32_t index = 0;
+  while (start <= values.size() && index < static_cast<uint32_t>(count)) {
+    const size_t end = values.find('\n', start);
+    const size_t length =
+        end == std::string::npos ? values.size() - start : end - start;
+    v8::Local<v8::String> address;
+    if (!v8::String::NewFromUtf8(isolate, values.data() + start,
+                                 v8::NewStringType::kNormal,
+                                 static_cast<int>(length))
+             .ToLocal(&address) ||
+        !addresses->Set(context, index++, address).FromMaybe(false)) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(isolate, "cannot materialize DNS result")));
+      return;
+    }
+    if (end == std::string::npos) break;
+    start = end + 1;
+  }
+  info.GetReturnValue().Set(addresses);
+}
+
+void SpawnSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  constexpr size_t kMaximumArguments = 256;
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  if (info.Length() == 0 || !info[0]->IsString() ||
+      (info.Length() > 1 && !info[1]->IsArray())) {
+    ThrowTypeError(isolate, "spawnSync needs an executable and argument array");
+    return;
+  }
+  const std::string executable = ToUtf8(isolate, info[0]);
+  v8::Local<v8::Array> values =
+      info.Length() > 1 ? info[1].As<v8::Array>() : v8::Array::New(isolate);
+  if (values->Length() > kMaximumArguments) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        v8::String::NewFromUtf8Literal(isolate, "child argument limit exceeded")));
+    return;
+  }
+  std::vector<std::string> argument_storage;
+  std::vector<SakoNativeBytes> arguments;
+  argument_storage.reserve(values->Length());
+  arguments.reserve(values->Length());
+  for (uint32_t index = 0; index < values->Length(); ++index) {
+    v8::Local<v8::Value> value;
+    if (!values->Get(context, index).ToLocal(&value)) return;
+    argument_storage.push_back(ToUtf8(isolate, value));
+  }
+  for (const std::string& argument : argument_storage) {
+    arguments.push_back({reinterpret_cast<const uint8_t*>(argument.data()),
+                         argument.size()});
+  }
+  const std::string cwd = info.Length() > 2 && info[2]->IsString()
+                              ? ToUtf8(isolate, info[2])
+                              : std::string();
+  char error[1024] = {};
+  void* raw = sako_process_spawn_sync(
+      {reinterpret_cast<const uint8_t*>(executable.data()), executable.size()},
+      arguments.data(), arguments.size(),
+      {reinterpret_cast<const uint8_t*>(cwd.data()), cwd.size()}, error,
+      sizeof(error));
+  if (raw == nullptr) {
+    isolate->ThrowException(v8::Exception::Error(
+        v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+    return;
+  }
+  std::unique_ptr<void, void (*)(void*)> output(raw,
+                                                sako_process_output_delete);
+  auto make_bytes = [isolate](SakoNativeBytes bytes)
+      -> v8::MaybeLocal<v8::Uint8Array> {
+    if (bytes.length != 0 && bytes.data == nullptr) return {};
+    std::unique_ptr<v8::BackingStore> backing =
+        v8::ArrayBuffer::NewBackingStore(isolate, bytes.length);
+    if (bytes.length != 0) {
+      std::memcpy(backing->Data(), bytes.data, bytes.length);
+    }
+    v8::Local<v8::ArrayBuffer> buffer =
+        v8::ArrayBuffer::New(isolate, std::move(backing));
+    return v8::Uint8Array::New(buffer, 0, bytes.length);
+  };
+  v8::Local<v8::Uint8Array> stdout_value;
+  v8::Local<v8::Uint8Array> stderr_value;
+  if (!make_bytes(sako_process_output_stdout(raw)).ToLocal(&stdout_value) ||
+      !make_bytes(sako_process_output_stderr(raw)).ToLocal(&stderr_value)) {
+    isolate->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8Literal(
+        isolate, "cannot materialize child output")));
+    return;
+  }
+  v8::Local<v8::Object> result = v8::Object::New(isolate);
+  const auto set = [&](const char* name, v8::Local<v8::Value> value) {
+    return result
+        ->Set(context, v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
+              value)
+        .FromMaybe(false);
+  };
+  if (!set("status",
+           v8::Integer::New(isolate, sako_process_output_status(raw))) ||
+      !set("stdout", stdout_value) || !set("stderr", stderr_value)) {
+    return;
+  }
+  info.GetReturnValue().Set(result);
+}
+
+void FetchSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  constexpr size_t kMaximumHeaders = 128;
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  if (info.Length() < 4 || !info[0]->IsString() || !info[1]->IsString() ||
+      !info[2]->IsArray()) {
+    ThrowTypeError(isolate, "fetch needs URL, method, headers, and body");
+    return;
+  }
+  const std::string url = ToUtf8(isolate, info[0]);
+  const std::string method = ToUtf8(isolate, info[1]);
+  v8::Local<v8::Array> pairs = info[2].As<v8::Array>();
+  if (pairs->Length() % 2 != 0 || pairs->Length() / 2 > kMaximumHeaders) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        v8::String::NewFromUtf8Literal(isolate, "fetch header limit exceeded")));
+    return;
+  }
+  std::vector<std::string> names;
+  std::vector<std::string> values;
+  names.reserve(pairs->Length() / 2);
+  values.reserve(pairs->Length() / 2);
+  for (uint32_t index = 0; index < pairs->Length(); index += 2) {
+    v8::Local<v8::Value> name;
+    v8::Local<v8::Value> value;
+    if (!pairs->Get(context, index).ToLocal(&name) ||
+        !pairs->Get(context, index + 1).ToLocal(&value)) {
+      return;
+    }
+    names.push_back(ToUtf8(isolate, name));
+    values.push_back(ToUtf8(isolate, value));
+  }
+  std::vector<SakoNativeHeader> headers;
+  headers.reserve(names.size());
+  for (size_t index = 0; index < names.size(); ++index) {
+    headers.push_back(
+        {{reinterpret_cast<const uint8_t*>(names[index].data()), names[index].size()},
+         {reinterpret_cast<const uint8_t*>(values[index].data()), values[index].size()}});
+  }
+  const uint8_t* body = nullptr;
+  size_t body_length = 0;
+  if (!ReadBytes(info[3], &body, &body_length)) {
+    ThrowTypeError(isolate, "fetch body must be a byte array");
+    return;
+  }
+  char error[1024] = {};
+  void* raw = sako_fetch_sync(
+      {reinterpret_cast<const uint8_t*>(url.data()), url.size()},
+      {reinterpret_cast<const uint8_t*>(method.data()), method.size()},
+      headers.data(), headers.size(), {body, body_length}, error, sizeof(error));
+  if (raw == nullptr) {
+    isolate->ThrowException(v8::Exception::Error(
+        v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+    return;
+  }
+  std::unique_ptr<void, void (*)(void*)> output(raw, sako_fetch_output_delete);
+  const auto make_string = [isolate](SakoNativeBytes bytes)
+      -> v8::MaybeLocal<v8::String> {
+    if ((bytes.length != 0 && bytes.data == nullptr) ||
+        bytes.length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return {};
+    }
+    return v8::String::NewFromUtf8(
+        isolate, reinterpret_cast<const char*>(bytes.data),
+        v8::NewStringType::kNormal, static_cast<int>(bytes.length));
+  };
+  v8::Local<v8::String> status_text;
+  v8::Local<v8::String> final_url;
+  if (!make_string(sako_fetch_output_status_text(raw)).ToLocal(&status_text) ||
+      !make_string(sako_fetch_output_url(raw)).ToLocal(&final_url)) {
+    isolate->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8Literal(
+        isolate, "cannot materialize fetch response strings")));
+    return;
+  }
+  const size_t header_count = sako_fetch_output_header_count(raw);
+  if (header_count > kMaximumHeaders) return;
+  v8::Local<v8::Array> response_headers =
+      v8::Array::New(isolate, static_cast<int>(header_count * 2));
+  for (size_t index = 0; index < header_count; ++index) {
+    v8::Local<v8::String> name;
+    v8::Local<v8::String> value;
+    if (!make_string(sako_fetch_output_header_name(raw, index)).ToLocal(&name) ||
+        !make_string(sako_fetch_output_header_value(raw, index)).ToLocal(&value) ||
+        !response_headers->Set(context, static_cast<uint32_t>(index * 2), name)
+             .FromMaybe(false) ||
+        !response_headers
+             ->Set(context, static_cast<uint32_t>(index * 2 + 1), value)
+             .FromMaybe(false)) {
+      return;
+    }
+  }
+  const SakoNativeBytes response_body = sako_fetch_output_body(raw);
+  if (response_body.length != 0 && response_body.data == nullptr) return;
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(isolate, response_body.length);
+  if (response_body.length != 0) {
+    std::memcpy(backing->Data(), response_body.data, response_body.length);
+  }
+  v8::Local<v8::ArrayBuffer> body_buffer =
+      v8::ArrayBuffer::New(isolate, std::move(backing));
+  v8::Local<v8::Object> result = v8::Object::New(isolate);
+  const auto set = [&](const char* name, v8::Local<v8::Value> value) {
+    return result
+        ->Set(context, v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
+              value)
+        .FromMaybe(false);
+  };
+  if (!set("status", v8::Integer::NewFromUnsigned(
+                         isolate, sako_fetch_output_status(raw))) ||
+      !set("statusText", status_text) || !set("url", final_url) ||
+      !set("headers", response_headers) ||
+      !set("body", v8::Uint8Array::New(body_buffer, 0, response_body.length))) {
+    return;
+  }
+  info.GetReturnValue().Set(result);
+}
+
+void Sha1(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  constexpr size_t kMaximumHashBytes = 256 * 1024 * 1024;
+  v8::Isolate* isolate = info.GetIsolate();
+  const uint8_t* bytes = nullptr;
+  size_t length = 0;
+  if (info.Length() == 0 || !ReadBytes(info[0], &bytes, &length)) {
+    ThrowTypeError(isolate, "SHA-1 needs a byte array");
+    return;
+  }
+  if (length > kMaximumHashBytes) {
+    isolate->ThrowException(v8::Exception::RangeError(
+        v8::String::NewFromUtf8Literal(isolate, "hash input exceeds byte limit")));
+    return;
+  }
+  BCRYPT_ALG_HANDLE algorithm = nullptr;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  DWORD object_length = 0;
+  DWORD hash_length = 0;
+  DWORD written = 0;
+  NTSTATUS status = BCryptOpenAlgorithmProvider(
+      &algorithm, BCRYPT_SHA1_ALGORITHM, nullptr, 0);
+  if (BCRYPT_SUCCESS(status)) {
+    status = BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
+                               reinterpret_cast<PUCHAR>(&object_length),
+                               sizeof(object_length), &written, 0);
+  }
+  if (BCRYPT_SUCCESS(status)) {
+    status = BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH,
+                               reinterpret_cast<PUCHAR>(&hash_length),
+                               sizeof(hash_length), &written, 0);
+  }
+  std::vector<uint8_t> object(object_length);
+  std::vector<uint8_t> digest(hash_length);
+  if (BCRYPT_SUCCESS(status)) {
+    status = BCryptCreateHash(algorithm, &hash, object.data(), object_length,
+                              nullptr, 0, 0);
+  }
+  size_t offset = 0;
+  while (BCRYPT_SUCCESS(status) && offset < length) {
+    const ULONG chunk = static_cast<ULONG>(
+        std::min<size_t>(length - offset, std::numeric_limits<ULONG>::max()));
+    status = BCryptHashData(hash, const_cast<PUCHAR>(bytes + offset), chunk, 0);
+    offset += chunk;
+  }
+  if (BCRYPT_SUCCESS(status)) {
+    status = BCryptFinishHash(hash, digest.data(), hash_length, 0);
+  }
+  if (hash != nullptr) BCryptDestroyHash(hash);
+  if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
+  if (!BCRYPT_SUCCESS(status)) {
+    isolate->ThrowException(v8::Exception::Error(
+        v8::String::NewFromUtf8Literal(isolate, "Windows SHA-1 failed")));
+    return;
+  }
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(isolate, digest.size());
+  std::memcpy(backing->Data(), digest.data(), digest.size());
+  v8::Local<v8::ArrayBuffer> buffer =
+      v8::ArrayBuffer::New(isolate, std::move(backing));
+  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, digest.size()));
 }
 
 void ConsoleLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
@@ -166,11 +642,29 @@ std::filesystem::path CallbackPath(
   return std::filesystem::path(Utf8ToWide(ToUtf8(info.GetIsolate(), info[0])));
 }
 
+std::filesystem::path ValuePath(v8::Isolate* isolate,
+                                v8::Local<v8::Value> value) {
+  if (!value->IsString()) return {};
+  return std::filesystem::path(Utf8ToWide(ToUtf8(isolate, value)));
+}
+
 void ThrowFileError(v8::Isolate* isolate, const std::string& operation,
                     const std::filesystem::path& path) {
   const std::string message =
       operation + " failed for " + PathToUtf8(path) + ": " +
       std::system_category().message(static_cast<int>(GetLastError()));
+  isolate->ThrowException(v8::Exception::Error(
+      v8::String::NewFromUtf8(isolate, message.data(),
+                              v8::NewStringType::kNormal,
+                              static_cast<int>(message.size()))
+          .ToLocalChecked()));
+}
+
+void ThrowFileError(v8::Isolate* isolate, const std::string& operation,
+                    const std::filesystem::path& path,
+                    const std::error_code& error) {
+  const std::string message = operation + " failed for " + PathToUtf8(path) +
+                              ": " + error.message();
   isolate->ThrowException(v8::Exception::Error(
       v8::String::NewFromUtf8(isolate, message.data(),
                               v8::NewStringType::kNormal,
@@ -236,7 +730,7 @@ void WriteFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
         v8::String::NewFromUtf8Literal(isolate, "file exceeds byte limit")));
     return;
   }
-  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  std::ofstream output(ExtendedPath(path), std::ios::binary | std::ios::trunc);
   if (!output ||
       (length != 0 &&
        !output.write(reinterpret_cast<const char*>(bytes), length))) {
@@ -247,7 +741,268 @@ void WriteFileSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
 void ExistsSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
   const std::filesystem::path path = CallbackPath(info);
   std::error_code error;
-  info.GetReturnValue().Set(!path.empty() && std::filesystem::exists(path, error));
+  info.GetReturnValue().Set(!path.empty() &&
+                            std::filesystem::exists(ExtendedPath(path), error));
+}
+
+void StatSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "statSync needs a string path");
+    return;
+  }
+  const bool follow_links =
+      info.Length() < 2 || info[1]->BooleanValue(isolate);
+  std::error_code error;
+  const std::filesystem::file_status status =
+      follow_links ? std::filesystem::status(ExtendedPath(path), error)
+                   : std::filesystem::symlink_status(ExtendedPath(path), error);
+  if (error || status.type() == std::filesystem::file_type::not_found) {
+    if (!error) error = std::make_error_code(std::errc::no_such_file_or_directory);
+    ThrowFileError(isolate, "stat", path, error);
+    return;
+  }
+  uintmax_t size = 0;
+  if (std::filesystem::is_regular_file(status)) {
+    size = std::filesystem::file_size(ExtendedPath(path), error);
+    if (error) {
+      ThrowFileError(isolate, "stat", path, error);
+      return;
+    }
+  }
+  const auto modified = std::filesystem::last_write_time(ExtendedPath(path), error);
+  if (error) {
+    ThrowFileError(isolate, "stat", path, error);
+    return;
+  }
+  const double modified_milliseconds = static_cast<double>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          modified.time_since_epoch())
+          .count());
+  v8::Local<v8::Object> result = v8::Object::New(isolate);
+  const auto set = [&](const char* name, v8::Local<v8::Value> value) {
+    return result
+        ->Set(context, v8::String::NewFromUtf8(isolate, name).ToLocalChecked(),
+              value)
+        .FromMaybe(false);
+  };
+  if (!set("file", v8::Boolean::New(isolate, std::filesystem::is_regular_file(status))) ||
+      !set("directory", v8::Boolean::New(isolate, std::filesystem::is_directory(status))) ||
+      !set("symbolicLink", v8::Boolean::New(isolate, std::filesystem::is_symlink(status))) ||
+      !set("size", v8::Number::New(isolate, static_cast<double>(size))) ||
+      !set("mtimeMs", v8::Number::New(isolate, modified_milliseconds))) {
+    return;
+  }
+  info.GetReturnValue().Set(result);
+}
+
+void ReadDirectorySync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  constexpr size_t kMaximumDirectoryEntries = 100'000;
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "readdirSync needs a string path");
+    return;
+  }
+  std::error_code error;
+  std::filesystem::directory_iterator entries(ExtendedPath(path), error);
+  if (error) {
+    ThrowFileError(isolate, "read directory", path, error);
+    return;
+  }
+  std::vector<std::string> names;
+  for (const auto& entry : entries) {
+    if (names.size() >= kMaximumDirectoryEntries) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate,
+                                         "directory entry limit exceeded")));
+      return;
+    }
+    names.push_back(PathToUtf8(entry.path().filename()));
+  }
+  std::sort(names.begin(), names.end());
+  v8::Local<v8::Array> output =
+      v8::Array::New(isolate, static_cast<int>(names.size()));
+  for (uint32_t index = 0; index < names.size(); ++index) {
+    const std::string& name = names[index];
+    v8::Local<v8::String> value;
+    if (!v8::String::NewFromUtf8(isolate, name.data(),
+                                 v8::NewStringType::kNormal,
+                                 static_cast<int>(name.size()))
+             .ToLocal(&value) ||
+        !output->Set(context, index, value).FromMaybe(false)) {
+      return;
+    }
+  }
+  info.GetReturnValue().Set(output);
+}
+
+void MakeDirectorySync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "mkdirSync needs a string path");
+    return;
+  }
+  const bool recursive = info.Length() > 1 && info[1]->BooleanValue(isolate);
+  std::error_code error;
+  const bool created =
+      recursive ? std::filesystem::create_directories(ExtendedPath(path), error)
+                : std::filesystem::create_directory(ExtendedPath(path), error);
+  if (!recursive && !created && !error) {
+    error = std::make_error_code(std::errc::file_exists);
+  }
+  if (error) {
+    ThrowFileError(isolate, "create directory", path, error);
+    return;
+  }
+  info.GetReturnValue().Set(created);
+}
+
+void RemovePathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "remove needs a string path");
+    return;
+  }
+  const bool recursive = info.Length() > 1 && info[1]->BooleanValue(isolate);
+  const bool force = info.Length() > 2 && info[2]->BooleanValue(isolate);
+  const bool files_only = info.Length() > 3 && info[3]->BooleanValue(isolate);
+  std::error_code error;
+  if (files_only && IsDirectory(path, error)) {
+    error = std::make_error_code(std::errc::operation_not_permitted);
+  }
+  if (error) {
+    ThrowFileError(isolate, "remove", path, error);
+    return;
+  }
+  const uintmax_t removed =
+      recursive ? std::filesystem::remove_all(ExtendedPath(path), error)
+                : std::filesystem::remove(ExtendedPath(path), error);
+  if (removed == 0 && !force && !error) {
+    error = std::make_error_code(std::errc::no_such_file_or_directory);
+  }
+  if (error && !(force && error == std::errc::no_such_file_or_directory)) {
+    ThrowFileError(isolate, "remove", path, error);
+    return;
+  }
+  info.GetReturnValue().Set(v8::Number::New(isolate, static_cast<double>(removed)));
+}
+
+void RenamePathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path source = CallbackPath(info);
+  const std::filesystem::path destination =
+      info.Length() > 1 ? ValuePath(isolate, info[1]) : std::filesystem::path();
+  if (source.empty() || destination.empty()) {
+    ThrowTypeError(isolate, "renameSync needs source and destination paths");
+    return;
+  }
+  std::error_code error;
+  std::filesystem::rename(ExtendedPath(source), ExtendedPath(destination), error);
+  if (error) ThrowFileError(isolate, "rename", source, error);
+}
+
+void LinkPathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path source = CallbackPath(info);
+  const std::filesystem::path destination =
+      info.Length() > 1 ? ValuePath(isolate, info[1]) : std::filesystem::path();
+  if (source.empty() || destination.empty()) {
+    ThrowTypeError(isolate, "linkSync needs source and destination paths");
+    return;
+  }
+  std::error_code error;
+  std::filesystem::create_hard_link(ExtendedPath(source),
+                                    ExtendedPath(destination), error);
+  if (error) ThrowFileError(isolate, "create hard link", destination, error);
+}
+
+void SymlinkPathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path target = CallbackPath(info);
+  const std::filesystem::path link =
+      info.Length() > 1 ? ValuePath(isolate, info[1]) : std::filesystem::path();
+  if (target.empty() || link.empty()) {
+    ThrowTypeError(isolate, "symlinkSync needs target and link paths");
+    return;
+  }
+  const bool directory = info.Length() > 2 && info[2]->BooleanValue(isolate);
+  std::error_code error;
+  if (directory) {
+    std::filesystem::create_directory_symlink(
+        target.is_absolute() ? ExtendedPath(target) : target, ExtendedPath(link),
+        error);
+  } else {
+    std::filesystem::create_symlink(
+        target.is_absolute() ? ExtendedPath(target) : target, ExtendedPath(link),
+        error);
+  }
+  if (error) ThrowFileError(isolate, "create symbolic link", link, error);
+}
+
+void ReadLinkSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "readlinkSync needs a string path");
+    return;
+  }
+  std::error_code error;
+  const std::filesystem::path target =
+      UserPath(std::filesystem::read_symlink(ExtendedPath(path), error));
+  if (error) {
+    ThrowFileError(isolate, "read symbolic link", path, error);
+    return;
+  }
+  const std::string value = PathToUtf8(target);
+  info.GetReturnValue().Set(
+      v8::String::NewFromUtf8(isolate, value.data(), v8::NewStringType::kNormal,
+                              static_cast<int>(value.size()))
+          .ToLocalChecked());
+}
+
+void RealPathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const std::filesystem::path path = CallbackPath(info);
+  if (path.empty()) {
+    ThrowTypeError(isolate, "realpathSync needs a string path");
+    return;
+  }
+  std::error_code error;
+  const std::filesystem::path canonical =
+      UserPath(std::filesystem::canonical(ExtendedPath(path), error));
+  if (error) {
+    ThrowFileError(isolate, "realpath", path, error);
+    return;
+  }
+  const std::string value = PathToUtf8(canonical);
+  info.GetReturnValue().Set(
+      v8::String::NewFromUtf8(isolate, value.data(), v8::NewStringType::kNormal,
+                              static_cast<int>(value.size()))
+          .ToLocalChecked());
+}
+
+void ProcessCwd(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  const DWORD required = GetCurrentDirectoryW(0, nullptr);
+  std::wstring path(required, L'\0');
+  const DWORD written =
+      required == 0 ? 0 : GetCurrentDirectoryW(required, path.data());
+  if (written == 0) {
+    ThrowFileError(info.GetIsolate(), "read current directory", {});
+    return;
+  }
+  path.resize(written);
+  const std::string utf8 = WideToUtf8(path);
+  info.GetReturnValue().Set(
+      v8::String::NewFromUtf8(info.GetIsolate(), utf8.data(),
+                              v8::NewStringType::kNormal,
+                              static_cast<int>(utf8.size()))
+          .ToLocalChecked());
 }
 
 std::string FormatException(v8::Isolate* isolate,
@@ -281,6 +1036,68 @@ std::string FormatException(v8::Isolate* isolate,
   return output.empty() ? "JavaScript execution failed" : output;
 }
 
+std::string FormatRejection(v8::Isolate* isolate,
+                            v8::Local<v8::Context> context,
+                            v8::Local<v8::Value> reason) {
+  if (reason->IsObject()) {
+    v8::Local<v8::Value> stack;
+    if (reason.As<v8::Object>()
+            ->Get(context,
+                  v8::String::NewFromUtf8Literal(isolate, "stack"))
+            .ToLocal(&stack) &&
+        stack->IsString()) {
+      return ToUtf8(isolate, stack);
+    }
+  }
+  return ToUtf8(isolate, reason);
+}
+
+class Engine {
+ public:
+  bool Initialize(const char* executable_path, const char* icu_data_path,
+                  std::string* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (initialized_) return true;
+    if (!v8::V8::InitializeICUDefaultLocation(executable_path, icu_data_path)) {
+      *error = std::string("failed to initialize ICU from ") + icu_data_path;
+      return false;
+    }
+    platform_ = v8::platform::NewDefaultPlatform();
+    if (!platform_) {
+      *error = "failed to create the V8 platform";
+      return false;
+    }
+    v8::V8::InitializePlatform(platform_.get());
+    if (!v8::V8::Initialize()) {
+      *error = "failed to initialize V8";
+      v8::V8::DisposePlatform();
+      platform_.reset();
+      return false;
+    }
+    initialized_ = true;
+    return true;
+  }
+
+  ~Engine() {
+    if (initialized_) {
+      v8::V8::Dispose();
+      v8::V8::DisposePlatform();
+    }
+  }
+
+  v8::Platform* platform() const { return platform_.get(); }
+
+ private:
+  std::mutex mutex_;
+  std::unique_ptr<v8::Platform> platform_;
+  bool initialized_ = false;
+};
+
+Engine& GetEngine() {
+  static Engine engine;
+  return engine;
+}
+
 class Runtime {
  public:
   static std::unique_ptr<Runtime> Create(const char* executable_path,
@@ -288,24 +1105,9 @@ class Runtime {
                                          std::string* error) {
     auto runtime = std::unique_ptr<Runtime>(new Runtime());
 
-    if (!v8::V8::InitializeICUDefaultLocation(executable_path, icu_data_path)) {
-      *error = std::string("failed to initialize ICU from ") + icu_data_path;
-      return nullptr;
-    }
-
-    runtime->platform_ = v8::platform::NewDefaultPlatform();
-    if (!runtime->platform_) {
-      *error = "failed to create the V8 platform";
-      return nullptr;
-    }
-
-    v8::V8::InitializePlatform(runtime->platform_.get());
-    if (!v8::V8::Initialize()) {
-      *error = "failed to initialize V8";
-      v8::V8::DisposePlatform();
-      return nullptr;
-    }
-    runtime->v8_initialized_ = true;
+    Engine& engine = GetEngine();
+    if (!engine.Initialize(executable_path, icu_data_path, error)) return nullptr;
+    runtime->platform_ = engine.platform();
 
     runtime->allocator_.reset(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
     if (!runtime->allocator_) {
@@ -322,11 +1124,18 @@ class Runtime {
     }
     runtime->isolate_->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
     runtime->isolate_->SetData(0, runtime.get());
+    runtime->isolate_->SetHostImportModuleDynamicallyCallback(
+        ImportModuleDynamically);
     if (!runtime->InitializeContext(error)) return nullptr;
     return runtime;
   }
 
   ~Runtime() {
+    for (auto& [descriptor, file] : file_descriptors_) {
+      (void)descriptor;
+      if (file.handle != INVALID_HANDLE_VALUE) CloseHandle(file.handle);
+    }
+    file_descriptors_.clear();
     if (isolate_ != nullptr) {
       {
         v8::Isolate::Scope isolate_scope(isolate_);
@@ -350,19 +1159,21 @@ class Runtime {
           module.exports.Reset();
         }
         synthetic_commonjs_.clear();
+        for (auto& [id, binding] : http_servers_) {
+          (void)id;
+          binding->handler.Reset();
+          sako_http_server_delete(binding->server);
+          binding->server = nullptr;
+        }
+        http_servers_.clear();
         context_.Reset();
         isolate_->SetData(0, nullptr);
       }
-      v8::platform::NotifyIsolateShutdown(platform_.get(), isolate_);
+      v8::platform::NotifyIsolateShutdown(platform_, isolate_);
       isolate_->Dispose();
       isolate_ = nullptr;
     }
     allocator_.reset();
-    if (v8_initialized_) {
-      v8::V8::Dispose();
-      v8::V8::DisposePlatform();
-    }
-    platform_.reset();
   }
 
   bool Execute(const uint8_t* source_bytes, size_t source_length,
@@ -443,7 +1254,7 @@ class Runtime {
     }
     std::error_code path_error;
     const std::filesystem::path entry =
-        std::filesystem::weakly_canonical(wide_path, path_error);
+        CanonicalPath(wide_path, path_error);
     if (path_error) {
       *error = "cannot resolve module path: " + path_text;
       return false;
@@ -470,7 +1281,7 @@ class Runtime {
     if (evaluation->IsPromise()) {
       v8::Local<v8::Promise> promise = evaluation.As<v8::Promise>();
       if (promise->State() == v8::Promise::PromiseState::kRejected) {
-        *error = ToUtf8(isolate_, promise->Result());
+        *error = FormatRejection(isolate_, context, promise->Result());
         return false;
       }
     }
@@ -497,7 +1308,7 @@ class Runtime {
     const std::wstring wide_path = Utf8ToWide(path_text);
     std::error_code path_error;
     const std::filesystem::path entry =
-        std::filesystem::weakly_canonical(wide_path, path_error);
+        CanonicalPath(wide_path, path_error);
     if (wide_path.empty() || path_error) {
       *error = "cannot resolve CommonJS entry: " + path_text;
       return false;
@@ -514,28 +1325,69 @@ class Runtime {
 
   void MemoryStats(uint64_t* heap_used, uint64_t* heap_committed,
                    uint64_t* heap_limit, uint64_t* persistent_handles,
-                   uint64_t* timers) const {
+                   uint64_t* timers, uint64_t* external_memory,
+                   uint64_t* http_servers, uint64_t* sockets,
+                   uint64_t* http_buffer_bytes, uint64_t* native_memory_bytes,
+                   uint64_t* module_cache_entries,
+                   uint64_t* queued_operations) const {
     v8::Isolate::Scope isolate_scope(isolate_);
     v8::HeapStatistics statistics;
     isolate_->GetHeapStatistics(&statistics);
     *heap_used = statistics.used_heap_size();
     *heap_committed = statistics.total_heap_size();
     *heap_limit = statistics.heap_size_limit();
+    *external_memory = statistics.external_memory();
     uint64_t handles =
         (context_.IsEmpty() ? 0 : 1) + modules_.size() +
-        commonjs_modules_.size() + synthetic_commonjs_.size();
+        commonjs_modules_.size() + synthetic_commonjs_.size() +
+        http_servers_.size();
     for (const auto& [id, timer] : timers_) {
       (void)id;
       handles += 1 + timer.arguments.size();
     }
     *persistent_handles = handles;
     *timers = timers_.size();
+    *http_servers = http_servers_.size();
+    *sockets = 0;
+    *http_buffer_bytes = 0;
+    *module_cache_entries =
+        modules_.size() + commonjs_modules_.size() + synthetic_commonjs_.size();
+    *queued_operations = closing_http_servers_.size();
+    *native_memory_bytes = module_source_bytes_ +
+                           timers_.size() * sizeof(Timer) +
+                           http_servers_.size() * sizeof(HttpBinding);
+    for (const auto& [id, binding] : http_servers_) {
+      (void)id;
+      uint64_t connections = 0;
+      uint64_t rejected = 0;
+      if (sako_http_server_stats(binding->server, &connections, &rejected) == 0) {
+        *sockets += connections;
+      }
+      *http_buffer_bytes += binding->response_reason.capacity() +
+                            binding->response_body.capacity();
+      for (const auto& name : binding->response_header_names) {
+        *http_buffer_bytes += name.capacity();
+      }
+      for (const auto& value : binding->response_header_values) {
+        *http_buffer_bytes += value.capacity();
+      }
+      *http_buffer_bytes += binding->response_headers.capacity() *
+                            sizeof(SakoNativeHeader);
+    }
+    *native_memory_bytes += *http_buffer_bytes;
   }
 
  private:
   static constexpr size_t kMaximumTimers = 65'536;
   static constexpr size_t kMaximumModules = 4'096;
   static constexpr size_t kMaximumModuleBytes = 64 * 1024 * 1024;
+  static constexpr size_t kMaximumHttpServers = 64;
+  static constexpr size_t kMaximumFileDescriptors = 1'024;
+
+  struct FileDescriptor {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool append = false;
+  };
 
   struct Timer {
     uint64_t id = 0;
@@ -554,6 +1406,19 @@ class Runtime {
   struct SyntheticCommonJs {
     v8::Global<v8::Value> exports;
     std::vector<std::string> names;
+  };
+
+  struct HttpBinding {
+    Runtime* runtime = nullptr;
+    void* server = nullptr;
+    v8::Global<v8::Function> handler;
+    std::string response_reason;
+    std::string response_body;
+    std::vector<std::string> response_header_names;
+    std::vector<std::string> response_header_values;
+    std::vector<SakoNativeHeader> response_headers;
+    bool closing = false;
+    bool secure = false;
   };
 
   Runtime() = default;
@@ -589,7 +1454,43 @@ class Runtime {
         !InstallFunction(context, "__sakoWriteFileSync", WriteFileSync,
                          v8::Undefined(isolate_)) ||
         !InstallFunction(context, "__sakoExistsSync", ExistsSync,
-                         v8::Undefined(isolate_))) {
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoStatSync", StatSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoReadDirectorySync", ReadDirectorySync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoMakeDirectorySync", MakeDirectorySync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoRemovePathSync", RemovePathSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoRenamePathSync", RenamePathSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoLinkPathSync", LinkPathSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoSymlinkPathSync", SymlinkPathSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoReadLinkSync", ReadLinkSync,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoRealPathSync", RealPathSync,
+                          v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoOpenSync", OpenSync, data) ||
+        !InstallFunction(context, "__sakoCloseSync", CloseSync, data) ||
+        !InstallFunction(context, "__sakoReadSync", ReadSync, data) ||
+        !InstallFunction(context, "__sakoWriteSync", WriteSync, data) ||
+        !InstallFunction(context, "__sakoIsTty", IsTty,
+                          v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoResolveHost", ResolveHost,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoSpawnSync", SpawnSync,
+                          v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoFetchSync", FetchSync,
+                          v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoSha1", Sha1,
+                         v8::Undefined(isolate_)) ||
+        !InstallFunction(context, "__sakoHttpListen", HttpListen, data) ||
+        !InstallFunction(context, "__sakoHttpsListen", HttpsListen, data) ||
+        !InstallFunction(context, "__sakoHttpClose", HttpClose, data) ||
+        !InstallFunction(context, "__sakoHttpAddress", HttpAddress, data)) {
       *error = "failed to install runtime scheduling globals";
       return false;
     }
@@ -618,7 +1519,8 @@ class Runtime {
   bool RunBootstrap(v8::Local<v8::Context> context, std::string* error) {
     v8::TryCatch try_catch(isolate_);
     v8::Local<v8::String> source;
-    if (!v8::String::NewFromUtf8(isolate_, kSakoBootstrap,
+    if (!v8::String::NewFromUtf8(isolate_,
+                                 reinterpret_cast<const char*>(kSakoBootstrap),
                                  v8::NewStringType::kNormal,
                                  static_cast<int>(sizeof(kSakoBootstrap) - 1))
              .ToLocal(&source)) {
@@ -703,29 +1605,33 @@ class Runtime {
 
     const std::string request = ToUtf8(isolate, specifier);
     const std::string referrer_name = ToUtf8(isolate, referrer->GetResourceName());
+    v8::Local<v8::Module> builtin;
+    std::string builtin_error;
+    if (runtime->CompileSyntheticBuiltin(context, request, &builtin,
+                                         &builtin_error)) {
+      return builtin;
+    }
     if (request.starts_with("node:")) {
-      v8::Local<v8::Module> builtin;
-      std::string builtin_error;
-      if (runtime->CompileSyntheticBuiltin(context, request, &builtin,
-                                           &builtin_error)) {
-        return builtin;
+      if (!isolate->HasPendingException()) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8(isolate, builtin_error.data(),
+                                    v8::NewStringType::kNormal,
+                                    static_cast<int>(builtin_error.size()))
+                .ToLocalChecked()));
       }
-      isolate->ThrowException(v8::Exception::Error(
-          v8::String::NewFromUtf8(isolate, builtin_error.data(),
-                                  v8::NewStringType::kNormal,
-                                  static_cast<int>(builtin_error.size()))
-              .ToLocalChecked()));
       return {};
     }
     std::filesystem::path resolved;
     std::string message;
     if (!runtime->ResolvePath(context, request, referrer_name, &resolved,
                               &message)) {
-      isolate->ThrowException(v8::Exception::Error(
-          v8::String::NewFromUtf8(isolate, message.data(),
-                                  v8::NewStringType::kNormal,
-                                  static_cast<int>(message.size()))
-              .ToLocalChecked()));
+      if (!isolate->HasPendingException()) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8(isolate, message.data(),
+                                    v8::NewStringType::kNormal,
+                                    static_cast<int>(message.size()))
+                .ToLocalChecked()));
+      }
       return {};
     }
 
@@ -736,14 +1642,113 @@ class Runtime {
                               : runtime->CompileModule(context, resolved,
                                                        &module, &message);
     if (!compiled) {
-      isolate->ThrowException(v8::Exception::Error(
-          v8::String::NewFromUtf8(isolate, message.data(),
-                                  v8::NewStringType::kNormal,
-                                  static_cast<int>(message.size()))
-              .ToLocalChecked()));
+      if (!isolate->HasPendingException()) {
+        isolate->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8(isolate, message.data(),
+                                    v8::NewStringType::kNormal,
+                                    static_cast<int>(message.size()))
+                .ToLocalChecked()));
+      }
       return {};
     }
     return module;
+  }
+
+  static v8::MaybeLocal<v8::Promise> ImportModuleDynamically(
+      v8::Local<v8::Context> context,
+      v8::Local<v8::Data> host_defined_options,
+      v8::Local<v8::Value> resource_name,
+      v8::Local<v8::String> specifier,
+      v8::Local<v8::FixedArray> import_attributes) {
+    (void)host_defined_options;
+    (void)import_attributes;
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    Runtime* runtime = static_cast<Runtime*>(isolate->GetData(0));
+    if (runtime == nullptr) return {};
+
+    v8::Local<v8::Promise::Resolver> resolver;
+    if (!v8::Promise::Resolver::New(context).ToLocal(&resolver)) return {};
+    v8::TryCatch try_catch(isolate);
+    const std::string request = ToUtf8(isolate, specifier);
+    const std::string referrer = ToUtf8(isolate, resource_name);
+    std::string error;
+    v8::Local<v8::Module> module;
+    bool loaded = false;
+    loaded = runtime->CompileSyntheticBuiltin(context, request, &module, &error);
+    if (!loaded && !request.starts_with("node:")) {
+      std::filesystem::path resolved;
+      if (runtime->ResolvePath(context, request, referrer, &resolved, &error)) {
+        loaded = runtime->IsCommonJsPath(context, resolved)
+                     ? runtime->CompileSyntheticCommonJs(context, resolved,
+                                                         &module, &error)
+                     : runtime->CompileModule(context, resolved, &module,
+                                              &error);
+      }
+    }
+    if (!loaded) {
+      return RejectDynamicImport(context, resolver, try_catch, error);
+    }
+    if (module->GetStatus() == v8::Module::kUninstantiated &&
+        !module->InstantiateModule(context, ResolveModule).FromMaybe(false)) {
+      return RejectDynamicImport(context, resolver, try_catch,
+                                 "failed to instantiate dynamic import");
+    }
+    if (module->GetStatus() == v8::Module::kErrored) {
+      return RejectDynamicImport(context, resolver, try_catch,
+                                 "dynamic import module is errored",
+                                 module->GetException());
+    }
+    if (module->GetStatus() == v8::Module::kEvaluated) {
+      if (!resolver->Resolve(context, module->GetModuleNamespace())
+               .FromMaybe(false)) {
+        return {};
+      }
+      return resolver->GetPromise();
+    }
+    if (module->GetStatus() != v8::Module::kInstantiated) {
+      return RejectDynamicImport(context, resolver, try_catch,
+                                 "dynamic import module is already evaluating");
+    }
+
+    v8::Local<v8::Value> evaluation;
+    if (!module->Evaluate(context).ToLocal(&evaluation) ||
+        !evaluation->IsPromise()) {
+      return RejectDynamicImport(context, resolver, try_catch,
+                                 "failed to evaluate dynamic import");
+    }
+    v8::Local<v8::Function> namespace_callback;
+    if (!v8::Function::New(context, ReturnCallbackData,
+                           module->GetModuleNamespace())
+             .ToLocal(&namespace_callback)) {
+      return {};
+    }
+    return evaluation.As<v8::Promise>()->Then(context, namespace_callback);
+  }
+
+  static v8::MaybeLocal<v8::Promise> RejectDynamicImport(
+      v8::Local<v8::Context> context,
+      v8::Local<v8::Promise::Resolver> resolver, v8::TryCatch& try_catch,
+      const std::string& message,
+      v8::Local<v8::Value> explicit_reason = v8::Local<v8::Value>()) {
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Local<v8::Value> reason = explicit_reason;
+    if (reason.IsEmpty() && try_catch.HasCaught()) reason = try_catch.Exception();
+    if (reason.IsEmpty()) {
+      const std::string fallback =
+          message.empty() ? "dynamic import failed" : message;
+      reason = v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, fallback.data(),
+                                  v8::NewStringType::kNormal,
+                                  static_cast<int>(fallback.size()))
+              .ToLocalChecked());
+    }
+    if (!resolver->Reject(context, reason).FromMaybe(false)) return {};
+    return resolver->GetPromise();
+  }
+
+  static void ReturnCallbackData(
+      const v8::FunctionCallbackInfo<v8::Value>& info) {
+    info.GetReturnValue().Set(info.Data());
   }
 
   bool IsCommonJsPath(v8::Local<v8::Context> context,
@@ -944,10 +1949,6 @@ class Runtime {
       *error = "unsupported built-in module: " + request;
       return false;
     }
-    if (request.starts_with('#')) {
-      return ResolvePackageImport(context, request, referrer, "require",
-                                  output, error);
-    }
     const std::wstring request_wide = Utf8ToWide(request);
     const std::wstring referrer_wide = Utf8ToWide(referrer);
     if (request_wide.empty() || referrer_wide.empty()) {
@@ -978,9 +1979,9 @@ class Runtime {
     }
     for (const auto& path : candidates) {
       std::error_code status_error;
-      if (std::filesystem::is_regular_file(path, status_error)) {
+      if (IsRegularFile(path, status_error)) {
         std::error_code canonical_error;
-        *output = std::filesystem::weakly_canonical(path, canonical_error);
+        *output = CanonicalPath(path, canonical_error);
         if (!canonical_error) return true;
       }
     }
@@ -1112,9 +2113,9 @@ class Runtime {
     std::error_code root_error;
     std::error_code target_error;
     const std::filesystem::path canonical_root =
-        std::filesystem::weakly_canonical(package_root, root_error);
+        CanonicalPath(package_root, root_error);
     const std::filesystem::path canonical_target =
-        std::filesystem::weakly_canonical(candidate, target_error);
+        CanonicalPath(candidate, target_error);
     if (root_error || target_error ||
         !canonical_target.native().starts_with(canonical_root.native())) {
       return false;
@@ -1185,7 +2186,7 @@ class Runtime {
       const std::filesystem::path package_root =
           directory / L"node_modules" / Utf8ToWide(package_name);
       std::error_code directory_error;
-      if (std::filesystem::is_directory(package_root, directory_error)) {
+      if (IsDirectory(package_root, directory_error)) {
         v8::Local<v8::Object> manifest;
         if (ReadJsonObject(context, package_root / L"package.json", &manifest)) {
           v8::Local<v8::Value> exports;
@@ -1408,8 +2409,7 @@ class Runtime {
     const std::string request = ToUtf8(isolate, info[0]);
     const std::string referrer = ToUtf8(isolate, referrer_value);
     v8::Local<v8::Value> builtin;
-    if (request.starts_with("node:") &&
-        runtime->LoadBuiltin(context, request, &builtin)) {
+    if (runtime->LoadBuiltin(context, request, &builtin)) {
       info.GetReturnValue().Set(builtin);
       return;
     }
@@ -1464,12 +2464,10 @@ class Runtime {
         runtime_value.As<v8::External>()->Value(
             v8::kExternalPointerTypeTagDefault));
     const std::string request = ToUtf8(isolate, info[0]);
-    if (request.starts_with("node:")) {
-      v8::Local<v8::Value> builtin;
-      if (runtime->LoadBuiltin(context, request, &builtin)) {
-        info.GetReturnValue().Set(info[0]);
-        return;
-      }
+    v8::Local<v8::Value> builtin;
+    if (runtime->LoadBuiltin(context, request, &builtin)) {
+      info.GetReturnValue().Set(info[0]);
+      return;
     }
     std::filesystem::path resolved;
     std::string error;
@@ -1516,6 +2514,8 @@ class Runtime {
   bool LoadBuiltin(v8::Local<v8::Context> context,
                    const std::string& request,
                    v8::Local<v8::Value>* output) {
+    const std::string canonical_request =
+        request.starts_with("node:") ? request : "node:" + request;
     v8::Local<v8::Value> builtins;
     if (context->Global()
             ->Get(context,
@@ -1523,13 +2523,14 @@ class Runtime {
             .ToLocal(&builtins) &&
         builtins->IsObject()) {
       v8::Local<v8::Value> builtin;
-      if (GetProperty(context, builtins.As<v8::Object>(), request, &builtin) &&
+      if (GetProperty(context, builtins.As<v8::Object>(), canonical_request,
+                      &builtin) &&
           !builtin->IsUndefined()) {
         *output = builtin;
         return true;
       }
     }
-    if (request == "node:assert") {
+    if (canonical_request == "node:assert") {
       v8::Local<v8::Function> assert;
       v8::Local<v8::Function> strict_equal;
       if (!v8::Function::New(context, Assert).ToLocal(&assert) ||
@@ -1544,8 +2545,8 @@ class Runtime {
     }
 
     const char* global_name = nullptr;
-    if (request == "node:console") global_name = "console";
-    if (request == "node:process") global_name = "process";
+    if (canonical_request == "node:console") global_name = "console";
+    if (canonical_request == "node:process") global_name = "process";
     if (global_name != nullptr) {
       return context->Global()
           ->Get(context,
@@ -1555,7 +2556,7 @@ class Runtime {
           .ToLocal(output);
     }
 
-    if (request == "node:timers") {
+    if (canonical_request == "node:timers") {
       v8::Local<v8::Object> timers = v8::Object::New(isolate_);
       constexpr const char* names[] = {"setTimeout", "setInterval",
                                        "clearTimeout", "clearInterval"};
@@ -1584,6 +2585,10 @@ class Runtime {
     if (request.starts_with("node:")) {
       *error = "unsupported built-in module: " + request;
       return false;
+    }
+    if (request.starts_with('#')) {
+      return ResolvePackageImport(context, request, referrer, "require",
+                                  output, error);
     }
     const std::wstring request_wide = Utf8ToWide(request);
     const std::filesystem::path referrer_path(Utf8ToWide(referrer));
@@ -1619,15 +2624,15 @@ class Runtime {
     };
     for (const auto& file : files) {
       std::error_code status_error;
-      if (std::filesystem::is_regular_file(file, status_error)) {
+      if (IsRegularFile(file, status_error)) {
         std::error_code canonical_error;
-        *output = std::filesystem::weakly_canonical(file, canonical_error);
+        *output = CanonicalPath(file, canonical_error);
         if (!canonical_error) return true;
       }
     }
 
     std::error_code directory_error;
-    if (!std::filesystem::is_directory(candidate, directory_error)) return false;
+    if (!IsDirectory(candidate, directory_error)) return false;
     const std::filesystem::path manifest_path = candidate / L"package.json";
     std::string manifest_source;
     if (ReadFile(manifest_path, &manifest_source)) {
@@ -1652,9 +2657,9 @@ class Runtime {
           };
           for (const auto& file : main_files) {
             std::error_code status_error;
-            if (std::filesystem::is_regular_file(file, status_error)) {
+            if (IsRegularFile(file, status_error)) {
               std::error_code canonical_error;
-              *output = std::filesystem::weakly_canonical(file, canonical_error);
+              *output = CanonicalPath(file, canonical_error);
               if (!canonical_error) return true;
             }
           }
@@ -1691,7 +2696,73 @@ class Runtime {
 
     v8::Local<v8::Object> process = v8::Object::New(isolate_);
     v8::Local<v8::Object> versions = v8::Object::New(isolate_);
+    v8::Local<v8::Object> environment = v8::Object::New(isolate_);
+    v8::Local<v8::Object> stdout_stream = v8::Object::New(isolate_);
+    v8::Local<v8::Object> stderr_stream = v8::Object::New(isolate_);
+    v8::Local<v8::Function> stdout_write;
+    v8::Local<v8::Function> stderr_write;
+    if (!v8::Function::New(
+             context, WriteStream,
+             v8::Integer::New(isolate_, static_cast<int32_t>(STD_OUTPUT_HANDLE)))
+             .ToLocal(&stdout_write) ||
+        !v8::Function::New(
+             context, WriteStream,
+             v8::Integer::New(isolate_, static_cast<int32_t>(STD_ERROR_HANDLE)))
+             .ToLocal(&stderr_write) ||
+        !Set(context, stdout_stream, "fd", v8::Integer::New(isolate_, 1)) ||
+        !Set(context, stdout_stream, "write", stdout_write) ||
+        !Set(context, stderr_stream, "fd", v8::Integer::New(isolate_, 2)) ||
+        !Set(context, stderr_stream, "write", stderr_write)) {
+      return false;
+    }
+    LPWCH environment_block = GetEnvironmentStringsW();
+    if (environment_block == nullptr) return false;
+    bool environment_ok = true;
+    for (const wchar_t* entry = environment_block; *entry != L'\0';) {
+      const std::wstring item(entry);
+      entry += item.size() + 1;
+      if (item.starts_with(L'=')) continue;
+      const size_t equals = item.find(L'=');
+      if (equals == std::wstring::npos) continue;
+      const std::string name = WideToUtf8(item.substr(0, equals));
+      const std::string value = WideToUtf8(item.substr(equals + 1));
+      v8::Local<v8::String> text;
+      if (name.empty() ||
+          !v8::String::NewFromUtf8(isolate_, value.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(value.size()))
+               .ToLocal(&text) ||
+          !Set(context, environment, name, text)) {
+        environment_ok = false;
+        break;
+      }
+    }
+    FreeEnvironmentStringsW(environment_block);
+    if (!environment_ok) return false;
+
+    v8::Local<v8::Function> cwd;
+    v8::Local<v8::Value> next_tick;
+    if (!v8::Function::New(context, ProcessCwd).ToLocal(&cwd) ||
+        !context->Global()
+             ->Get(context,
+                   v8::String::NewFromUtf8Literal(isolate_, "queueMicrotask"))
+             .ToLocal(&next_tick)) {
+      return false;
+    }
+    v8::Local<v8::Value> executable =
+        argument_count == 0
+            ? v8::String::Empty(isolate_).As<v8::Value>()
+            : arguments->Get(context, 0).ToLocalChecked();
     return Set(context, process, "argv", arguments) &&
+           Set(context, process, "env", environment) &&
+           Set(context, process, "execPath", executable) &&
+           Set(context, process, "cwd", cwd) &&
+           Set(context, process, "nextTick", next_tick) &&
+           Set(context, process, "stdout", stdout_stream) &&
+           Set(context, process, "stderr", stderr_stream) &&
+           Set(context, process, "exitCode", v8::Integer::New(isolate_, 0)) &&
+           Set(context, process, "version",
+               v8::String::NewFromUtf8Literal(isolate_, "v0.1.0")) &&
            Set(context, process, "platform",
                v8::String::NewFromUtf8Literal(isolate_, "win32")) &&
            Set(context, process, "arch",
@@ -1718,6 +2789,16 @@ class Runtime {
            const char* name, v8::Local<v8::Value> value) {
     v8::Local<v8::String> key;
     return v8::String::NewFromUtf8(isolate_, name).ToLocal(&key) &&
+           object->Set(context, key, value).FromMaybe(false);
+  }
+
+  bool Set(v8::Local<v8::Context> context, v8::Local<v8::Object> object,
+           const std::string& name, v8::Local<v8::Value> value) {
+    v8::Local<v8::String> key;
+    return v8::String::NewFromUtf8(isolate_, name.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(name.size()))
+               .ToLocal(&key) &&
            object->Set(context, key, value).FromMaybe(false);
   }
 
@@ -1761,6 +2842,536 @@ class Runtime {
     isolate->EnqueueMicrotask(info[0].As<v8::Function>());
   }
 
+  static FileDescriptor* FindFileDescriptor(
+      Runtime* runtime, const v8::FunctionCallbackInfo<v8::Value>& info,
+      int argument = 0) {
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    if (runtime == nullptr || info.Length() <= argument ||
+        !info[argument]->IsInt32()) {
+      ThrowTypeError(isolate, "file descriptor must be an integer");
+      return nullptr;
+    }
+    const int descriptor = info[argument]->Int32Value(context).FromMaybe(-1);
+    auto found = runtime->file_descriptors_.find(descriptor);
+    if (found == runtime->file_descriptors_.end()) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(isolate, "file descriptor is not open")));
+      return nullptr;
+    }
+    return &found->second;
+  }
+
+  static void OpenSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    if (runtime == nullptr || info.Length() < 2 || !info[0]->IsString() ||
+        !info[1]->IsString()) {
+      ThrowTypeError(isolate, "openSync needs a path and string flags");
+      return;
+    }
+    if (runtime->file_descriptors_.size() >= kMaximumFileDescriptors) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate, "file descriptor capacity exceeded")));
+      return;
+    }
+    const std::filesystem::path path = CallbackPath(info);
+    const std::string flags = ToUtf8(isolate, info[1]);
+    DWORD access = 0;
+    DWORD creation = OPEN_EXISTING;
+    bool append = false;
+    if (flags == "r") {
+      access = GENERIC_READ;
+    } else if (flags == "r+") {
+      access = GENERIC_READ | GENERIC_WRITE;
+    } else if (flags == "w" || flags == "wx") {
+      access = GENERIC_WRITE;
+      creation = flags == "wx" ? CREATE_NEW : CREATE_ALWAYS;
+    } else if (flags == "w+" || flags == "wx+") {
+      access = GENERIC_READ | GENERIC_WRITE;
+      creation = flags == "wx+" ? CREATE_NEW : CREATE_ALWAYS;
+    } else if (flags == "a" || flags == "ax") {
+      access = GENERIC_WRITE;
+      creation = flags == "ax" ? CREATE_NEW : OPEN_ALWAYS;
+      append = true;
+    } else if (flags == "a+" || flags == "ax+") {
+      access = GENERIC_READ | GENERIC_WRITE;
+      creation = flags == "ax+" ? CREATE_NEW : OPEN_ALWAYS;
+      append = true;
+    } else {
+      ThrowTypeError(isolate, "unsupported file open flags");
+      return;
+    }
+    HANDLE handle = CreateFileW(
+        ExtendedPath(path).native().c_str(), access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, creation,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+      ThrowFileError(isolate, "open", path);
+      return;
+    }
+    int descriptor = runtime->next_file_descriptor_++;
+    if (descriptor < 100) {
+      descriptor = 100;
+      runtime->next_file_descriptor_ = 101;
+    }
+    runtime->file_descriptors_.emplace(
+        descriptor, FileDescriptor{.handle = handle, .append = append});
+    info.GetReturnValue().Set(v8::Integer::New(isolate, descriptor));
+  }
+
+  static void CloseSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    FileDescriptor* file = FindFileDescriptor(runtime, info);
+    if (file == nullptr) return;
+    v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+    const int descriptor = info[0]->Int32Value(context).FromMaybe(-1);
+    const HANDLE handle = file->handle;
+    runtime->file_descriptors_.erase(descriptor);
+    if (!CloseHandle(handle)) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "close failed")));
+    }
+  }
+
+  static bool DescriptorTransferArguments(
+      const v8::FunctionCallbackInfo<v8::Value>& info, uint8_t** bytes,
+      DWORD* length, bool* positioned, LARGE_INTEGER* position) {
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    const uint8_t* data = nullptr;
+    size_t byte_length = 0;
+    if (info.Length() < 4 || !ReadBytes(info[1], &data, &byte_length)) {
+      ThrowTypeError(isolate, "descriptor I/O needs a byte array");
+      return false;
+    }
+    const int64_t offset = info[2]->IntegerValue(context).FromMaybe(-1);
+    const int64_t requested = info[3]->IntegerValue(context).FromMaybe(-1);
+    if (offset < 0 || requested < 0 || requested > MAXDWORD ||
+        static_cast<uint64_t>(offset) > byte_length ||
+        static_cast<uint64_t>(requested) > byte_length - offset) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate, "descriptor I/O range is invalid")));
+      return false;
+    }
+    *bytes = const_cast<uint8_t*>(data) + offset;
+    *length = static_cast<DWORD>(requested);
+    *positioned = info.Length() > 4 && !info[4]->IsNullOrUndefined();
+    position->QuadPart = 0;
+    if (*positioned) {
+      const int64_t value = info[4]->IntegerValue(context).FromMaybe(-1);
+      if (value < 0) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(isolate, "file position is invalid")));
+        return false;
+      }
+      position->QuadPart = value;
+    }
+    return true;
+  }
+
+  static void ReadSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    FileDescriptor* file = FindFileDescriptor(FromCallback(info), info);
+    if (file == nullptr) return;
+    uint8_t* bytes = nullptr;
+    DWORD length = 0;
+    bool positioned = false;
+    LARGE_INTEGER position{};
+    if (!DescriptorTransferArguments(info, &bytes, &length, &positioned,
+                                     &position)) {
+      return;
+    }
+    LARGE_INTEGER saved{};
+    LARGE_INTEGER zero{};
+    if (positioned &&
+        (!SetFilePointerEx(file->handle, zero, &saved, FILE_CURRENT) ||
+         !SetFilePointerEx(file->handle, position, nullptr, FILE_BEGIN))) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "read seek failed")));
+      return;
+    }
+    DWORD transferred = 0;
+    const BOOL succeeded = ::ReadFile(file->handle, bytes, length, &transferred, nullptr);
+    if (positioned) SetFilePointerEx(file->handle, saved, nullptr, FILE_BEGIN);
+    if (!succeeded) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "read failed")));
+      return;
+    }
+    info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(info.GetIsolate(), transferred));
+  }
+
+  static void WriteSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    FileDescriptor* file = FindFileDescriptor(FromCallback(info), info);
+    if (file == nullptr) return;
+    uint8_t* bytes = nullptr;
+    DWORD length = 0;
+    bool positioned = false;
+    LARGE_INTEGER position{};
+    if (!DescriptorTransferArguments(info, &bytes, &length, &positioned,
+                                     &position)) {
+      return;
+    }
+    LARGE_INTEGER saved{};
+    LARGE_INTEGER zero{};
+    if (file->append) {
+      position.QuadPart = 0;
+      if (!SetFilePointerEx(file->handle, position, nullptr, FILE_END)) {
+        info.GetIsolate()->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8Literal(info.GetIsolate(), "append seek failed")));
+        return;
+      }
+      positioned = false;
+    } else if (positioned &&
+               (!SetFilePointerEx(file->handle, zero, &saved, FILE_CURRENT) ||
+                !SetFilePointerEx(file->handle, position, nullptr, FILE_BEGIN))) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "write seek failed")));
+      return;
+    }
+    DWORD transferred = 0;
+    const BOOL succeeded =
+        ::WriteFile(file->handle, bytes, length, &transferred, nullptr);
+    if (positioned) SetFilePointerEx(file->handle, saved, nullptr, FILE_BEGIN);
+    if (!succeeded) {
+      info.GetIsolate()->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(info.GetIsolate(), "write failed")));
+      return;
+    }
+    info.GetReturnValue().Set(v8::Integer::NewFromUnsigned(info.GetIsolate(), transferred));
+  }
+
+  static void HttpListen(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    if (runtime == nullptr || info.Length() < 2 || !info[0]->IsFunction()) {
+      ThrowTypeError(isolate, "HTTP listen needs a handler and port");
+      return;
+    }
+    if (runtime->http_servers_.size() >= kMaximumHttpServers) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate,
+                                         "HTTP server capacity exceeded")));
+      return;
+    }
+    const int64_t requested_port = info[1]->IntegerValue(context).FromMaybe(-1);
+    if (requested_port < 0 || requested_port > 65'535) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate, "invalid HTTP port")));
+      return;
+    }
+    auto binding = std::make_unique<HttpBinding>();
+    binding->runtime = runtime;
+    uint16_t local_port = 0;
+    char error[1024] = {};
+    binding->server = sako_http_server_new(
+        static_cast<uint16_t>(requested_port), &local_port, error,
+        sizeof(error));
+    if (binding->server == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+      return;
+    }
+    binding->handler.Reset(isolate, info[0].As<v8::Function>());
+    uint64_t id = runtime->next_http_server_id_++;
+    if (id == 0) id = runtime->next_http_server_id_++;
+    runtime->http_servers_.emplace(id, std::move(binding));
+    v8::Local<v8::Array> result = v8::Array::New(isolate, 2);
+    if (!result->Set(context, 0, v8::Number::New(isolate, id))
+             .FromMaybe(false) ||
+        !result->Set(context, 1, v8::Integer::New(isolate, local_port))
+             .FromMaybe(false)) {
+      return;
+    }
+    info.GetReturnValue().Set(result);
+  }
+
+  static void HttpsListen(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    if (runtime == nullptr || info.Length() < 4 || !info[0]->IsFunction()) {
+      ThrowTypeError(isolate, "HTTPS listen needs a handler, port, key, and certificate");
+      return;
+    }
+    if (runtime->http_servers_.size() >= kMaximumHttpServers) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate,
+                                         "HTTP server capacity exceeded")));
+      return;
+    }
+    const int64_t requested_port = info[1]->IntegerValue(context).FromMaybe(-1);
+    const uint8_t* private_key = nullptr;
+    size_t private_key_length = 0;
+    const uint8_t* certificate = nullptr;
+    size_t certificate_length = 0;
+    if (requested_port < 0 || requested_port > 65'535 ||
+        !ReadBytes(info[2], &private_key, &private_key_length) ||
+        !ReadBytes(info[3], &certificate, &certificate_length) ||
+        private_key_length > 1024 * 1024 || certificate_length > 1024 * 1024) {
+      ThrowTypeError(isolate, "HTTPS key or certificate input is invalid");
+      return;
+    }
+    auto binding = std::make_unique<HttpBinding>();
+    binding->runtime = runtime;
+    binding->secure = true;
+    uint16_t local_port = 0;
+    char error[1024] = {};
+    binding->server = sako_https_server_new(
+        static_cast<uint16_t>(requested_port),
+        SakoNativeBytes{certificate, certificate_length},
+        SakoNativeBytes{private_key, private_key_length}, &local_port, error,
+        sizeof(error));
+    if (binding->server == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+      return;
+    }
+    binding->handler.Reset(isolate, info[0].As<v8::Function>());
+    uint64_t id = runtime->next_http_server_id_++;
+    if (id == 0) id = runtime->next_http_server_id_++;
+    runtime->http_servers_.emplace(id, std::move(binding));
+    v8::Local<v8::Array> result = v8::Array::New(isolate, 2);
+    if (!result->Set(context, 0, v8::Number::New(isolate, id))
+             .FromMaybe(false) ||
+        !result->Set(context, 1, v8::Integer::New(isolate, local_port))
+             .FromMaybe(false)) {
+      return;
+    }
+    info.GetReturnValue().Set(result);
+  }
+
+  static void HttpClose(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    if (runtime == nullptr || info.Length() == 0) return;
+    v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+    const uint64_t id = info[0]->IntegerValue(context).FromMaybe(0);
+    auto found = runtime->http_servers_.find(id);
+    if (found == runtime->http_servers_.end()) return;
+    if (std::find(runtime->closing_http_servers_.begin(),
+                  runtime->closing_http_servers_.end(),
+                  id) == runtime->closing_http_servers_.end()) {
+      runtime->closing_http_servers_.push_back(id);
+    }
+  }
+
+  static void HttpAddress(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    if (runtime == nullptr || info.Length() == 0) return;
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    const uint64_t id = info[0]->IntegerValue(context).FromMaybe(0);
+    if (!runtime->http_servers_.contains(id)) {
+      info.GetReturnValue().Set(v8::Null(isolate));
+      return;
+    }
+    v8::Local<v8::Object> result = v8::Object::New(isolate);
+    const int port = info.Length() > 1
+                         ? info[1]->Int32Value(context).FromMaybe(0)
+                         : 0;
+    if (!runtime->Set(context, result, "address",
+                      v8::String::NewFromUtf8Literal(isolate, "127.0.0.1")) ||
+        !runtime->Set(context, result, "family",
+                      v8::String::NewFromUtf8Literal(isolate, "IPv4")) ||
+        !runtime->Set(context, result, "port",
+                      v8::Integer::New(isolate, port))) {
+      return;
+    }
+    info.GetReturnValue().Set(result);
+  }
+
+  static int DispatchHttp(void* context, SakoNativeBytes method,
+                          SakoNativeBytes target,
+                          SakoNativeBytes body,
+                          const SakoNativeHeader* headers,
+                          size_t header_count,
+                          SakoNativeHttpResponse* response) {
+    auto* binding = static_cast<HttpBinding*>(context);
+    if (binding == nullptr || binding->runtime == nullptr || response == nullptr ||
+        (header_count != 0 && headers == nullptr)) {
+      return 1;
+    }
+    Runtime* runtime = binding->runtime;
+    v8::Isolate* isolate = runtime->isolate_;
+    v8::HandleScope handle_scope(isolate);
+    v8::Local<v8::Context> js_context = isolate->GetCurrentContext();
+    v8::TryCatch try_catch(isolate);
+    v8::Local<v8::Value> dispatcher_value;
+    if (!js_context->Global()
+             ->Get(js_context, v8::String::NewFromUtf8Literal(
+                                  isolate, "__sakoDispatchHttpRequest"))
+             .ToLocal(&dispatcher_value) ||
+        !dispatcher_value->IsFunction()) {
+      runtime->async_error_ = "HTTP JavaScript dispatcher is unavailable";
+      return 1;
+    }
+    auto make_string = [isolate](SakoNativeBytes bytes) {
+      return v8::String::NewFromUtf8(
+          isolate, reinterpret_cast<const char*>(bytes.data),
+          v8::NewStringType::kNormal, static_cast<int>(bytes.length));
+    };
+    v8::Local<v8::String> method_value;
+    v8::Local<v8::String> target_value;
+    v8::Local<v8::ArrayBuffer> body_buffer;
+    if (method.length > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        target.length > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        !make_string(method).ToLocal(&method_value) ||
+        !make_string(target).ToLocal(&target_value)) {
+      runtime->async_error_ = "HTTP request strings exceed V8 limits";
+      return 1;
+    }
+    std::unique_ptr<v8::BackingStore> body_backing =
+        v8::ArrayBuffer::NewBackingStore(isolate, body.length);
+    if (body.length != 0) {
+      std::memcpy(body_backing->Data(), body.data, body.length);
+    }
+    body_buffer = v8::ArrayBuffer::New(isolate, std::move(body_backing));
+    v8::Local<v8::Uint8Array> body_value =
+        v8::Uint8Array::New(body_buffer, 0, body.length);
+    size_t header_bytes_length = 0;
+    for (size_t index = 0; index < header_count; ++index) {
+      const size_t item_length = headers[index].name.length +
+                                 headers[index].value.length;
+      if (item_length < headers[index].name.length ||
+          header_bytes_length > std::numeric_limits<uint32_t>::max() -
+                                    item_length) {
+        runtime->async_error_ = "HTTP request header exceeds V8 limits";
+        return 1;
+      }
+      header_bytes_length += item_length;
+    }
+    std::unique_ptr<v8::BackingStore> header_backing =
+        v8::ArrayBuffer::NewBackingStore(isolate, header_bytes_length);
+    const size_t range_count = header_count * 4;
+    std::unique_ptr<v8::BackingStore> range_backing =
+        v8::ArrayBuffer::NewBackingStore(isolate, range_count * sizeof(uint32_t));
+    auto* header_output = static_cast<uint8_t*>(header_backing->Data());
+    auto* ranges = static_cast<uint32_t*>(range_backing->Data());
+    size_t header_offset = 0;
+    for (size_t index = 0; index < header_count; ++index) {
+      ranges[index * 4] = static_cast<uint32_t>(header_offset);
+      ranges[index * 4 + 1] = static_cast<uint32_t>(headers[index].name.length);
+      if (headers[index].name.length != 0) {
+        std::memcpy(header_output + header_offset, headers[index].name.data,
+                    headers[index].name.length);
+      }
+      header_offset += headers[index].name.length;
+      ranges[index * 4 + 2] = static_cast<uint32_t>(header_offset);
+      ranges[index * 4 + 3] = static_cast<uint32_t>(headers[index].value.length);
+      if (headers[index].value.length != 0) {
+        std::memcpy(header_output + header_offset, headers[index].value.data,
+                    headers[index].value.length);
+      }
+      header_offset += headers[index].value.length;
+    }
+    v8::Local<v8::ArrayBuffer> header_buffer =
+        v8::ArrayBuffer::New(isolate, std::move(header_backing));
+    v8::Local<v8::Uint8Array> header_values =
+        v8::Uint8Array::New(header_buffer, 0, header_bytes_length);
+    v8::Local<v8::ArrayBuffer> range_buffer =
+        v8::ArrayBuffer::New(isolate, std::move(range_backing));
+    v8::Local<v8::Uint32Array> header_ranges =
+        v8::Uint32Array::New(range_buffer, 0, range_count);
+    v8::Local<v8::Value> arguments[] = {
+        binding->handler.Get(isolate), method_value, target_value, header_values,
+        header_ranges, body_value, v8::Boolean::New(isolate, binding->secure)};
+    v8::Local<v8::Value> result;
+    if (!dispatcher_value.As<v8::Function>()
+              ->Call(js_context, v8::Undefined(isolate), 7, arguments)
+             .ToLocal(&result) ||
+        !result->IsObject()) {
+      runtime->async_error_ = FormatException(isolate, js_context, try_catch);
+      return 1;
+    }
+    isolate->PerformMicrotaskCheckpoint();
+    v8::Local<v8::Value> finalize_value;
+    v8::Local<v8::Value> finalized;
+    if (!js_context->Global()
+             ->Get(js_context,
+                   v8::String::NewFromUtf8Literal(
+                       isolate, "__sakoFinalizeHttpResponse"))
+             .ToLocal(&finalize_value) ||
+        !finalize_value->IsFunction() ||
+        !finalize_value.As<v8::Function>()
+             ->Call(js_context, v8::Undefined(isolate), 1, &result)
+             .ToLocal(&finalized) ||
+        !finalized->IsObject()) {
+      runtime->async_error_ = FormatException(isolate, js_context, try_catch);
+      return 1;
+    }
+    v8::Local<v8::Object> object = finalized.As<v8::Object>();
+    v8::Local<v8::Value> status;
+    v8::Local<v8::Value> reason;
+    v8::Local<v8::Value> response_body;
+    v8::Local<v8::Value> response_headers;
+    if (!runtime->GetProperty(js_context, object, "status", &status) ||
+        !runtime->GetProperty(js_context, object, "reason", &reason) ||
+        !runtime->GetProperty(js_context, object, "body", &response_body) ||
+        !runtime->GetProperty(js_context, object, "headers", &response_headers) ||
+        !reason->IsString() || !response_headers->IsArray()) {
+      runtime->async_error_ = "HTTP dispatcher returned an invalid response";
+      return 1;
+    }
+    const int64_t status_code = status->IntegerValue(js_context).FromMaybe(0);
+    if (status_code < 100 || status_code > 999) {
+      runtime->async_error_ = "HTTP dispatcher returned an invalid status";
+      return 1;
+    }
+    binding->response_reason = ToUtf8(isolate, reason);
+    if (response_body->IsString()) {
+      binding->response_body = ToUtf8(isolate, response_body);
+    } else {
+      const uint8_t* bytes = nullptr;
+      size_t length = 0;
+      if (!ReadBytes(response_body, &bytes, &length)) {
+        runtime->async_error_ = "HTTP response body must be a string or byte array";
+        return 1;
+      }
+      binding->response_body.assign(reinterpret_cast<const char*>(bytes), length);
+    }
+    v8::Local<v8::Array> pairs = response_headers.As<v8::Array>();
+    if (pairs->Length() % 2 != 0 || pairs->Length() / 2 > 128) {
+      runtime->async_error_ = "HTTP dispatcher returned invalid headers";
+      return 1;
+    }
+    const size_t pair_count = pairs->Length() / 2;
+    binding->response_header_names.clear();
+    binding->response_header_values.clear();
+    binding->response_header_names.reserve(pair_count);
+    binding->response_header_values.reserve(pair_count);
+    for (uint32_t index = 0; index < pairs->Length(); index += 2) {
+      v8::Local<v8::Value> name;
+      v8::Local<v8::Value> value;
+      if (!pairs->Get(js_context, index).ToLocal(&name) ||
+          !pairs->Get(js_context, index + 1).ToLocal(&value)) {
+        runtime->async_error_ = "cannot read HTTP response headers";
+        return 1;
+      }
+      binding->response_header_names.push_back(ToUtf8(isolate, name));
+      binding->response_header_values.push_back(ToUtf8(isolate, value));
+    }
+    binding->response_headers.clear();
+    binding->response_headers.reserve(pair_count);
+    for (size_t index = 0; index < pair_count; ++index) {
+      const std::string& name = binding->response_header_names[index];
+      const std::string& value = binding->response_header_values[index];
+      binding->response_headers.push_back(
+          {{reinterpret_cast<const uint8_t*>(name.data()), name.size()},
+           {reinterpret_cast<const uint8_t*>(value.data()), value.size()}});
+    }
+    response->status = static_cast<uint16_t>(status_code);
+    response->reason = {
+        reinterpret_cast<const uint8_t*>(binding->response_reason.data()),
+        binding->response_reason.size()};
+    response->headers = binding->response_headers.data();
+    response->header_count = binding->response_headers.size();
+    response->body = {
+        reinterpret_cast<const uint8_t*>(binding->response_body.data()),
+        binding->response_body.size()};
+    return 0;
+  }
+
   void ScheduleTimer(const v8::FunctionCallbackInfo<v8::Value>& info,
                      bool repeat) {
     v8::Isolate* isolate = info.GetIsolate();
@@ -1798,10 +3409,69 @@ class Runtime {
 
   bool DrainEventLoop(v8::Local<v8::Context> context, std::string* error) {
     while (true) {
-      while (v8::platform::PumpMessageLoop(platform_.get(), isolate_)) {
+      while (v8::platform::PumpMessageLoop(platform_, isolate_)) {
         isolate_->PerformMicrotaskCheckpoint();
       }
-      if (timers_.empty()) return true;
+
+      bool handled_http = false;
+      for (auto& [id, binding] : http_servers_) {
+        (void)id;
+        char native_error[1024] = {};
+        const int handled = sako_http_server_tick(
+            binding->server, DispatchHttp, binding.get(), native_error,
+            sizeof(native_error));
+        if (handled < 0) {
+          *error = async_error_.empty() ? native_error : async_error_;
+          async_error_.clear();
+          return false;
+        }
+        handled_http |= handled != 0;
+        isolate_->PerformMicrotaskCheckpoint();
+        if (!async_error_.empty()) {
+          *error = async_error_;
+          async_error_.clear();
+          return false;
+        }
+      }
+      if (!closing_http_servers_.empty()) {
+        std::sort(closing_http_servers_.begin(), closing_http_servers_.end());
+        closing_http_servers_.erase(
+            std::unique(closing_http_servers_.begin(),
+                        closing_http_servers_.end()),
+            closing_http_servers_.end());
+        for (uint64_t id : closing_http_servers_) {
+          auto found = http_servers_.find(id);
+          if (found == http_servers_.end()) continue;
+          HttpBinding& binding = *found->second;
+          if (!binding.closing) {
+            if (sako_http_server_close(binding.server) != 0) {
+              *error = "cannot close native HTTP server";
+              return false;
+            }
+            binding.closing = true;
+          }
+          uint64_t connections = 0;
+          uint64_t rejected = 0;
+          if (sako_http_server_stats(binding.server, &connections, &rejected) != 0) {
+            *error = "cannot query closing HTTP server";
+            return false;
+          }
+          if (connections == 0) {
+            binding.handler.Reset();
+            sako_http_server_delete(binding.server);
+            binding.server = nullptr;
+            http_servers_.erase(found);
+          }
+        }
+        std::erase_if(closing_http_servers_, [this](uint64_t id) {
+          return !http_servers_.contains(id);
+        });
+      }
+      if (timers_.empty()) {
+        if (http_servers_.empty()) return true;
+        if (!handled_http) Sleep(1);
+        continue;
+      }
 
       auto next = std::min_element(
           timers_.begin(), timers_.end(),
@@ -1812,7 +3482,9 @@ class Runtime {
       if (next->second.deadline > now) {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
             next->second.deadline - now + std::chrono::milliseconds(1));
-        Sleep(static_cast<DWORD>(std::min<int64_t>(remaining.count(), MAXDWORD)));
+        int64_t sleep_milliseconds = remaining.count();
+        if (!http_servers_.empty()) sleep_milliseconds = std::min<int64_t>(1, sleep_milliseconds);
+        Sleep(static_cast<DWORD>(std::min<int64_t>(sleep_milliseconds, MAXDWORD)));
       }
 
       const auto ready_at = std::chrono::steady_clock::now();
@@ -1856,7 +3528,7 @@ class Runtime {
     }
   }
 
-  std::unique_ptr<v8::Platform> platform_;
+  v8::Platform* platform_ = nullptr;
   std::unique_ptr<v8::ArrayBuffer::Allocator> allocator_;
   v8::Isolate* isolate_ = nullptr;
   v8::Global<v8::Context> context_;
@@ -1864,9 +3536,14 @@ class Runtime {
   std::unordered_map<std::string, v8::Global<v8::Module>> modules_;
   std::unordered_map<std::string, v8::Global<v8::Object>> commonjs_modules_;
   std::unordered_map<int, SyntheticCommonJs> synthetic_commonjs_;
+  std::unordered_map<uint64_t, std::unique_ptr<HttpBinding>> http_servers_;
+  std::unordered_map<int, FileDescriptor> file_descriptors_;
+  std::vector<uint64_t> closing_http_servers_;
+  std::string async_error_;
   size_t module_source_bytes_ = 0;
   uint64_t next_timer_id_ = 1;
-  bool v8_initialized_ = false;
+  uint64_t next_http_server_id_ = 1;
+  int next_file_descriptor_ = 100;
 };
 
 }  // namespace
@@ -1912,13 +3589,21 @@ extern "C" int sako_v8_runtime_execute(
 
 extern "C" int sako_v8_runtime_memory_stats(
     void* runtime, uint64_t* heap_used, uint64_t* heap_committed,
-    uint64_t* heap_limit, uint64_t* persistent_handles, uint64_t* timers) {
+    uint64_t* heap_limit, uint64_t* persistent_handles, uint64_t* timers,
+    uint64_t* external_memory, uint64_t* http_servers, uint64_t* sockets,
+    uint64_t* http_buffer_bytes, uint64_t* native_memory_bytes,
+    uint64_t* module_cache_entries, uint64_t* queued_operations) {
   if (runtime == nullptr || heap_used == nullptr || heap_committed == nullptr ||
-      heap_limit == nullptr || persistent_handles == nullptr || timers == nullptr) {
+      heap_limit == nullptr || persistent_handles == nullptr || timers == nullptr ||
+      external_memory == nullptr || http_servers == nullptr || sockets == nullptr ||
+      http_buffer_bytes == nullptr || native_memory_bytes == nullptr ||
+      module_cache_entries == nullptr || queued_operations == nullptr) {
     return 1;
   }
   static_cast<Runtime*>(runtime)->MemoryStats(
-      heap_used, heap_committed, heap_limit, persistent_handles, timers);
+      heap_used, heap_committed, heap_limit, persistent_handles, timers,
+      external_memory, http_servers, sockets, http_buffer_bytes,
+      native_memory_bytes, module_cache_entries, queued_operations);
   return 0;
 }
 

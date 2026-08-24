@@ -13,4 +13,6 @@ The Windows x64 V8 bootstrap and Phase 2 runtime are operational. Phase 3 module
 cargo run -p sako-cli -- tests/hello.js
 ```
 
-Implemented experimental commands include `run`, `eval`, `repl`, `--version`, `install`, `add`, `remove`, and `update`. See [Node compatibility](docs/node-compatibility.md) and [package manager status](docs/package-manager.md) before relying on ecosystem behavior.
+Implemented experimental commands include `run`, `eval`, `repl`, `--version`, `--memory-stats`, `--detect-leaks`, `--workers=N|auto`, `install`, `add`, `remove`, and `update`. See the [architecture](docs/architecture.md), [Node compatibility](docs/node-compatibility.md), and [package manager status](docs/package-manager.md) before relying on ecosystem behavior.
+
+The repository also contains bounded overlapped IOCP, native `CreateProcessW`/Job Object process ownership, connection slabs, native HTTP/1 and TLS server bridges, bounded Web Fetch, diagnostics, and measured scalar/SSE4.2/AVX2 foundations. Express 4.21.2 serves through the partial Node HTTP layer; public raw TCP sockets and Node HTTP/HTTPS clients remain unimplemented. The [roadmap](docs/roadmap.md) is authoritative.

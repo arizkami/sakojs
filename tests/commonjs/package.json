@@ -1,0 +1,8 @@
+{
+  "imports": {
+    "#condition": {
+      "import": "./import-condition.mjs",
+      "require": "./require-condition.cjs"
+    }
+  }
+}

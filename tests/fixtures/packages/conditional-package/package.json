@@ -1,0 +1,11 @@
+{
+  "name": "conditional-package",
+  "version": "1.0.0",
+  "exports": {
+    ".": {
+      "import": "./import.mjs",
+      "require": "./require.cjs"
+    },
+    "./feature/*": "./features/*.mjs"
+  }
+}

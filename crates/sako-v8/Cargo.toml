@@ -7,5 +7,16 @@ repository.workspace = true
 links = "sako_v8_bridge"
 build = "build.rs"
 
+[dependencies]
+sako-http = { path = "../sako-http" }
+sako-net = { path = "../sako-net" }
+sako-process = { path = "../sako-process" }
+ureq = "2.12"
+
 [build-dependencies]
 cc = "1.2"
+
+[dev-dependencies]
+rcgen = "0.14.9"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+sako-diagnostics = { path = "../sako-diagnostics" }
