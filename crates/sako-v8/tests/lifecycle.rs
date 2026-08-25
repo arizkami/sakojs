@@ -106,7 +106,7 @@ fn repeated_spawn_sync_releases_process_handles() {
         let mut runtime = Runtime::new().unwrap();
         runtime
             .execute(
-                "__sakoBuiltins['node:child_process'].spawnSync('cmd.exe', ['/d', '/c', 'echo warmup']);",
+                "const [f,a]=process.platform==='win32'?['cmd.exe',['/d','/c','echo warmup']]:['/bin/sh',['-c','echo warmup']];__sakoBuiltins['node:child_process'].spawnSync(f,a);",
                 "child-warmup.js",
             )
             .unwrap();
@@ -116,7 +116,7 @@ fn repeated_spawn_sync_releases_process_handles() {
         let mut runtime = Runtime::new().unwrap();
         runtime
             .execute(
-                "const result = __sakoBuiltins['node:child_process'].spawnSync('cmd.exe', ['/d', '/c', 'echo child']); if (result.status !== 0) throw new Error('child failed');",
+                "const [f,a]=process.platform==='win32'?['cmd.exe',['/d','/c','echo child']]:['/bin/sh',['-c','echo child']];const result = __sakoBuiltins['node:child_process'].spawnSync(f,a); if (result.status !== 0) throw new Error('child failed');",
                 &format!("child-lifecycle-{cycle}.js"),
             )
             .unwrap();

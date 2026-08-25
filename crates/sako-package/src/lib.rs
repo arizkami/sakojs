@@ -194,6 +194,38 @@ fn registry_auth_key(url: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn home_directory() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        env::var_os("USERPROFILE").map(PathBuf::from)
+    }
+    #[cfg(unix)]
+    {
+        env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+/// The base directory package downloads are cached under: `LOCALAPPDATA` on
+/// Windows, matching the XDG base directory spec (`XDG_CACHE_HOME`, falling
+/// back to `~/.cache`) on Unix.
+fn cache_directory() -> Result<PathBuf, PackageError> {
+    #[cfg(windows)]
+    {
+        env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| PackageError("LOCALAPPDATA is not set".into()))
+    }
+    #[cfg(unix)]
+    {
+        if let Some(xdg_cache) = env::var_os("XDG_CACHE_HOME") {
+            return Ok(PathBuf::from(xdg_cache));
+        }
+        home_directory()
+            .map(|home| home.join(".cache"))
+            .ok_or_else(|| PackageError("neither XDG_CACHE_HOME nor HOME is set".into()))
+    }
+}
+
 #[derive(Debug)]
 pub struct PackageError(String);
 
@@ -263,8 +295,8 @@ impl PackageManager {
         }
         if let Some(user_config) = env::var_os("NPM_CONFIG_USERCONFIG") {
             read_npmrc(&PathBuf::from(user_config), &mut registry_config)?;
-        } else if let Some(home) = env::var_os("USERPROFILE") {
-            read_npmrc(&PathBuf::from(home).join(".npmrc"), &mut registry_config)?;
+        } else if let Some(home) = home_directory() {
+            read_npmrc(&home.join(".npmrc"), &mut registry_config)?;
         }
         read_npmrc(&root.join(".npmrc"), &mut registry_config)?;
         if let Ok(registry) = env::var("NPM_CONFIG_REGISTRY") {
@@ -325,12 +357,7 @@ impl PackageManager {
         if let Some(token) = registry_config.default_auth_token.take() {
             registry_config.auth_tokens.insert(default_auth_key, token);
         }
-        let cache_root = env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or_else(|| PackageError("LOCALAPPDATA is not set".into()))?
-            .join("Sako")
-            .join("Store")
-            .join("sha512");
+        let cache_root = cache_directory()?.join("Sako").join("Store").join("sha512");
         let mut agent = ureq::AgentBuilder::new();
         if let Some(proxy) = registry_config.proxy {
             agent = agent.proxy(
@@ -1576,14 +1603,15 @@ fn run_lifecycle_scripts(
         let Some(script) = scripts.get(name) else {
             continue;
         };
-        let arguments = [
-            "/d".to_owned(),
-            "/s".to_owned(),
-            "/c".to_owned(),
-            script.to_owned(),
-        ];
-        let output = spawn_native_with_bounded_output(
+        #[cfg(windows)]
+        let (shell, arguments) = (
             "cmd.exe",
+            vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned(), script.to_owned()],
+        );
+        #[cfg(unix)]
+        let (shell, arguments) = ("/bin/sh", vec!["-c".to_owned(), script.to_owned()]);
+        let output = spawn_native_with_bounded_output(
+            shell,
             &arguments,
             Some(package_root),
             MAXIMUM_SCRIPT_OUTPUT_BYTES,

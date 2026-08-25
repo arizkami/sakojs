@@ -4,10 +4,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket};
 use std::time::Duration;
 
-use sako_platform::{IocpReactor, PostError};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
+use sako_platform::{PostError, Reactor};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectionId {
@@ -76,7 +80,7 @@ pub struct TcpAcceptorCounters {
 pub struct TcpAcceptor {
     // The reactor is declared first so it is dropped first: draining its
     // in-flight operations requires the connection sockets to still be open.
-    reactor: IocpReactor,
+    reactor: Reactor,
     listener: TcpListener,
     connections: ConnectionSlab<TcpConnection>,
     operation_owners: HashMap<u64, ConnectionId>,
@@ -103,7 +107,7 @@ impl TcpAcceptor {
             .maximum_connections
             .checked_mul(2)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "I/O capacity overflow"))?;
-        let reactor = IocpReactor::new(operation_capacity)?;
+        let reactor = Reactor::new(operation_capacity)?;
         Ok(Self {
             reactor,
             listener,
@@ -155,7 +159,10 @@ impl TcpAcceptor {
                     continue;
                 }
             };
+            #[cfg(windows)]
             let socket = self.connections.get(id).unwrap().stream.as_socket();
+            #[cfg(unix)]
+            let socket = self.connections.get(id).unwrap().stream.as_raw_fd();
             match self.reactor.associate_socket(socket, id.completion_key()) {
                 Ok(inline_completions) => {
                     self.connections.get_mut(id).unwrap().inline_completions = inline_completions;
@@ -275,15 +282,22 @@ impl TcpAcceptor {
         if connection.pending_read.is_some() {
             return Ok(());
         }
+        #[cfg(windows)]
         let socket = connection.stream.as_raw_socket();
+        #[cfg(unix)]
+        let socket = connection.stream.as_raw_fd();
         let inline_completions = connection.inline_completions;
         let length = u32::try_from(length).unwrap_or(u32::MAX);
         // SAFETY: accept_ready associated this connection's socket file object
         // with this reactor, and the connection owns that socket until every
         // pending operation on it has been drained by drain_completions.
+        #[cfg(windows)]
+        let handle = unsafe { BorrowedSocket::borrow_raw(socket) };
+        #[cfg(unix)]
+        let handle = socket;
         let operation = unsafe {
             self.reactor.submit_associated_socket_receive(
-                BorrowedSocket::borrow_raw(socket),
+                handle,
                 id.completion_key(),
                 length,
                 inline_completions,
@@ -313,16 +327,23 @@ impl TcpAcceptor {
         if connection.pending_write.is_some() {
             return Err(io::ErrorKind::WouldBlock.into());
         }
+        #[cfg(windows)]
         let socket = connection.stream.as_raw_socket();
+        #[cfg(unix)]
+        let socket = connection.stream.as_raw_fd();
         let inline_completions = connection.inline_completions;
         let mut payload = self.reactor.acquire_buffer(buffer.len());
         payload.copy_from_slice(buffer);
         // SAFETY: accept_ready associated this connection's socket file object
         // with this reactor, and the connection owns that socket until every
         // pending operation on it has been drained by drain_completions.
+        #[cfg(windows)]
+        let handle = unsafe { BorrowedSocket::borrow_raw(socket) };
+        #[cfg(unix)]
+        let handle = socket;
         let operation = unsafe {
             self.reactor.submit_associated_socket_send(
-                BorrowedSocket::borrow_raw(socket),
+                handle,
                 id.completion_key(),
                 payload,
                 inline_completions,
