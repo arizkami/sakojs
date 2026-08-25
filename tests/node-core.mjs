@@ -193,4 +193,49 @@ controller.signal.addEventListener("abort", () => { aborted = true; });
 controller.abort("reason");
 assert.ok(aborted);
 
+// The deprecated flat `constants` module, required by bare name. graceful-fs
+// asks for it on its first line, before anything else in the ecosystem loads.
+const nodeConstants = await import("node:constants").then((module) => module.default ?? module);
+strictEqual(nodeConstants.ENOENT, 2);
+strictEqual(nodeConstants.O_WRONLY, 1);
+strictEqual(nodeConstants.F_OK, 0);
+// Absent on win32 in Node too, and libraries branch on that rather than on the
+// platform.
+assert.ok(!Object.hasOwn(nodeConstants, "O_SYMLINK"));
+strictEqual(os.constants.errno.ENOENT, 2);
+
+// fs-extra wraps a fixed list of callback functions at import time and crashes
+// on the first one that is missing, so the shapes matter as much as the
+// behaviour.
+for (const name of ["access", "appendFile", "chmod", "close", "copyFile", "fstat",
+  "ftruncate", "lstat", "mkdir", "open", "read", "readdir", "readFile", "readlink",
+  "realpath", "rename", "rmdir", "stat", "truncate", "unlink", "utimes", "write",
+  "writeFile"]) {
+  strictEqual(typeof fs[name], "function", `fs.${name}`);
+  strictEqual(typeof fs[`${name}Sync`], "function", `fs.${name}Sync`);
+}
+strictEqual(typeof fs.realpathSync.native, "function");
+
+// fs.writeSync has two shapes, and taking a string call for a buffer call
+// writes nothing at all -- which produces an empty file rather than an error.
+const writtenPath = path.join(os.tmpdir(), `sako-write-${process.pid}.txt`);
+const written = fs.openSync(writtenPath, "w");
+strictEqual(fs.writeSync(written, "written as a string"), 19);
+strictEqual(fs.fstatSync(written).size, 19);
+fs.closeSync(written);
+strictEqual(readFileSync(writtenPath, "utf8"), "written as a string");
+fs.truncateSync(writtenPath, 7);
+strictEqual(readFileSync(writtenPath, "utf8"), "written");
+fs.unlinkSync(writtenPath);
+
+// process.chdir, which a scaffolding tool uses to step into what it created.
+// The path helpers read a cached copy of the working directory, so resolve()
+// has to follow it.
+const startingDirectory = process.cwd();
+process.chdir(os.tmpdir());
+strictEqual(fs.realpathSync(process.cwd()), fs.realpathSync(os.tmpdir()));
+strictEqual(path.resolve("child"), path.join(process.cwd(), "child"));
+process.chdir(startingDirectory);
+strictEqual(process.cwd(), startingDirectory);
+
 console.log("node-core", encoded.length, received);

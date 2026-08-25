@@ -412,6 +412,7 @@ pub unsafe extern "C" fn sako_process_spawn_sync(
     arguments: *const NativeBytes,
     argument_count: usize,
     cwd: NativeBytes,
+    verbatim_arguments: c_int,
     error: *mut c_char,
     error_capacity: usize,
 ) -> *mut c_void {
@@ -459,6 +460,7 @@ pub unsafe extern "C" fn sako_process_spawn_sync(
         &values,
         cwd,
         MAXIMUM_CHILD_OUTPUT_BYTES,
+        verbatim_arguments != 0,
     ) {
         Ok(output) => output,
         Err(cause) => {
@@ -738,17 +740,18 @@ pub unsafe extern "C" fn sako_http_server_tick(
         write_native_error(error, error_capacity, "HTTP server is null");
         return -1;
     };
-    let result = server.server.tick_deferrable(|request, body, ticket| {
-        match dispatch_native_http(handler, context, request, body, ticket) {
-            Ok(outcome) => outcome,
-            Err(message) => Some(HttpResponse {
-                status: 500,
-                reason: "Internal Server Error".into(),
-                headers: vec![("Connection".into(), "close".into())],
-                body: message.into_bytes(),
-            }),
-        }
-    });
+    let result =
+        server.server.tick_deferrable(|request, body, ticket| {
+            match dispatch_native_http(handler, context, request, body, ticket) {
+                Ok(outcome) => outcome,
+                Err(message) => Some(HttpResponse {
+                    status: 500,
+                    reason: "Internal Server Error".into(),
+                    headers: vec![("Connection".into(), "close".into())],
+                    body: message.into_bytes(),
+                }),
+            }
+        });
     match result {
         Ok(handled) => c_int::try_from(handled).unwrap_or(c_int::MAX),
         Err(cause) => {
@@ -1025,11 +1028,7 @@ pub const SAKO_HASH_MAXIMUM_BYTES: usize = 64;
 /// `bytes` must describe a readable range for this call. `digest` must be
 /// writable for at least `SAKO_HASH_MAXIMUM_BYTES` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sako_hash(
-    algorithm: u32,
-    bytes: NativeBytes,
-    digest: *mut u8,
-) -> usize {
+pub unsafe extern "C" fn sako_hash(algorithm: u32, bytes: NativeBytes, digest: *mut u8) -> usize {
     use sha1::Digest as _;
     let input = if bytes.length == 0 {
         &[][..]
@@ -1118,6 +1117,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn sako_v8_runtime_delete(runtime: *mut c_void);
     fn sako_v8_runtime_abandon(runtime: *mut c_void);
+    fn sako_v8_restore_terminal();
+    fn sako_v8_remember_output_code_page(code_page: u32);
     fn sako_perf_enable();
     fn sako_perf_mark(name: *const c_char);
     fn sako_perf_report();
@@ -1143,6 +1144,29 @@ pub fn perf_mark(name: &'static CStr) {
 pub fn perf_report() {
     // SAFETY: the bridge writes its own recorded state to the error handle.
     unsafe { sako_perf_report() };
+}
+
+/// Restores line editing and echo if a script put the terminal into raw mode.
+///
+/// Belongs on every exit path. A prompt that ends by returning rather than by
+/// calling `process.exit` leaves through the CLI, which terminates the process
+/// outright -- so without this the shell that comes next inherits a terminal
+/// with no echo. A no-op when raw mode was never entered.
+/// Tells the runtime which console output code page to put back.
+///
+/// `process.exit` terminates rather than returning, so the CLI's own restore
+/// never runs for a script that calls it -- and the console was left in UTF-8
+/// for whatever the user typed next. Passing the value here lets the exit path
+/// undo it. A no-op off Windows, where there is no per-console encoding.
+pub fn remember_output_code_page(code_page: Option<u32>) {
+    // SAFETY: the bridge only stores the value and reads it back on exit.
+    unsafe { sako_v8_remember_output_code_page(code_page.unwrap_or(0)) };
+}
+
+pub fn restore_terminal() {
+    // SAFETY: the bridge only rewrites the console or termios state it saved,
+    // and does nothing at all when it saved none.
+    unsafe { sako_v8_restore_terminal() };
 }
 
 #[derive(Debug)]

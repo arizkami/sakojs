@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! Terminal styling for the CLI.
+//! Terminal setup for the CLI: colour, and the console's output encoding.
 //!
 //! Deliberately dependency-free: the workspace keeps its dependency surface
-//! small, and this needs only SGR escapes plus one console call on Windows.
+//! small, and this needs only SGR escapes plus a couple of console calls on
+//! Windows.
 //!
 //! Colour is decided per stream, because stdout is frequently redirected while
 //! stderr stays attached to the terminal. Honours the `NO_COLOR` convention
@@ -102,6 +103,67 @@ impl Painter {
         self.paint(&format!("{BOLD}{CYAN}"), text)
     }
 }
+
+/// Switches the console to UTF-8 output, returning the code page it replaced.
+///
+/// Sako writes UTF-8, and so does every tool it launches, but a Windows
+/// console decodes output bytes with its own code page -- still an OEM one on
+/// most machines. Vite's `->` arrow then arrives as three characters of
+/// Cyrillic, and so does every emoji a tool prints.
+///
+/// This is `chcp 65001` performed by the process that needs it. The code page
+/// belongs to the console rather than to the program, so a child process
+/// inheriting these handles gets it too, which is the point: the mangled
+/// output usually comes from the dev server, not from Sako.
+///
+/// Only the output side is touched. Switching the input code page as well is
+/// the traditional advice and the traditional source of broken console reads,
+/// and nothing here needs it.
+#[cfg(windows)]
+pub fn use_utf8_output() -> Option<u32> {
+    const CP_UTF8: u32 = 65001;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleOutputCP() -> u32;
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+    }
+
+    unsafe {
+        let previous = GetConsoleOutputCP();
+        // Zero means there is no console attached, and a console already in
+        // UTF-8 needs nothing restored.
+        if previous == 0 || previous == CP_UTF8 {
+            return None;
+        }
+        (SetConsoleOutputCP(CP_UTF8) != 0).then_some(previous)
+    }
+}
+
+/// Puts back whatever `use_utf8_output` replaced, so a shell session is left
+/// as it was found.
+#[cfg(windows)]
+pub fn restore_output_encoding(previous: Option<u32>) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+    }
+
+    if let Some(code_page) = previous {
+        unsafe {
+            SetConsoleOutputCP(code_page);
+        }
+    }
+}
+
+/// POSIX consoles are UTF-8 already; there is no per-console encoding to set.
+#[cfg(not(windows))]
+pub fn use_utf8_output() -> Option<u32> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn restore_output_encoding(_previous: Option<u32>) {}
 
 fn colors_enabled(stream: Stream) -> bool {
     static STDOUT: OnceLock<bool> = OnceLock::new();

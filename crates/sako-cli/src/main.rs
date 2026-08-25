@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use sako_package::{PackageManager, PackageManagerOptions};
-use sako_v8::{MemoryStats, Runtime, perf_enable, perf_mark, perf_report};
+use sako_v8::{
+    MemoryStats, Runtime, perf_enable, perf_mark, perf_report, remember_output_code_page,
+    restore_terminal,
+};
 
 use style::Painter;
 
@@ -27,6 +30,14 @@ struct DiagnosticsOptions {
 }
 
 fn main() -> ! {
+    // Before anything prints: Sako and the tools it launches all write UTF-8,
+    // and a Windows console decodes with its own code page until told
+    // otherwise.
+    let previous_encoding = style::use_utf8_output();
+    // process.exit terminates without unwinding, so the restore at the bottom
+    // of this function never runs for a script that calls it. Handing the
+    // value to the runtime lets that path put the console back too.
+    remember_output_code_page(previous_encoding);
     let status = match run() {
         Ok(code) => code,
         Err(error) => {
@@ -36,11 +47,16 @@ fn main() -> ! {
         }
     };
     perf_report();
+    // A script that asked for raw mode and then simply returned never got to
+    // put the terminal back; the exit below runs no destructors, so this is
+    // the last chance before the shell inherits a console with no echo.
+    restore_terminal();
     // Deliberately not returning: see sako_process::exit_immediately. Rust's
     // own streams are line buffered, so anything printed without a trailing
     // newline is still sitting in them and has to be flushed by hand.
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
+    style::restore_output_encoding(previous_encoding);
     sako_process::exit_immediately(status)
 }
 
@@ -55,22 +71,22 @@ fn run() -> Result<u8, String> {
     // `x` and `create` forward everything after the command name, so the tool
     // receives its own --help and --version rather than Sako intercepting
     // them. Split here, before any global flag parsing touches the tail.
+    //
+    // The command word is whatever comes first that is not a global flag, so
+    // `sako --workers=2 x tsc` still forwards, while `sako add exec` -- where
+    // `exec` is an argument rather than the command -- does not.
     if let Some(position) = arguments
         .iter()
-        .position(|argument| argument == "x" || argument == "create")
+        .position(|argument| !is_global_flag(argument))
+        && let Some(name @ ("x" | "create")) =
+            canonical_command(&arguments[position].to_string_lossy())
     {
-        if arguments[..position]
-            .iter()
-            .all(|argument| is_global_flag(argument))
-        {
-            let forwarding = arguments[position].clone();
-            let forwarded = arguments.split_off(position + 1);
-            return if forwarding == "create" {
-                create::run(&forwarded)
-            } else {
-                execute_package_binary(&forwarded)
-            };
-        }
+        let forwarded = arguments.split_off(position + 1);
+        return if name == "create" {
+            create::run(&forwarded)
+        } else {
+            execute_package_binary(&forwarded)
+        };
     }
 
     if take_flag(&mut arguments, "--perf-breakdown") {
@@ -87,7 +103,28 @@ fn run() -> Result<u8, String> {
     };
     arguments.remove(0);
 
-    match command.to_string_lossy().as_ref() {
+    let command = command.to_string_lossy().into_owned();
+    // An alias is resolved once, here, so every arm below only has to know the
+    // canonical name -- and so `sako help i` and `sako i --help` describe the
+    // same command the alias runs.
+    let canonical = canonical_command(&command).unwrap_or(&command);
+
+    // `sako install --help` should explain install rather than reject the
+    // flag. Only the leading position counts: `sako run build --help` is the
+    // build script's flag, not Sako's.
+    if matches!(
+        arguments
+            .first()
+            .map(|first| first.to_string_lossy())
+            .as_deref(),
+        Some("--help" | "-h")
+    ) && let Some(entry) = help::find(canonical)
+    {
+        print!("{}", help::command_page(Painter::stdout(), entry));
+        return Ok(SUCCESS);
+    }
+
+    match canonical {
         "--help" | "-h" | "help" => {
             let painter = Painter::stdout();
             match arguments.first() {
@@ -102,7 +139,7 @@ fn run() -> Result<u8, String> {
             }
             Ok(SUCCESS)
         }
-        "--version" | "-V" => {
+        "--version" | "-V" | "-v" => {
             println!("sako {VERSION}");
             Ok(SUCCESS)
         }
@@ -172,6 +209,19 @@ fn ok(_: ()) -> u8 {
     SUCCESS
 }
 
+/// Maps whatever the user typed onto the canonical command name, or `None` if
+/// it is not a command at all.
+///
+/// Only exact spellings resolve. A near miss stays unknown so it reaches the
+/// script fallback and then the suggestion, rather than silently running
+/// something the user did not ask for.
+fn canonical_command(typed: &str) -> Option<&'static str> {
+    help::COMMANDS
+        .iter()
+        .find(|command| command.answers_to(typed))
+        .map(|command| command.name)
+}
+
 fn is_global_flag(argument: &OsString) -> bool {
     let argument = argument.to_string_lossy();
     argument.starts_with("--workers=")
@@ -217,11 +267,23 @@ fn unknown_command(name: &str) -> String {
 /// Suggests a command within edit distance 2, which catches the usual
 /// transpositions and single missing or doubled letters without proposing
 /// something unrelated for a genuinely novel word.
+///
+/// Aliases are searched too, but the canonical name is what gets suggested:
+/// `unistall` should point at `install`, not at `uninstall`.
+///
+/// The distance also has to be smaller than what was typed. Without that,
+/// every unrecognised single letter came back as "did you mean x?" -- a
+/// suggestion that shares nothing with the input and only ever misled.
 fn nearest_command(name: &str) -> Option<&'static str> {
+    let typed = name.chars().count();
     help::COMMANDS
         .iter()
-        .map(|command| (command.name, edit_distance(name, command.name)))
-        .filter(|(_, distance)| *distance <= 2)
+        .flat_map(|command| {
+            std::iter::once(command.name)
+                .chain(command.aliases.iter().copied())
+                .map(move |spelling| (command.name, edit_distance(name, spelling)))
+        })
+        .filter(|(_, distance)| *distance <= 2 && *distance < typed)
         .min_by_key(|(_, distance)| *distance)
         .map(|(name, _)| name)
 }
@@ -302,30 +364,73 @@ fn execute_workers(
 
 fn package_install(mut arguments: Vec<OsString>) -> Result<(), String> {
     let options = take_package_options(&mut arguments)?;
+    let development = take_flag(&mut arguments, "--dev") | take_flag(&mut arguments, "-D");
+    reject_unsupported_flags("install", &arguments)?;
+    // `npm install lodash` adds a dependency rather than complaining, and it
+    // is what everyone types. Sako rejected it outright, so the alias `i` on
+    // its own would still have left half the muscle memory broken.
     if !arguments.is_empty() {
-        return Err("install received an unsupported argument".into());
+        return add_all(options, &arguments, development);
+    }
+    if development {
+        return Err("--dev applies to packages being added; install takes none".into());
     }
     package_manager(options)?
         .install()
         .map_err(|error| error.to_string())
 }
 
+/// Rejects a leftover flag rather than treating it as a package name.
+///
+/// Every option this command understands has already been taken out of the
+/// vector, so anything still starting with a dash is one Sako does not know --
+/// and passing it on would send the registry a request for a package called
+/// `--frozen-lockfile`.
+fn reject_unsupported_flags(command: &str, arguments: &[OsString]) -> Result<(), String> {
+    match arguments
+        .iter()
+        .find(|argument| argument.to_string_lossy().starts_with('-'))
+    {
+        Some(flag) => Err(format!(
+            "{command} does not understand {}",
+            Painter::stderr().bold(&flag.to_string_lossy()),
+        )),
+        None => Ok(()),
+    }
+}
+
 fn package_add(mut arguments: Vec<OsString>) -> Result<(), String> {
     let options = take_package_options(&mut arguments)?;
-    let development = take_flag(&mut arguments, "--dev") || take_flag(&mut arguments, "-D");
+    // Non-short-circuiting on purpose: with `||`, `--dev` matching meant `-D`
+    // was never removed from the vector and was installed as a package named
+    // "-D".
+    let development = take_flag(&mut arguments, "--dev") | take_flag(&mut arguments, "-D");
+    reject_unsupported_flags("add", &arguments)?;
     if arguments.is_empty() {
         return Err("add requires at least one package".into());
     }
-    let mut manager = package_manager(options)?;
-    for specifier in arguments {
-        manager
-            .add(&specifier.to_string_lossy(), development)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    add_all(options, &arguments, development)
+}
+
+/// Records every named package and installs once, rather than reinstalling the
+/// whole graph for each one.
+fn add_all(
+    options: PackageManagerOptions,
+    specifiers: &[OsString],
+    development: bool,
+) -> Result<(), String> {
+    let names: Vec<String> = specifiers
+        .iter()
+        .map(|specifier| specifier.to_string_lossy().into_owned())
+        .collect();
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    package_manager(options)?
+        .add_all(&borrowed, development)
+        .map_err(|error| error.to_string())
 }
 
 fn package_remove(arguments: Vec<OsString>) -> Result<(), String> {
+    reject_unsupported_flags("remove", &arguments)?;
     if arguments.is_empty() {
         return Err("remove requires at least one package".into());
     }
@@ -343,6 +448,7 @@ fn package_remove(arguments: Vec<OsString>) -> Result<(), String> {
 
 fn package_update(mut arguments: Vec<OsString>) -> Result<(), String> {
     let options = take_package_options(&mut arguments)?;
+    reject_unsupported_flags("update", &arguments)?;
     if !arguments.is_empty() {
         return Err("update received an unsupported argument".into());
     }
@@ -390,21 +496,25 @@ fn take_option(arguments: &mut Vec<OsString>, name: &str) -> Result<Option<Strin
     if index >= arguments.len() {
         return Err(format!("{name} needs a value"));
     }
-    let value = arguments.remove(index).to_string_lossy().into_owned();
-    if value.is_empty() {
-        Err(format!("{name} needs a value"))
-    } else {
-        Ok(Some(value))
+    let value = arguments[index].to_string_lossy().into_owned();
+    // A flag is never a value. `sako install --registry --token abc` used to
+    // set the registry to the literal string "--token" and then fail somewhere
+    // far away, fetching from a URL nobody typed.
+    if value.is_empty() || value.starts_with("--") {
+        return Err(format!("{name} needs a value"));
     }
+    arguments.remove(index);
+    Ok(Some(value))
 }
 
+/// Removes every occurrence of `flag` and reports whether there was one.
+///
+/// Every occurrence, not the first: a repeated `--dev` used to leave a copy
+/// behind, which the command then read as a package name or a script path.
 fn take_flag(arguments: &mut Vec<OsString>, flag: &str) -> bool {
-    if let Some(index) = arguments.iter().position(|argument| argument == flag) {
-        arguments.remove(index);
-        true
-    } else {
-        false
-    }
+    let before = arguments.len();
+    arguments.retain(|argument| argument != flag);
+    arguments.len() != before
 }
 
 fn looks_like_script_path(path: &Path) -> bool {
@@ -589,8 +699,13 @@ fn shell_command(
     // The shims generated by sako-package prefer this over a PATH lookup, so a
     // script re-enters the exact binary the user invoked.
     if let Ok(executable) = env::current_exe() {
-        command.env("SAKO_EXECUTABLE", executable);
+        command.env("SAKO_EXECUTABLE", &executable);
+        command.env("npm_execpath", executable);
     }
+    // How the npm ecosystem asks which package manager is running. Tools that
+    // print follow-up commands read it, and with nothing set they all assumed
+    // npm and told the user to run npm.
+    command.env("npm_config_user_agent", sako_package::user_agent());
     command
 }
 
@@ -610,11 +725,11 @@ pub(crate) fn exit_code(status: std::process::ExitStatus) -> u8 {
 fn undefined_script(name: &str, scripts: Option<&serde_json::Value>) -> String {
     let painter = Painter::stderr();
     let mut message = format!("no script named {} in package.json", painter.bold(name));
-    if let Some(available) = scripts.and_then(serde_json::Value::as_object) {
-        if !available.is_empty() {
-            let names: Vec<String> = available.keys().map(|key| painter.cyan(key)).collect();
-            message.push_str(&format!("\n       available: {}", names.join(", ")));
-        }
+    if let Some(available) = scripts.and_then(serde_json::Value::as_object)
+        && !available.is_empty()
+    {
+        let names: Vec<String> = available.keys().map(|key| painter.cyan(key)).collect();
+        message.push_str(&format!("\n       available: {}", names.join(", ")));
     }
     message
 }
@@ -641,6 +756,11 @@ fn execute_package_binary(arguments: &[OsString]) -> Result<u8, String> {
         .env("PATH", node_bin::augmented_path(&directory))
         .env(
             "SAKO_EXECUTABLE",
+            env::current_exe().unwrap_or_else(|_| PathBuf::from("sako")),
+        )
+        .env("npm_config_user_agent", sako_package::user_agent())
+        .env(
+            "npm_execpath",
             env::current_exe().unwrap_or_else(|_| PathBuf::from("sako")),
         )
         .stdin(Stdio::inherit())

@@ -32,9 +32,12 @@
 #include <cstdlib>
 #include <ctime>
 #include <fcntl.h>
+#include <csignal>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
 extern char** environ;
 #endif
@@ -312,7 +315,7 @@ int sako_dns_resolve(SakoNativeBytes host, int family, char* output,
 void* sako_process_spawn_sync(SakoNativeBytes executable,
                               const SakoNativeBytes* arguments,
                               size_t argument_count, SakoNativeBytes cwd,
-                              char* error, size_t error_capacity);
+                              int verbatim_arguments, char* error, size_t error_capacity);
 int sako_process_output_status(const void* output);
 SakoNativeBytes sako_process_output_stdout(const void* output);
 SakoNativeBytes sako_process_output_stderr(const void* output);
@@ -774,8 +777,18 @@ bool TranspileTypeScript(const std::filesystem::path& path, bool commonjs,
   return true;
 }
 
+/// Serializes writes to the standard streams.
+///
+/// `--workers=N` runs N isolates on N threads against the same two handles, and
+/// a write is not atomic: one thread's partial WriteFile could land in the
+/// middle of another's line, so two workers printing one line each could
+/// produce two lines that were neither. One lock across both handles, because
+/// stdout and stderr usually share a console and interleave there too.
+std::mutex g_output_mutex;
+
 #if defined(_WIN32)
 void WriteHandle(HANDLE output, const char* bytes, size_t length) {
+  const std::lock_guard<std::mutex> guard(g_output_mutex);
   while (output != INVALID_HANDLE_VALUE && output != nullptr && length != 0) {
     const DWORD chunk = length > MAXDWORD ? MAXDWORD : static_cast<DWORD>(length);
     DWORD written = 0;
@@ -790,6 +803,7 @@ void WriteStdout(const char* bytes, size_t length) {
 }
 #else
 void WriteHandle(int output, const char* bytes, size_t length) {
+  const std::lock_guard<std::mutex> guard(g_output_mutex);
   while (output >= 0 && length != 0) {
     const ssize_t written = ::write(output, bytes, length);
     if (written <= 0) return;
@@ -888,6 +902,379 @@ bool IsTerminal(int descriptor) {
 #endif
 }
 
+// Standard input.
+//
+// Nothing here existed before, and `process.stdin` was wired to the fs
+// `readSync`, which resolves descriptors through Sako's own table of opened
+// files. Descriptor 0 was never in that table, so every read threw and the
+// JavaScript side read the throw as end-of-input: `process.stdin` reported EOF
+// on the first read whether input was a pipe, a file, or a keyboard.
+//
+// Raw mode was missing for the same reason -- `setRawMode` returned `this` and
+// did nothing. Together those two gaps are why an interactive scaffolder
+// (`sako create vite`) printed its first prompt and exited instead of waiting:
+// it asked for raw mode, got a silent yes, attached a keypress listener that
+// nothing could ever feed, and the event loop found no work left to do.
+
+/// The console output code page to put back on the way out.
+///
+/// The CLI switches it to UTF-8 for the duration of a run and restores it when
+/// `run()` returns -- but `process.exit` terminates instead of returning, so a
+/// script that called it left the code page switched for whatever ran next in
+/// that console. Recorded here by the CLI so the exit path can undo it too.
+#if defined(_WIN32)
+UINT g_saved_output_code_page = 0;
+#endif
+
+/// The console mode to put back when raw mode ends.
+///
+/// Saved on the first switch into raw mode rather than at startup: a mode
+/// captured before the program ran would also be restored over a mode the user
+/// set deliberately in between.
+#if defined(_WIN32)
+DWORD g_saved_console_mode = 0;
+#else
+struct termios g_saved_terminal_mode;
+#endif
+bool g_terminal_mode_saved = false;
+
+/// Puts the terminal back the way it was found.
+///
+/// Raw mode outlives the process that set it: a console left with echo and
+/// line editing off stays that way for the shell that follows, which is the
+/// difference between a prompt that exits cleanly and a terminal the user has
+/// to reset by hand. Called from every exit path, including `process.exit`,
+/// which terminates rather than unwinding and so runs no destructors.
+#if !defined(_WIN32)
+void InstallTerminalSignalHandlers();
+#endif
+
+void RestoreTerminalMode() {
+#if defined(_WIN32)
+  if (g_saved_output_code_page != 0) {
+    SetConsoleOutputCP(g_saved_output_code_page);
+    g_saved_output_code_page = 0;
+  }
+#endif
+  if (!g_terminal_mode_saved) return;
+  g_terminal_mode_saved = false;
+#if defined(_WIN32)
+  SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), g_saved_console_mode);
+#else
+  tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_terminal_mode);
+#endif
+}
+
+#if !defined(_WIN32)
+/// Puts the terminal back before dying on a signal that would otherwise leave
+/// it in raw mode -- a killed prompt should not cost the user their echo. The
+/// handler restores, reinstates the default disposition, and re-raises, so the
+/// process still ends the way the sender asked it to.
+extern "C" void TerminalSignalHandler(int number) {
+  RestoreTerminalMode();
+  signal(number, SIG_DFL);
+  raise(number);
+}
+
+void InstallTerminalSignalHandlers() {
+  // SIGINT is included for the line-mode case: raw mode clears ISIG, so there
+  // Ctrl+C arrives as a byte instead.
+  for (int number : {SIGHUP, SIGINT, SIGTERM, SIGQUIT}) {
+    struct sigaction action {};
+    action.sa_handler = TerminalSignalHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESETHAND;
+    sigaction(number, &action, nullptr);
+  }
+}
+#endif
+
+#if defined(_WIN32)
+BOOL WINAPI ConsoleControlHandler(DWORD) {
+  // Ctrl+C with ENABLE_PROCESSED_INPUT cleared is delivered as a byte rather
+  // than an event, so this only runs for the cases the program cannot see --
+  // a console close or a logoff. Restoring and declining to handle lets the
+  // default terminator run against a sane terminal.
+  RestoreTerminalMode();
+  return FALSE;
+}
+#endif
+
+/// Switches descriptor 0 between line mode and raw mode.
+///
+/// Returns whether raw mode is now in effect, which is false for a redirected
+/// stdin: there is no terminal to configure, and a caller that checks can fall
+/// back to reading lines.
+bool SetStdinRawMode(bool enable) {
+#if defined(_WIN32)
+  const HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
+  DWORD mode = 0;
+  if (handle == INVALID_HANDLE_VALUE || handle == nullptr ||
+      GetConsoleMode(handle, &mode) == 0) {
+    return false;
+  }
+  if (!enable) {
+    RestoreTerminalMode();
+    return false;
+  }
+  if (!g_terminal_mode_saved) {
+    g_saved_console_mode = mode;
+    g_terminal_mode_saved = true;
+    // Once per process. Registering again on each entry into raw mode would
+    // stack duplicate entries in the handler list that nothing removes.
+    static bool handler_installed = false;
+    if (!handler_installed) {
+      handler_installed = SetConsoleCtrlHandler(ConsoleControlHandler, TRUE) != 0;
+    }
+  }
+  // ENABLE_VIRTUAL_TERMINAL_INPUT is what makes this tractable: the console
+  // itself turns arrow keys and function keys into the escape sequences the
+  // rest of the world already speaks, so the decoder in bootstrap.js is the
+  // same one that reads a POSIX terminal.
+  DWORD raw = mode & ~static_cast<DWORD>(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                                         ENABLE_PROCESSED_INPUT);
+  raw |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+  return SetConsoleMode(handle, raw) != 0;
+#else
+  if (isatty(STDIN_FILENO) == 0) return false;
+  if (!enable) {
+    RestoreTerminalMode();
+    return false;
+  }
+  if (!g_terminal_mode_saved) {
+    if (tcgetattr(STDIN_FILENO, &g_saved_terminal_mode) != 0) return false;
+    g_terminal_mode_saved = true;
+    InstallTerminalSignalHandlers();
+  }
+  struct termios raw = g_saved_terminal_mode;
+  // ISIG off is deliberate and matches Node: in raw mode Ctrl+C arrives as
+  // 0x03 for the program to interpret, which is how a prompt offers "cancel"
+  // rather than dying mid-render and leaving the terminal dressed.
+  raw.c_lflag &= ~static_cast<tcflag_t>(ECHO | ICANON | IEXTEN | ISIG);
+  raw.c_iflag &= ~static_cast<tcflag_t>(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  return tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0;
+#endif
+}
+
+/// What one read of standard input produced.
+enum class StdinRead { Bytes, Timeout, End };
+
+#if defined(_WIN32)
+/// Spends what is left of a read's budget asleep.
+///
+/// A console handle stays signalled for as long as anything is queued on it,
+/// so once the user has typed a character that does not yet finish a line,
+/// waiting on the handle returns immediately every time. Returning straight
+/// away turned that into a spin -- a hundred per cent of a core for as long as
+/// someone was mid-word. Sleeping the remainder keeps the poll rate the caller
+/// asked for.
+StdinRead WaitOutTheBudget(uint32_t timeout_milliseconds) {
+  if (timeout_milliseconds != 0) Sleep(timeout_milliseconds);
+  return StdinRead::Timeout;
+}
+
+/// The leading half of a character a console read cut in two. See ReadStdin.
+wchar_t g_pending_high_surrogate = 0;
+
+/// Whether the console has a complete line queued.
+///
+/// The records sit in the input queue until a read consumes them, so a
+/// carriage return among them means `ReadConsoleW` has a line to hand back and
+/// will not have to wait for the keyboard.
+bool ConsoleLineIsReady(HANDLE handle) {
+  DWORD queued = 0;
+  if (GetNumberOfConsoleInputEvents(handle, &queued) == 0 || queued == 0) {
+    return false;
+  }
+  // Bounded: a paste can queue a great many records, and scanning all of them
+  // on every poll would cost more than the wait it saves. Anything past the
+  // cap is found by a later poll, once the front of the queue is consumed.
+  constexpr DWORD kMaximumScan = 4096;
+  std::vector<INPUT_RECORD> records(std::min(queued, kMaximumScan));
+  DWORD peeked = 0;
+  if (PeekConsoleInputW(handle, records.data(),
+                        static_cast<DWORD>(records.size()), &peeked) == 0) {
+    return false;
+  }
+  for (DWORD index = 0; index < peeked; ++index) {
+    const INPUT_RECORD& record = records[index];
+    if (record.EventType != KEY_EVENT || record.Event.KeyEvent.bKeyDown == 0) {
+      continue;
+    }
+    const wchar_t character = record.Event.KeyEvent.uChar.UnicodeChar;
+    // Ctrl+Z ends the input just as Enter does, and the console returns from
+    // the read either way.
+    if (character == L'\r' || character == L'\n' || character == 0x1a) return true;
+  }
+  return false;
+}
+#endif
+
+/// Reads whatever standard input has, waiting at most `timeout_milliseconds`.
+///
+/// The timeout is what lets a blocking read live inside a single-threaded
+/// event loop: the pump asks for input, and either gets some or hands control
+/// back so timers still fire.
+StdinRead ReadStdin(uint32_t timeout_milliseconds, std::string* out) {
+#if defined(_WIN32)
+  const HANDLE handle = GetStdHandle(STD_INPUT_HANDLE);
+  if (handle == INVALID_HANDLE_VALUE || handle == nullptr) return StdinRead::End;
+  DWORD mode = 0;
+  if (GetConsoleMode(handle, &mode) != 0) {
+    if (WaitForSingleObject(handle, timeout_milliseconds) != WAIT_OBJECT_0) {
+      return StdinRead::Timeout;
+    }
+    // In raw mode the handle signals for every input record, most of which
+    // carry no characters: focus changes, key releases, window resizes, and
+    // mouse movement all wake it. Discarding them keeps ReadConsoleW from
+    // blocking past the timeout on a record it would ignore anyway.
+    //
+    // Only in raw mode. With line input still on, the console host does the
+    // editing itself when the read happens, and it needs the very records this
+    // loop throws away -- an arrow key carries no character but does move the
+    // cursor.
+    if ((mode & ENABLE_LINE_INPUT) == 0) {
+      for (;;) {
+        INPUT_RECORD record{};
+        DWORD peeked = 0;
+        if (PeekConsoleInputW(handle, &record, 1, &peeked) == 0) return StdinRead::End;
+        if (peeked == 0) return WaitOutTheBudget(timeout_milliseconds);
+        if (record.EventType == KEY_EVENT && record.Event.KeyEvent.bKeyDown != 0 &&
+            record.Event.KeyEvent.uChar.UnicodeChar != 0) {
+          break;
+        }
+        DWORD consumed = 0;
+        if (ReadConsoleInputW(handle, &record, 1, &consumed) == 0) return StdinRead::End;
+      }
+    } else if (!ConsoleLineIsReady(handle)) {
+      // With line input on, ReadConsoleW does not return until the user
+      // presses Enter -- and this runtime has one thread, so calling it early
+      // froze every timer for as long as someone was still typing. Waiting
+      // until the whole line is queued keeps the read short.
+      return WaitOutTheBudget(timeout_milliseconds);
+    }
+    wchar_t wide[2048];
+    // The high half of a character the previous read cut in two goes first, so
+    // the pair converts as one.
+    DWORD carried = 0;
+    if (g_pending_high_surrogate != 0) {
+      wide[0] = g_pending_high_surrogate;
+      g_pending_high_surrogate = 0;
+      carried = 1;
+    }
+    DWORD read = 0;
+    if (ReadConsoleW(handle, wide + carried,
+                     static_cast<DWORD>(std::size(wide)) - carried, &read,
+                     nullptr) == 0) {
+      return StdinRead::End;
+    }
+    read += carried;
+    // Zero characters from a console read is Ctrl+Z at a line prompt, the
+    // Windows spelling of end-of-input.
+    if (read == 0) return StdinRead::End;
+    // A character outside the basic plane is two UTF-16 units, and a read can
+    // land between them. Converting a lone surrogate substitutes U+FFFD and
+    // loses the character for good, so the tail is held back for the next read
+    // to complete.
+    if (wide[read - 1] >= 0xd800 && wide[read - 1] <= 0xdbff) {
+      g_pending_high_surrogate = wide[read - 1];
+      --read;
+      if (read == 0) return StdinRead::Timeout;
+    }
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(read),
+                                           nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return StdinRead::Timeout;
+    out->resize(static_cast<size_t>(needed));
+    WideCharToMultiByte(CP_UTF8, 0, wide, static_cast<int>(read), out->data(),
+                        needed, nullptr, nullptr);
+    return StdinRead::Bytes;
+  }
+
+  // A pipe has to be peeked rather than read: ReadFile on an empty pipe blocks
+  // until the writer sends something or closes, which would hold the event
+  // loop for as long as the other end stays quiet.
+  if (GetFileType(handle) == FILE_TYPE_PIPE) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_milliseconds);
+    for (;;) {
+      DWORD available = 0;
+      // Every failure here means the same thing to a reader: nothing more is
+      // coming. A broken pipe is the writer having finished, and anything else
+      // is a handle that can no longer be read.
+      if (PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) == 0) {
+        return StdinRead::End;
+      }
+      if (available != 0) break;
+      if (std::chrono::steady_clock::now() >= deadline) return StdinRead::Timeout;
+      Sleep(1);
+    }
+  }
+  char buffer[8192];
+  DWORD read = 0;
+  // Qualified: this translation unit has its own ReadFile, which reads a whole
+  // file by path.
+  if (::ReadFile(handle, buffer, static_cast<DWORD>(sizeof(buffer)), &read,
+                 nullptr) == 0) {
+    return StdinRead::End;
+  }
+  if (read == 0) return StdinRead::End;
+  out->assign(buffer, read);
+  return StdinRead::Bytes;
+#else
+  struct pollfd watched {};
+  watched.fd = STDIN_FILENO;
+  watched.events = POLLIN;
+  const int ready = poll(&watched, 1, static_cast<int>(timeout_milliseconds));
+  if (ready == 0) return StdinRead::Timeout;
+  if (ready < 0) return errno == EINTR ? StdinRead::Timeout : StdinRead::End;
+  char buffer[8192];
+  const ssize_t read_bytes = read(STDIN_FILENO, buffer, sizeof(buffer));
+  if (read_bytes == 0) return StdinRead::End;
+  if (read_bytes < 0) {
+    return (errno == EINTR || errno == EAGAIN) ? StdinRead::Timeout : StdinRead::End;
+  }
+  out->assign(buffer, static_cast<size_t>(read_bytes));
+  return StdinRead::Bytes;
+#endif
+}
+
+/// Backs `process.stdin.setRawMode`.
+void StdinSetRawMode(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  const bool enable = info.Length() > 0 && info[0]->BooleanValue(isolate);
+  info.GetReturnValue().Set(SetStdinRawMode(enable));
+}
+
+/// Backs the stdin pump. Returns the bytes read, an empty array when the wait
+/// expired with nothing to show for it, or null at end of input.
+void StdinRead(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  double requested = info.Length() > 0 ? info[0]->NumberValue(context).FromMaybe(0) : 0;
+  if (!std::isfinite(requested) || requested < 0) requested = 0;
+  const uint32_t timeout = static_cast<uint32_t>(std::min(requested, 60000.0));
+
+  std::string bytes;
+  switch (ReadStdin(timeout, &bytes)) {
+    case StdinRead::End:
+      info.GetReturnValue().SetNull();
+      return;
+    case StdinRead::Timeout:
+      // Undefined rather than an empty array: the pump asks about fifty times
+      // a second while a prompt waits, and every empty array was a buffer, a
+      // backing store, and a typed array for the collector to walk.
+      info.GetReturnValue().SetUndefined();
+      return;
+    case StdinRead::Bytes:
+      break;
+  }
+  v8::Local<v8::ArrayBuffer> buffer = v8::ArrayBuffer::New(isolate, bytes.size());
+  std::memcpy(buffer->Data(), bytes.data(), bytes.size());
+  info.GetReturnValue().Set(v8::Uint8Array::New(buffer, 0, bytes.size()));
+}
+
 /// Backs process.exit.
 ///
 /// Terminates immediately like Node's, rather than unwinding: callers use it
@@ -907,6 +1294,8 @@ void ProcessExit(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::Local<v8::Context> context = isolate->GetCurrentContext();
   const int code =
       info.Length() == 0 ? 0 : info[0]->Int32Value(context).FromMaybe(0);
+  // Before the terminate below, which runs nothing else.
+  RestoreTerminalMode();
   std::fflush(stdout);
   std::fflush(stderr);
 #if defined(_WIN32)
@@ -1045,12 +1434,15 @@ void SpawnSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
   const std::string cwd = info.Length() > 2 && info[2]->IsString()
                               ? ToUtf8(isolate, info[2])
                               : std::string();
+  // The caller has already built the command line the way the child expects.
+  const int verbatim =
+      info.Length() > 3 && info[3]->BooleanValue(isolate) ? 1 : 0;
   char error[1024] = {};
   void* raw = sako_process_spawn_sync(
       {reinterpret_cast<const uint8_t*>(executable.data()), executable.size()},
       arguments.data(), arguments.size(),
-      {reinterpret_cast<const uint8_t*>(cwd.data()), cwd.size()}, error,
-      sizeof(error));
+      {reinterpret_cast<const uint8_t*>(cwd.data()), cwd.size()}, verbatim,
+      error, sizeof(error));
   if (raw == nullptr) {
     isolate->ThrowException(v8::Exception::Error(
         v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
@@ -1255,15 +1647,20 @@ void ConsoleLog(const v8::FunctionCallbackInfo<v8::Value>& info) {
   v8::HandleScope scope(isolate);
   v8::Local<v8::Context> context = isolate->GetCurrentContext();
 
+  // Assembled first and written once. Writing each argument, each separator,
+  // and the newline separately meant a `--workers=N` run could interleave two
+  // workers' lines -- the text of one landing between the text and the newline
+  // of another. It is also three to four fewer write calls per line.
+  std::string line;
   for (int index = 0; index < info.Length(); ++index) {
-    if (index != 0) WriteStdout(" ", 1);
+    if (index != 0) line.push_back(' ');
     v8::Local<v8::String> text;
     if (info[index]->ToString(context).ToLocal(&text)) {
-      const std::string utf8 = ToUtf8(isolate, text);
-      WriteStdout(utf8.data(), utf8.size());
+      line += ToUtf8(isolate, text);
     }
   }
-  WriteStdout("\n", 1);
+  line.push_back('\n');
+  WriteStdout(line.data(), line.size());
 }
 
 void ThrowTypeError(v8::Isolate* isolate, const char* message) {
@@ -1783,33 +2180,77 @@ void RealPathSync(const v8::FunctionCallbackInfo<v8::Value>& info) {
           .ToLocalChecked());
 }
 
-void ProcessCwd(const v8::FunctionCallbackInfo<v8::Value>& info) {
+bool ReadCurrentDirectory(std::string* output) {
 #if defined(_WIN32)
   const DWORD required = GetCurrentDirectoryW(0, nullptr);
   std::wstring path(required, L'\0');
   const DWORD written =
       required == 0 ? 0 : GetCurrentDirectoryW(required, path.data());
-  if (written == 0) {
-    ThrowFileError(info.GetIsolate(), "read current directory", {});
-    return;
-  }
+  if (written == 0) return false;
   path.resize(written);
-  const std::string utf8 = WideToUtf8(path);
+  *output = WideToUtf8(path);
 #else
   std::string utf8;
   utf8.resize(4096);
   while (getcwd(utf8.data(), utf8.size()) == nullptr) {
-    if (errno != ERANGE) {
-      ThrowFileError(info.GetIsolate(), "read current directory", {});
-      return;
-    }
+    if (errno != ERANGE) return false;
     utf8.resize(utf8.size() * 2);
   }
   utf8.resize(std::strlen(utf8.c_str()));
+  *output = std::move(utf8);
 #endif
+  return true;
+}
+
+void ProcessCwd(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  std::string utf8;
+  if (!ReadCurrentDirectory(&utf8)) {
+    ThrowFileError(info.GetIsolate(), "read current directory", {});
+    return;
+  }
   info.GetReturnValue().Set(
       v8::String::NewFromUtf8(info.GetIsolate(), utf8.data(),
                               v8::NewStringType::kNormal,
+                              static_cast<int>(utf8.size()))
+          .ToLocalChecked());
+}
+
+/// Changes the working directory, and the copy of it the path helpers read.
+///
+/// `__sakoCwd` is a global rather than a call because `path.resolve` reads it
+/// on every join. Leaving it stale after a chdir would make every relative
+/// path resolve against the directory the program started in -- which is
+/// exactly what a scaffolding tool does not want, having just chdir'd into the
+/// project it created.
+void ProcessChdir(const v8::FunctionCallbackInfo<v8::Value>& info) {
+  v8::Isolate* isolate = info.GetIsolate();
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  const std::filesystem::path target = CallbackPath(info);
+  if (target.empty()) {
+    ThrowTypeError(isolate, "chdir needs a string path");
+    return;
+  }
+#if defined(_WIN32)
+  // Deliberately not the extended-length form. A working directory cannot
+  // exceed MAX_PATH anyway, and the extended-length prefix would survive
+  // through GetCurrentDirectoryW into every child's inherited cwd --
+  // where cmd.exe refuses it outright and falls back to the Windows
+  // directory.
+  if (SetCurrentDirectoryW(target.native().c_str()) == 0) {
+    ThrowFileError(isolate, "chdir", target);
+    return;
+  }
+#else
+  if (chdir(target.c_str()) != 0) {
+    ThrowFileError(isolate, "chdir", target);
+    return;
+  }
+#endif
+  std::string utf8;
+  if (!ReadCurrentDirectory(&utf8)) return;
+  (void)context->Global()->Set(
+      context, v8::String::NewFromUtf8Literal(isolate, "__sakoCwd"),
+      v8::String::NewFromUtf8(isolate, utf8.data(), v8::NewStringType::kNormal,
                               static_cast<int>(utf8.size()))
           .ToLocalChecked());
 }
@@ -2662,6 +3103,8 @@ class Runtime {
         {"__sakoReadSync", ReadSync},
         {"__sakoWriteSync", WriteSync},
         {"__sakoIsTty", IsTty},
+        {"__sakoStdinRead", StdinRead},
+        {"__sakoStdinSetRawMode", StdinSetRawMode},
         {"__sakoResolveHost", ResolveHost},
         {"__sakoSpawnSync", SpawnSync},
         {"__sakoFetchSync", FetchSync},
@@ -4225,8 +4668,10 @@ class Runtime {
       return false;
     }
     v8::Local<v8::Function> cwd;
+    v8::Local<v8::Function> chdir;
     v8::Local<v8::Value> next_tick;
     if (!v8::Function::New(context, ProcessCwd).ToLocal(&cwd) ||
+        !v8::Function::New(context, ProcessChdir).ToLocal(&chdir) ||
         !context->Global()
              ->Get(context,
                    v8::String::NewFromUtf8Literal(isolate_, "queueMicrotask"))
@@ -4263,6 +4708,7 @@ class Runtime {
     const bool installed = Set(context, process, "argv", arguments) &&
            Set(context, process, "execPath", executable) &&
            Set(context, process, "cwd", cwd) &&
+           Set(context, process, "chdir", chdir) &&
            Set(context, process, "nextTick", next_tick) &&
            Set(context, process, "stdout", stdout_stream) &&
            Set(context, process, "stderr", stderr_stream) &&
@@ -5563,6 +6009,8 @@ const intptr_t* Runtime::ExternalReferences() {
       reinterpret_cast<intptr_t>(&WriteStandard),
       reinterpret_cast<intptr_t>(&TerminalSize),
       reinterpret_cast<intptr_t>(&IsTty),
+      reinterpret_cast<intptr_t>(&StdinRead),
+      reinterpret_cast<intptr_t>(&StdinSetRawMode),
       reinterpret_cast<intptr_t>(&ProcessExit),
       // Text encoding.
       reinterpret_cast<intptr_t>(&EncodeUtf8),
@@ -5710,6 +6158,24 @@ extern "C" void sako_v8_runtime_delete(void* runtime) {
   delete static_cast<Runtime*>(runtime);
 }
 
+/// Puts the terminal back before the process ends.
+///
+/// `process.exit` already does this on its own way out, but a script that
+/// simply returns leaves through the CLI instead, and that path terminates
+/// too -- no destructor between a prompt in raw mode and a shell that has lost
+/// its echo. Safe to call when raw mode was never entered.
+extern "C" void sako_v8_restore_terminal() { RestoreTerminalMode(); }
+
+/// Records the console output code page the CLI switched away from, so the
+/// exit paths that never return can put it back.
+extern "C" void sako_v8_remember_output_code_page(unsigned int code_page) {
+#if defined(_WIN32)
+  g_saved_output_code_page = code_page;
+#else
+  (void)code_page;
+#endif
+}
+
 #if defined(SAKO_SNAPSHOT_GENERATOR)
 
 // --- Build-time context snapshot generator ---------------------------------
@@ -5789,7 +6255,7 @@ int sako_dns_resolve(SakoNativeBytes, int, char*, size_t, char*, size_t) {
   SAKO_SNAPSHOT_STUB(sako_dns_resolve);
 }
 void* sako_process_spawn_sync(SakoNativeBytes, const SakoNativeBytes*, size_t,
-                              SakoNativeBytes, char*, size_t) {
+                              SakoNativeBytes, int, char*, size_t) {
   SAKO_SNAPSHOT_STUB(sako_process_spawn_sync);
 }
 int sako_process_output_status(const void*) {
@@ -5861,7 +6327,7 @@ constexpr const char* kRequiredGlobals[] = {
     "AbortController", "performance",       "__sakoPlatform",
     "__sakoBuiltins", "__sakoProcessExtras", "__sakoReadFileSync",
     "__sakoIsTty",   "__sakoWriteStandard", "__sakoCreateRequire",
-    "__sakoHttpListen",
+    "__sakoHttpListen", "__sakoStdinRead",    "__sakoStdinSetRawMode",
 };
 
 // Names the snapshot must not carry. Each describes one execution rather than

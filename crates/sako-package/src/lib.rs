@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
@@ -13,10 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::read::GzDecoder;
-use sako_process::spawn_native_with_bounded_output;
+use sako_process::spawn_native_with_bounded_output_in;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha384, Sha512};
 
 const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 const SAKO_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -68,6 +69,7 @@ fn link_binaries(node_modules: &Path) -> Result<(), PackageError> {
         }
     }
 
+    let mut linked: HashSet<String> = HashSet::new();
     for package in packages {
         let manifest_path = package.join("package.json");
         let Ok(source) = fs::read_to_string(&manifest_path) else {
@@ -87,7 +89,84 @@ fn link_binaries(node_modules: &Path) -> Result<(), PackageError> {
             }
             fs::create_dir_all(&bin_dir)?;
             write_binary_shim(&bin_dir, &command, &target)?;
+            linked.insert(command);
         }
+    }
+    link_node_shim(&bin_dir, &mut linked)?;
+    prune_binary_shims(&bin_dir, &linked)?;
+    Ok(())
+}
+
+/// Puts a `node` on PATH that is this runtime.
+///
+/// Published lifecycle scripts say `node install.js` in plain text --
+/// esbuild's does, and it is one of the first things a Vite project installs.
+/// Sako is not Node and there may be no Node on the machine at all, so without
+/// this the script simply fails. The shim is only written when nothing else
+/// claimed the name, so a project that really does depend on a `node` package
+/// keeps its own.
+fn link_node_shim(bin_dir: &Path, linked: &mut HashSet<String>) -> Result<(), PackageError> {
+    if linked.contains("node") || !bin_dir.is_dir() {
+        return Ok(());
+    }
+    let executable = env::current_exe()
+        .ok()
+        .unwrap_or_else(|| PathBuf::from("sako"));
+    // Not written through write_binary_shim: that one forwards a *script* path
+    // to Sako, while this has to forward the caller's own arguments.
+    let posix = format!(
+        "#!/bin/sh\nexec \"${{SAKO_EXECUTABLE:-{}}}\" \"$@\"\n",
+        executable.display().to_string().replace('\\', "/"),
+    );
+    let posix_path = bin_dir.join("node");
+    fs::write(&posix_path, posix)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&posix_path, fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(windows)]
+    fs::write(
+        bin_dir.join("node.cmd"),
+        "@ECHO off\r\n\
+         SETLOCAL\r\n\
+         IF DEFINED SAKO_EXECUTABLE (SET \"_sako=%SAKO_EXECUTABLE%\") ELSE (SET \"_sako=sako\")\r\n\
+         \"%_sako%\" %*\r\n\
+         EXIT /B %ERRORLEVEL%\r\n",
+    )?;
+    linked.insert("node".into());
+    Ok(())
+}
+
+/// Removes shims for packages that are no longer installed.
+///
+/// Linking only ever added before, so removing a package left a live shim
+/// pointing at a deleted file -- and `sako x <name>` then failed inside the
+/// shim rather than saying the tool was gone.
+fn prune_binary_shims(bin_dir: &Path, linked: &HashSet<String>) -> Result<(), PackageError> {
+    let Ok(entries) = fs::read_dir(bin_dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // `tsc` and `tsc.cmd` are one command; either spelling keeps both.
+        let stem = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_owned();
+        let name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_owned();
+        if linked.contains(&stem) || linked.contains(&name) {
+            continue;
+        }
+        fs::remove_file(&path)?;
     }
     Ok(())
 }
@@ -142,11 +221,15 @@ fn write_binary_shim(bin_dir: &Path, command: &str, target: &Path) -> Result<(),
     #[cfg(windows)]
     {
         let windows_target = relative.replace('/', "\\");
+        // EXIT /B carries the tool's exit code out of the SETLOCAL scope. Without
+        // it a failing linter or type-check inside `sako run` reported success,
+        // because cmd.exe reports the last *statement* rather than the child.
         let cmd = format!(
             "@ECHO off\r\n\
              SETLOCAL\r\n\
              IF DEFINED SAKO_EXECUTABLE (SET \"_sako=%SAKO_EXECUTABLE%\") ELSE (SET \"_sako=sako\")\r\n\
-             \"%_sako%\" \"%~dp0{windows_target}\" %*\r\n"
+             \"%_sako%\" \"%~dp0{windows_target}\" %*\r\n\
+             EXIT /B %ERRORLEVEL%\r\n"
         );
         fs::write(bin_dir.join(format!("{command}.cmd")), cmd)?;
     }
@@ -630,6 +713,9 @@ impl PackageManager {
             )?;
         }
         for (name, requirement) in optional_dependencies {
+            if self.built_for_another_platform(&name, &requirement) {
+                continue;
+            }
             if let Err(error) = self.install_dependency(
                 &name,
                 &requirement,
@@ -649,26 +735,37 @@ impl PackageManager {
     }
 
     pub fn add(&mut self, specifier: &str, development: bool) -> Result<(), PackageError> {
-        let (name, mut requirement) = parse_package_specifier(specifier)?;
-        if requirement == "latest" {
-            let selected = self.resolve(&name, &requirement)?;
-            requirement = format!("^{}", selected.version);
-        }
-        let mut manifest = self.read_or_create_manifest()?;
+        self.add_all(std::slice::from_ref(&specifier), development)
+    }
+
+    /// Records every specifier in package.json, then installs once.
+    ///
+    /// Adding them one at a time meant `sako add a b c` resolved and unpacked
+    /// the whole graph three times over, and printed three progress reports for
+    /// what the user asked for as one operation.
+    pub fn add_all(&mut self, specifiers: &[&str], development: bool) -> Result<(), PackageError> {
         let section = if development {
             "devDependencies"
         } else {
             "dependencies"
         };
-        let object = manifest
-            .as_object_mut()
-            .ok_or_else(|| PackageError("package.json must contain an object".into()))?;
-        let dependencies = object
-            .entry(section)
-            .or_insert_with(|| serde_json::Value::Object(Default::default()))
-            .as_object_mut()
-            .ok_or_else(|| PackageError(format!("package.json {section} must be an object")))?;
-        dependencies.insert(name, serde_json::Value::String(requirement));
+        let mut manifest = self.read_or_create_manifest()?;
+        for specifier in specifiers {
+            let (name, mut requirement) = parse_package_specifier(specifier)?;
+            if requirement == "latest" {
+                let selected = self.resolve(&name, &requirement)?;
+                requirement = format!("^{}", selected.version);
+            }
+            let object = manifest
+                .as_object_mut()
+                .ok_or_else(|| PackageError("package.json must contain an object".into()))?;
+            let dependencies = object
+                .entry(section)
+                .or_insert_with(|| serde_json::Value::Object(Default::default()))
+                .as_object_mut()
+                .ok_or_else(|| PackageError(format!("package.json {section} must be an object")))?;
+            dependencies.insert(name, serde_json::Value::String(requirement));
+        }
         self.write_manifest(&manifest)?;
         self.install()
     }
@@ -736,6 +833,12 @@ impl PackageManager {
             )));
         }
         let package = self.resolve(name, requirement)?;
+        if !package.supports_host() {
+            return Err(PackageError(format!(
+                "{}@{} is not built for {HOST_OS}-{HOST_CPU}",
+                package.name, package.version
+            )));
+        }
         validate_sako_engine(
             &format!("{}@{}", package.name, package.version),
             &package.engines,
@@ -746,34 +849,14 @@ impl PackageManager {
         }
 
         let destination = package_install_path(parent_node_modules, name)?;
-        let (archive, downloaded) = self.fetch_archive(&package.dist)?;
-        extract_archive(&archive, &destination)?;
-        self.report(ProgressEvent::Installed {
-            name: &package.name,
-            version: &package.version,
-            downloaded,
-        });
-
-        self.installed.insert(
-            lock_path.into(),
-            LockedPackage {
-                name: package.name.clone(),
-                version: package.version.clone(),
-                resolved: package.dist.tarball.clone(),
-                integrity: package.dist.integrity.clone(),
-                dependencies: package.dependencies.clone(),
-                optional_dependencies: package.optional_dependencies.clone(),
-                peer_dependencies: package.peer_dependencies.clone(),
-                optional_peers: package
-                    .peer_dependencies_meta
-                    .iter()
-                    .filter(|(_, metadata)| metadata.optional)
-                    .map(|(name, _)| name.clone())
-                    .collect(),
-                scripts: package.scripts.clone(),
-                engines: package.engines.clone(),
-            },
-        );
+        let outcome = self.unpack_dependency(&package, &destination, lock_path);
+        // Whatever happened, this position is finished with the identity. It
+        // used to stay in `active` on the way out through `?`, and since a
+        // failed optional dependency is only warned about, the next position
+        // that needed the same package took the "already active" path and was
+        // left with no directory at all.
+        self.active.remove(&identity);
+        outcome?;
 
         let child_node_modules = destination.join("node_modules");
         for (dependency, child_requirement) in package.dependencies.clone() {
@@ -786,6 +869,9 @@ impl PackageManager {
             )?;
         }
         for (dependency, child_requirement) in package.optional_dependencies.clone() {
+            if self.built_for_another_platform(&dependency, &child_requirement) {
+                continue;
+            }
             let child_lock_path = format!("{lock_path}/node_modules/{dependency}");
             if let Err(error) = self.install_dependency(
                 &dependency,
@@ -793,13 +879,74 @@ impl PackageManager {
                 &child_node_modules,
                 &child_lock_path,
             ) {
-                self.warn(&format!("skipping optional dependency {dependency}: {error}"));
+                self.warn(&format!(
+                    "skipping optional dependency {dependency}: {error}"
+                ));
             }
         }
         if !self.ignore_scripts {
-            run_lifecycle_scripts(&destination, &package.scripts)?;
+            // A postinstall routinely calls a tool the package itself depends
+            // on, so this package's own node_modules/.bin has to exist before
+            // the script runs. Linking used to happen once, at the project
+            // root, after every script had already been and gone.
+            link_binaries(&child_node_modules)?;
+            let scripts = self
+                .installed
+                .get(lock_path)
+                .map(|installed| installed.scripts.clone())
+                .unwrap_or_default();
+            run_lifecycle_scripts(&destination, &scripts, &self.root)?;
         }
-        self.active.remove(&identity);
+        Ok(())
+    }
+
+    /// Fetches, unpacks, and records one package.
+    ///
+    /// Split out so the caller can release the in-progress marker on the way
+    /// out whether this succeeded or not, and so a failure leaves nothing
+    /// half-written: an optional dependency that fails is only warned about,
+    /// and the debris it left behind used to stay in node_modules looking like
+    /// a working install.
+    fn unpack_dependency(
+        &mut self,
+        package: &PackageVersion,
+        destination: &Path,
+        lock_path: &str,
+    ) -> Result<(), PackageError> {
+        let checksum = package.dist.checksum().map_err(|error| {
+            PackageError(format!("{}@{}: {error}", package.name, package.version))
+        })?;
+        let (archive, downloaded) = self.fetch_archive(&package.dist.tarball, &checksum)?;
+        if let Err(error) = extract_archive(&archive, destination) {
+            let _ = fs::remove_dir_all(destination);
+            return Err(error);
+        }
+        self.report(ProgressEvent::Installed {
+            name: &package.name,
+            version: &package.version,
+            downloaded,
+        });
+
+        self.installed.insert(
+            lock_path.into(),
+            LockedPackage {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                resolved: package.dist.tarball.clone(),
+                integrity: checksum.to_integrity(),
+                dependencies: package.dependencies.clone(),
+                optional_dependencies: package.optional_dependencies.clone(),
+                peer_dependencies: package.peer_dependencies.clone(),
+                optional_peers: package
+                    .peer_dependencies_meta
+                    .iter()
+                    .filter(|(_, metadata)| metadata.optional)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+                scripts: installed_scripts(package, destination),
+                engines: package.engines.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -848,17 +995,22 @@ impl PackageManager {
             )?;
         }
         for (dependency, requirement) in workspace.optional_dependencies.clone() {
+            if self.built_for_another_platform(&dependency, &requirement) {
+                continue;
+            }
             if let Err(error) = self.install_dependency(
                 &dependency,
                 &requirement,
                 &child_node_modules,
                 &format!("{lock_path}/node_modules/{dependency}"),
             ) {
-                self.warn(&format!("skipping optional dependency {dependency}: {error}"));
+                self.warn(&format!(
+                    "skipping optional dependency {dependency}: {error}"
+                ));
             }
         }
         if !self.ignore_scripts {
-            run_lifecycle_scripts(&destination, &workspace.scripts)?;
+            run_lifecycle_scripts(&destination, &workspace.scripts, &self.root)?;
         }
         self.active.remove(&identity);
         Ok(())
@@ -874,8 +1026,17 @@ impl PackageManager {
             return Ok(false);
         }
         let source = fs::read_to_string(&path)?;
-        let lockfile: Lockfile = serde_json::from_str(&source)
-            .map_err(|error| PackageError(format!("invalid {}: {error}", path.display())))?;
+        // A lockfile is a cache, not a source of truth: one written by a
+        // different version, or half-written by an interrupted install, used to
+        // abort the install outright when resolving from package.json would
+        // have produced a correct tree and a fresh lockfile.
+        let lockfile: Lockfile = match serde_json::from_str(&source) {
+            Ok(lockfile) => lockfile,
+            Err(error) => {
+                self.warn(&format!("ignoring {}: {error}", path.display()));
+                return Ok(false);
+            }
+        };
         if lockfile.lockfile_version != 2
             || !lock_matches_manifest(&lockfile, root_dependencies, root_optional_dependencies)
         {
@@ -885,7 +1046,11 @@ impl PackageManager {
         self.report(ProgressEvent::Planned {
             total: lockfile.packages.len(),
         });
-        self.installed = lockfile.packages.clone();
+        // Filled by the walk below rather than copied wholesale, so it ends up
+        // describing what is on disk. Copying meant a package the manifest no
+        // longer asks for -- one just removed -- stayed in the lockfile and in
+        // the count reported at the end, describing a tree that was not there.
+        self.installed.clear();
         self.active.clear();
         let node_modules = self.root.join("node_modules");
         fs::create_dir_all(&node_modules)?;
@@ -906,6 +1071,12 @@ impl PackageManager {
             }
         }
         validate_peer_dependencies(&self.installed)?;
+        // Keys, because LockedPackage carries no equality and the question is
+        // only which packages the tree actually holds. Both maps are ordered,
+        // so this compares the sets.
+        if self.installed.keys().ne(lockfile.packages.keys()) {
+            self.write_lockfile()?;
+        }
         Ok(true)
     }
 
@@ -922,6 +1093,10 @@ impl PackageManager {
             &format!("{}@{}", package.name, package.version),
             &package.engines,
         )?;
+        // Recorded before the cycle guard below, so a position the guard skips
+        // still keeps its lockfile entry: dropping it would make the next
+        // install report a missing transitive dependency.
+        self.installed.insert(lock_path.into(), package.clone());
         let identity = format!("{}@{}", package.name, package.version);
         if !self.active.insert(identity.clone()) {
             return Ok(());
@@ -945,10 +1120,10 @@ impl PackageManager {
                 downloaded: false,
             });
         } else {
-            let (archive, downloaded) = self.fetch_archive(&Distribution {
-                tarball: package.resolved.clone(),
-                integrity: package.integrity.clone(),
+            let checksum = Checksum::parse(&package.integrity).map_err(|error| {
+                PackageError(format!("{}@{}: {error}", package.name, package.version))
             })?;
+            let (archive, downloaded) = self.fetch_archive(&package.resolved, &checksum)?;
             extract_archive(&archive, &destination)?;
             self.report(ProgressEvent::Installed {
                 name: &package.name,
@@ -973,14 +1148,31 @@ impl PackageManager {
                 && let Err(error) =
                     self.install_locked_dependency(lockfile, &child_path, &child_node_modules)
             {
-                self.warn(&format!("skipping optional dependency {dependency}: {error}"));
+                self.warn(&format!(
+                    "skipping optional dependency {dependency}: {error}"
+                ));
             }
         }
         if !self.ignore_scripts {
-            run_lifecycle_scripts(&destination, &package.scripts)?;
+            // The locked entry carries the scripts read off disk at
+            // resolution time, so a replay runs exactly what the first
+            // install did.
+            link_binaries(&child_node_modules)?;
+            run_lifecycle_scripts(&destination, &package.scripts, &self.root)?;
         }
         self.active.remove(&identity);
         Ok(())
+    }
+
+    /// Whether an optional dependency is one of the other platforms' builds.
+    ///
+    /// Not a failure and not worth a warning: shipping one narrowly-targeted
+    /// optional dependency per platform is exactly how esbuild, rollup, and
+    /// rolldown deliver native binaries, and every one of them but ours is
+    /// meant to be passed over in silence.
+    fn built_for_another_platform(&mut self, name: &str, requirement: &str) -> bool {
+        self.resolve(name, requirement)
+            .is_ok_and(|package| !package.supports_host())
     }
 
     fn resolve(&mut self, name: &str, requirement: &str) -> Result<PackageVersion, PackageError> {
@@ -1011,10 +1203,10 @@ impl PackageManager {
                     "registry metadata for {name} exceeds byte limit"
                 )));
             }
-            let metadata: Metadata = serde_json::from_slice(&bytes).map_err(|error| {
+            let raw: RawMetadata = serde_json::from_slice(&bytes).map_err(|error| {
                 PackageError(format!("invalid registry metadata for {name}: {error}"))
             })?;
-            self.metadata.insert(name.into(), metadata);
+            self.metadata.insert(name.into(), raw.into());
         }
         select_version(self.metadata.get(name).unwrap(), requirement)
     }
@@ -1024,22 +1216,24 @@ impl PackageManager {
     /// watching the install is concerned.
     fn fetch_archive(
         &self,
-        distribution: &Distribution,
+        tarball: &str,
+        expected: &Checksum,
     ) -> Result<(Vec<u8>, bool), PackageError> {
-        let expected = parse_sha512_integrity(&distribution.integrity)?;
-        let digest_hex = hex(&expected);
-        let cache_path = self
-            .cache_root
-            .join(&digest_hex[..2])
-            .join(format!("{digest_hex}.tgz"));
+        let key = expected.cache_key();
+        let cache_path = self.cache_root.join(&key[..2]).join(format!("{key}.tgz"));
         if cache_path.is_file() {
             let bytes = fs::read(&cache_path)?;
-            verify_integrity(&bytes, &expected)?;
-            return Ok((bytes, false));
+            // A cache entry that no longer matches its own name is corrupt
+            // rather than hostile, so it is replaced from the network instead
+            // of failing the install.
+            if expected.verify(&bytes).is_ok() {
+                return Ok((bytes, false));
+            }
+            let _ = fs::remove_file(&cache_path);
         }
 
         let response = self
-            .request(&distribution.tarball)
+            .request(tarball)
             .call()
             .map_err(|error| PackageError(format!("tarball download failed: {error}")))?;
         let mut bytes = Vec::new();
@@ -1050,7 +1244,7 @@ impl PackageManager {
         if bytes.len() as u64 > MAXIMUM_TARBALL_BYTES {
             return Err(PackageError("package tarball exceeds byte limit".into()));
         }
-        verify_integrity(&bytes, &expected)?;
+        expected.verify(&bytes)?;
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1340,11 +1534,52 @@ fn copy_workspace_directory(
     Ok(())
 }
 
+/// A packument exactly as the registry sent it.
+///
+/// Version entries stay unparsed here on purpose. A packument lists every
+/// version a package has ever published, and serde deserializing straight into
+/// the typed map makes the oldest, least relevant entry able to fail the whole
+/// document -- which is what `vue` did, on a 2014 release nothing was asking
+/// for.
 #[derive(Clone, Debug, Deserialize)]
-struct Metadata {
+struct RawMetadata {
     #[serde(rename = "dist-tags", default)]
     dist_tags: BTreeMap<String, String>,
+    #[serde(default)]
+    versions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Metadata {
+    dist_tags: BTreeMap<String, String>,
     versions: BTreeMap<String, PackageVersion>,
+    /// Versions this resolver could not read, and why. Kept rather than
+    /// discarded so a requirement that matches only unusable entries can say
+    /// what was wrong with them instead of claiming the version does not
+    /// exist.
+    unusable: BTreeMap<String, String>,
+}
+
+impl From<RawMetadata> for Metadata {
+    fn from(raw: RawMetadata) -> Self {
+        let mut versions = BTreeMap::new();
+        let mut unusable = BTreeMap::new();
+        for (version, entry) in raw.versions {
+            match serde_json::from_value::<PackageVersion>(entry) {
+                Ok(package) => {
+                    versions.insert(version, package);
+                }
+                Err(error) => {
+                    unusable.insert(version, error.to_string());
+                }
+            }
+        }
+        Self {
+            dist_tags: raw.dist_tags,
+            versions,
+            unusable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1352,6 +1587,23 @@ struct PackageVersion {
     name: String,
     version: String,
     dist: Distribution,
+    /// Which platforms the package is for.
+    ///
+    /// This is how esbuild and rollup ship native binaries: one optional
+    /// dependency per platform, each narrowed by `os` and `cpu`, and the
+    /// installer is expected to take only the matching one. Without the
+    /// filter a Windows install of a stock Vite project fetched and unpacked
+    /// every Linux and macOS binary too.
+    #[serde(default)]
+    os: Vec<String>,
+    #[serde(default)]
+    cpu: Vec<String>,
+    #[serde(default)]
+    libc: Vec<String>,
+    /// Set by npm's abbreviated document in place of `scripts`, which it does
+    /// not send. See `installed_scripts`.
+    #[serde(rename = "hasInstallScript", default)]
+    has_install_script: bool,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(rename = "optionalDependencies", default)]
@@ -1366,6 +1618,70 @@ struct PackageVersion {
     engines: BTreeMap<String, String>,
 }
 
+impl PackageVersion {
+    /// Whether this build is for the machine doing the installing.
+    ///
+    /// npm's rule, which the registry's metadata is written against: an empty
+    /// list means "anywhere"; an entry may be negated with a leading `!`; and a
+    /// list holding any positive entry requires one of them to match.
+    fn supports_host(&self) -> bool {
+        matches_platform(&self.os, HOST_OS)
+            && matches_platform(&self.cpu, HOST_CPU)
+            && matches_platform(&self.libc, HOST_LIBC)
+    }
+}
+
+/// npm's spelling of the current platform, which is Node's rather than Rust's.
+const HOST_OS: &str = if cfg!(target_os = "windows") {
+    "win32"
+} else if cfg!(target_os = "macos") {
+    "darwin"
+} else {
+    std::env::consts::OS
+};
+const HOST_CPU: &str = if cfg!(target_arch = "x86_64") {
+    "x64"
+} else if cfg!(target_arch = "aarch64") {
+    "arm64"
+} else if cfg!(target_arch = "x86") {
+    "ia32"
+} else {
+    std::env::consts::ARCH
+};
+/// Only meaningful on Linux; elsewhere no package narrows by it, so an empty
+/// name simply never matches a positive list -- and never needs to.
+const HOST_LIBC: &str = if cfg!(target_env = "musl") {
+    "musl"
+} else if cfg!(target_os = "linux") {
+    "glibc"
+} else {
+    ""
+};
+
+fn matches_platform(allowed: &[String], host: &str) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let mut positive = false;
+    for entry in allowed {
+        match entry.strip_prefix('!') {
+            Some(excluded) => {
+                if excluded == host {
+                    return false;
+                }
+            }
+            None => {
+                positive = true;
+                if entry == host {
+                    return true;
+                }
+            }
+        }
+    }
+    // Only exclusions, none of which matched.
+    !positive
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct PeerDependencyMetadata {
     #[serde(default)]
@@ -1375,7 +1691,25 @@ struct PeerDependencyMetadata {
 #[derive(Clone, Debug, Deserialize)]
 struct Distribution {
     tarball: String,
-    integrity: String,
+    /// Absent on everything published before npm 5, and on some private
+    /// registries to this day; `shasum` is the fallback those still carry.
+    #[serde(default)]
+    integrity: Option<String>,
+    #[serde(default)]
+    shasum: Option<String>,
+}
+
+impl Distribution {
+    fn checksum(&self) -> Result<Checksum, PackageError> {
+        match (&self.integrity, &self.shasum) {
+            (Some(integrity), _) if !integrity.is_empty() => Checksum::parse(integrity),
+            (_, Some(shasum)) if !shasum.is_empty() => Checksum::from_shasum(shasum),
+            _ => Err(PackageError(format!(
+                "the registry published {} without a checksum",
+                self.tarball
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1391,6 +1725,7 @@ struct LockedPackage {
     version: String,
     resolved: String,
     integrity: String,
+    #[serde(default)]
     dependencies: BTreeMap<String, String>,
     #[serde(default)]
     optional_dependencies: BTreeMap<String, String>,
@@ -1513,7 +1848,20 @@ fn normalize_npm_range(requirement: &str) -> Result<String, PackageError> {
 }
 
 fn normalize_npm_comparator(comparator: &str) -> String {
-    let comparator = comparator.replace(['x', 'X'], "*");
+    // Only an `x` standing in for a whole version part is a wildcard. A blanket
+    // replace also rewrote the letters inside prerelease and build identifiers,
+    // so `1.0.0-next` became `1.0.0-ne*t` and matched nothing.
+    let comparator = comparator
+        .split_inclusive('.')
+        .map(|part| {
+            let (digits, separator) = match part.strip_suffix('.') {
+                Some(digits) => (digits, "."),
+                None => (part, ""),
+            };
+            let wildcard = matches!(digits, "x" | "X" | "*");
+            format!("{}{separator}", if wildcard { "*" } else { digits })
+        })
+        .collect::<String>();
     if comparator == "*"
         || comparator.starts_with(['>', '<', '=', '~', '^'])
         || comparator.contains('*')
@@ -1643,10 +1991,19 @@ fn lock_has_ancestor_dependency(
 
 fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersion, PackageError> {
     if let Some(version) = metadata.dist_tags.get(requirement) {
-        return metadata.versions.get(version).cloned().ok_or_else(|| {
-            PackageError(format!(
+        if let Some(package) = metadata.versions.get(version) {
+            return Ok(package.clone());
+        }
+        // "missing" is the wrong word when the version is right there in the
+        // packument and was only dropped because this resolver could not read
+        // it. Say which, and why.
+        return Err(match metadata.unusable.get(version) {
+            Some(reason) => PackageError(format!(
+                "dist-tag '{requirement}' points at {version}, which the registry described in a way Sako cannot read: {reason}"
+            )),
+            None => PackageError(format!(
                 "dist-tag '{requirement}' points to a missing version"
-            ))
+            )),
         });
     }
     let requirement = if requirement.is_empty() {
@@ -1670,7 +2027,38 @@ fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersi
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, package)| package.clone())
-        .ok_or_else(|| PackageError(format!("no version satisfies '{requirement}'")))
+        .ok_or_else(|| unsatisfied_requirement(metadata, requirement))
+}
+
+/// Explains a requirement that matched nothing.
+///
+/// Dropping an unreadable version entry keeps one bad record from failing a
+/// whole packument, but it must not turn into a silent lie: if the version the
+/// caller wanted is exactly one of the entries that was dropped, say so and
+/// say why, rather than reporting it as never published.
+fn unsatisfied_requirement(metadata: &Metadata, requirement: &str) -> PackageError {
+    let mut message = format!("no version satisfies '{requirement}'");
+    let Ok(parsed) = npm_version_requirements(requirement) else {
+        return PackageError(message);
+    };
+    let mut blocked = metadata.unusable.iter().filter(|(version, _)| {
+        Version::parse(version)
+            .is_ok_and(|version| parsed.iter().any(|range| range.matches(&version)))
+    });
+    if let Some((version, reason)) = blocked.next() {
+        let others = blocked.count();
+        message.push_str(&format!(
+            "
+       {version} would have matched, but the registry described it in a way Sako cannot read: {reason}"
+        ));
+        if others > 0 {
+            message.push_str(&format!(
+                "
+       ({others} more like it)"
+            ));
+        }
+    }
+    PackageError(message)
 }
 
 fn parse_package_specifier(specifier: &str) -> Result<(String, String), PackageError> {
@@ -1734,25 +2122,124 @@ fn package_install_path(node_modules: &Path, name: &str) -> Result<PathBuf, Pack
     Ok(path)
 }
 
-fn parse_sha512_integrity(integrity: &str) -> Result<Vec<u8>, PackageError> {
-    integrity
-        .split_ascii_whitespace()
-        .find_map(|token| token.strip_prefix("sha512-"))
-        .ok_or_else(|| PackageError("package does not provide sha512 integrity".into()))
-        .and_then(|encoded| {
-            BASE64
-                .decode(encoded)
-                .map_err(|error| PackageError(format!("invalid package integrity: {error}")))
-        })
+/// The hash algorithms a registry may name in a Subresource Integrity string.
+///
+/// Ordered weakest to strongest so `max` picks the best one on offer: npm
+/// publishes several for the same tarball and the choice should not depend on
+/// the order they happen to appear in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Algorithm {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
-fn verify_integrity(bytes: &[u8], expected: &[u8]) -> Result<(), PackageError> {
-    let actual = Sha512::digest(bytes);
-    if actual.as_slice() == expected {
-        Ok(())
-    } else {
-        Err(PackageError("package integrity verification failed".into()))
+impl Algorithm {
+    fn from_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "sha1" => Some(Self::Sha1),
+            "sha256" => Some(Self::Sha256),
+            "sha384" => Some(Self::Sha384),
+            "sha512" => Some(Self::Sha512),
+            _ => None,
+        }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    fn digest(self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Sha1 => Sha1::digest(bytes).to_vec(),
+            Self::Sha256 => Sha256::digest(bytes).to_vec(),
+            Self::Sha384 => Sha384::digest(bytes).to_vec(),
+            Self::Sha512 => Sha512::digest(bytes).to_vec(),
+        }
+    }
+}
+
+/// One tarball checksum: an algorithm and the digest it produced.
+///
+/// npm has published `dist.integrity` since 2017, but the registry still
+/// serves the packages from before then with only `dist.shasum`, a bare hex
+/// SHA-1. Demanding SHA-512 rejected those, and because a packument carries
+/// every version a package has ever had, one ancient entry failed the whole
+/// document -- which is why `sako install` could not read `vue` at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Checksum {
+    algorithm: Algorithm,
+    digest: Vec<u8>,
+}
+
+impl Checksum {
+    /// Parses the strongest hash out of a Subresource Integrity string.
+    ///
+    /// The format allows several space-separated entries and per-entry options
+    /// after a `?`, both of which npm itself emits, so neither can be assumed
+    /// away. Unknown algorithms are skipped rather than rejected: a registry
+    /// adding one should not stop an install that already has a usable hash.
+    fn parse(integrity: &str) -> Result<Self, PackageError> {
+        integrity
+            .split_ascii_whitespace()
+            .filter_map(|token| {
+                let (prefix, encoded) = token.split_once('-')?;
+                let algorithm = Algorithm::from_prefix(prefix)?;
+                let encoded = encoded.split('?').next().unwrap_or(encoded);
+                let digest = BASE64.decode(encoded).ok()?;
+                (digest.len() == algorithm.digest(b"").len()).then_some(Self { algorithm, digest })
+            })
+            .max_by_key(|checksum| checksum.algorithm)
+            .ok_or_else(|| PackageError(format!("no usable checksum in integrity '{integrity}'")))
+    }
+
+    /// Reads npm's legacy `dist.shasum`: SHA-1 as forty hex digits.
+    fn from_shasum(shasum: &str) -> Result<Self, PackageError> {
+        let digest = decode_hex(shasum).filter(|digest| digest.len() == 20);
+        digest
+            .map(|digest| Self {
+                algorithm: Algorithm::Sha1,
+                digest,
+            })
+            .ok_or_else(|| PackageError(format!("invalid package shasum '{shasum}'")))
+    }
+
+    /// The Subresource Integrity spelling, which is what goes in the lockfile
+    /// so a replay verifies against exactly what resolution did.
+    fn to_integrity(&self) -> String {
+        format!("{}-{}", self.algorithm.name(), BASE64.encode(&self.digest))
+    }
+
+    /// Names the cache entry. Every algorithm produces a different digest
+    /// length, so one flat namespace cannot collide across them.
+    fn cache_key(&self) -> String {
+        hex(&self.digest)
+    }
+
+    fn verify(&self, bytes: &[u8]) -> Result<(), PackageError> {
+        if self.algorithm.digest(bytes) == self.digest {
+            Ok(())
+        } else {
+            Err(PackageError("package integrity verification failed".into()))
+        }
+    }
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || value.is_empty() {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }
 
 fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), PackageError> {
@@ -1822,11 +2309,42 @@ fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), PackageError>
         {
             continue;
         }
+        // A hard link inside a published tarball is a duplicate of a file the
+        // archive already carries -- the way tar deduplicates identical files.
+        // Copying it reproduces what the publisher packed.
+        if entry_type.is_hard_link()
+            && let Some(link) = entry.link_name()?
+        {
+            let mut source = destination.to_path_buf();
+            for component in link.components().skip(1) {
+                match component {
+                    Component::Normal(value) => source.push(value),
+                    _ => {
+                        return Err(PackageError(format!(
+                            "unsafe tarball link target: {}",
+                            link.display()
+                        )));
+                    }
+                }
+            }
+            if !source.starts_with(destination) || !source.is_file() {
+                return Err(PackageError(format!(
+                    "tarball hard link points outside the package: {}",
+                    archive_path.display()
+                )));
+            }
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &output)?;
+            continue;
+        }
         if !(entry_type.is_file() || entry_type.is_dir()) {
-            return Err(PackageError(format!(
-                "tarball links and special files are unsupported: {}",
-                archive_path.display()
-            )));
+            // Symlinks and device nodes are dropped rather than fatal. npm
+            // publishes tarballs containing both -- a symlinked licence file is
+            // enough -- and rejecting the archive failed the whole install over
+            // an entry nothing needs to resolve.
+            continue;
         }
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
@@ -1876,9 +2394,131 @@ fn prune_store(cache_root: &Path) -> Result<(), PackageError> {
     Ok(())
 }
 
+/// The lifecycle scripts a package actually declares.
+///
+/// Not the ones the packument listed, because it lists none: the abbreviated
+/// document Sako asks for (`application/vnd.npm.install-v1+json`) leaves
+/// `scripts` out entirely and reports only the boolean `hasInstallScript`.
+/// Reading the resolved metadata therefore found an empty map for every
+/// registry package, so no dependency's `preinstall`, `install`, or
+/// `postinstall` had ever run -- silently, since there was nothing to report.
+/// The unpacked manifest is the authority, the same way `link_binaries`
+/// already reads `bin` from it.
+fn installed_scripts(package: &PackageVersion, destination: &Path) -> BTreeMap<String, String> {
+    if !package.scripts.is_empty() {
+        return package.scripts.clone();
+    }
+    if !package.has_install_script {
+        return BTreeMap::new();
+    }
+    let Ok(source) = fs::read_to_string(destination.join("package.json")) else {
+        return BTreeMap::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&source) else {
+        return BTreeMap::new();
+    };
+    manifest
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter_map(|(name, command)| {
+                    // A non-string entry is malformed rather than fatal; npm
+                    // ignores it too.
+                    command
+                        .as_str()
+                        .map(|command| (name.clone(), command.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The environment npm gives a lifecycle script.
+///
+/// Scripts are written against it and simply fail without it. The important
+/// part is PATH: `"postinstall": "prebuild-install || node-gyp rebuild"` calls
+/// tools that live in `node_modules/.bin`, and previously the script inherited
+/// Sako's own environment unchanged, so none of them resolved. The `npm_*`
+/// variables are the other half -- packages read `npm_lifecycle_event` to tell
+/// which hook they are in, and `INIT_CWD` to find the project that pulled them
+/// in.
+fn lifecycle_environment(
+    package_root: &Path,
+    project_root: &Path,
+    event: &str,
+) -> Vec<(OsString, OsString)> {
+    let mut variables = vec![
+        (OsString::from("PATH"), script_path(package_root)),
+        (OsString::from("npm_lifecycle_event"), event.into()),
+        (OsString::from("npm_config_user_agent"), user_agent().into()),
+        (OsString::from("INIT_CWD"), project_root.into()),
+    ];
+    // The path Sako itself was launched from, so a script that re-enters the
+    // runtime gets this build rather than whichever one is on PATH -- the same
+    // contract the generated shims use.
+    if let Ok(executable) = env::current_exe() {
+        variables.push((
+            OsString::from("SAKO_EXECUTABLE"),
+            executable.clone().into_os_string(),
+        ));
+        variables.push((OsString::from("npm_execpath"), executable.into_os_string()));
+    }
+    if let Ok(source) = fs::read_to_string(package_root.join("package.json"))
+        && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&source)
+    {
+        for (key, field) in [
+            ("npm_package_name", "name"),
+            ("npm_package_version", "version"),
+        ] {
+            if let Some(value) = manifest.get(field).and_then(serde_json::Value::as_str) {
+                variables.push((OsString::from(key), value.into()));
+            }
+        }
+    }
+    variables
+}
+
+/// How Sako identifies itself to the wider npm ecosystem.
+///
+/// Initializers read this to decide which commands to print afterwards, which
+/// is why `sako create vite` used to finish by telling the user to run
+/// `npm install`. The shape is npm's: `name/version node/version platform arch`.
+pub fn user_agent() -> String {
+    format!("sako/{SAKO_VERSION} node/{SAKO_VERSION} {HOST_OS} {HOST_CPU}")
+}
+
+/// PATH with every `node_modules/.bin` from `package_root` upwards in front of
+/// it, plus the directory holding the running Sako executable.
+fn script_path(package_root: &Path) -> OsString {
+    let mut directories: Vec<PathBuf> = package_root
+        .ancestors()
+        .map(|directory| directory.join("node_modules").join(".bin"))
+        .filter(|directory| directory.is_dir())
+        .collect();
+    if let Ok(executable) = env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        directories.push(parent.to_path_buf());
+    }
+    let existing = env::var_os("PATH").unwrap_or_default();
+    match env::join_paths(directories) {
+        Ok(mut joined) if !joined.is_empty() => {
+            if !existing.is_empty() {
+                joined.push(if cfg!(windows) { ";" } else { ":" });
+                joined.push(&existing);
+            }
+            joined
+        }
+        _ => existing,
+    }
+}
+
 fn run_lifecycle_scripts(
     package_root: &Path,
     scripts: &BTreeMap<String, String>,
+    project_root: &Path,
 ) -> Result<(), PackageError> {
     for name in ["preinstall", "install", "postinstall"] {
         let Some(script) = scripts.get(name) else {
@@ -1896,11 +2536,15 @@ fn run_lifecycle_scripts(
         );
         #[cfg(unix)]
         let (shell, arguments) = ("/bin/sh", vec!["-c".to_owned(), script.to_owned()]);
-        let output = spawn_native_with_bounded_output(
+        let output = spawn_native_with_bounded_output_in(
             shell,
             &arguments,
             Some(package_root),
             MAXIMUM_SCRIPT_OUTPUT_BYTES,
+            // The arguments are built here, not by the script, so they still
+            // want the usual quoting.
+            false,
+            &lifecycle_environment(package_root, project_root, name),
         )
         .map_err(|error| PackageError(format!("cannot run {name} script: {error}")))?;
         io::stdout().write_all(&output.stdout)?;
@@ -1949,7 +2593,7 @@ mod tests {
 
     #[test]
     fn selects_highest_matching_version() {
-        let metadata: Metadata = serde_json::from_value(serde_json::json!({
+        let metadata: Metadata = serde_json::from_value::<RawMetadata>(serde_json::json!({
             "dist-tags": {"latest": "2.0.0"},
             "versions": {
                 "1.0.0": package_version("1.0.0"),
@@ -1957,7 +2601,8 @@ mod tests {
                 "2.0.0": package_version("2.0.0")
             }
         }))
-        .unwrap();
+        .unwrap()
+        .into();
         assert_eq!(
             select_version(&metadata, "^1.0.0").unwrap().version,
             "1.4.0"
@@ -1966,6 +2611,74 @@ mod tests {
             select_version(&metadata, "latest").unwrap().version,
             "2.0.0"
         );
+    }
+
+    #[test]
+    fn keeps_only_a_platform_the_host_can_run() {
+        let platform = |os: &[&str], cpu: &[&str]| {
+            serde_json::from_value::<PackageVersion>(serde_json::json!({
+                "name": "native",
+                "version": "1.0.0",
+                "dist": {"tarball": "https://example.invalid/p.tgz", "integrity": "sha512-AA=="},
+                "os": os,
+                "cpu": cpu,
+            }))
+            .unwrap()
+        };
+        assert!(platform(&[], &[]).supports_host());
+        assert!(platform(&[HOST_OS], &[HOST_CPU]).supports_host());
+        assert!(!platform(&["plan9"], &[]).supports_host());
+        assert!(!platform(&[], &["sparc"]).supports_host());
+        // A list of exclusions admits everything it does not name.
+        assert!(platform(&["!plan9"], &[]).supports_host());
+        assert!(!platform(&[&format!("!{HOST_OS}")], &[]).supports_host());
+    }
+
+    #[test]
+    fn reads_lifecycle_scripts_off_the_unpacked_package() {
+        // The abbreviated packument carries hasInstallScript instead of the
+        // scripts themselves, so the manifest on disk is the only source.
+        let root = env::temp_dir().join(format!("sako-scripts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"native","version":"1.0.0","scripts":{"postinstall":"node install.js","test":42}}"#,
+        )
+        .unwrap();
+        let abbreviated: PackageVersion = serde_json::from_value(serde_json::json!({
+            "name": "native",
+            "version": "1.0.0",
+            "dist": {"tarball": "https://example.invalid/p.tgz", "integrity": "sha512-AA=="},
+            "hasInstallScript": true,
+        }))
+        .unwrap();
+        let scripts = installed_scripts(&abbreviated, &root);
+        assert_eq!(
+            scripts.get("postinstall").map(String::as_str),
+            Some("node install.js")
+        );
+        // A non-string entry is skipped rather than failing the install.
+        assert!(!scripts.contains_key("test"));
+
+        let quiet: PackageVersion = serde_json::from_value(serde_json::json!({
+            "name": "plain",
+            "version": "1.0.0",
+            "dist": {"tarball": "https://example.invalid/p.tgz", "integrity": "sha512-AA=="},
+        }))
+        .unwrap();
+        assert!(installed_scripts(&quiet, &root).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_wildcard_is_a_whole_version_part_not_any_letter_x() {
+        assert!(requirement_matches("1.4.5", "1.4.x"));
+        assert!(requirement_matches("1.4.5", "1.4.X"));
+        // The x inside a prerelease identifier is part of the name.
+        assert_eq!(normalize_npm_comparator("1.0.0-next"), "=1.0.0-next");
+        assert_eq!(normalize_npm_comparator("1.2.x"), "1.2.*");
+        assert_eq!(normalize_npm_comparator("1.0.0-alpha.x"), "1.0.0-alpha.*");
     }
 
     #[test]
@@ -1989,9 +2702,78 @@ mod tests {
     fn verifies_sha512_integrity() {
         let bytes = b"package bytes";
         let integrity = format!("sha512-{}", BASE64.encode(Sha512::digest(bytes)));
-        let expected = parse_sha512_integrity(&integrity).unwrap();
-        assert!(verify_integrity(bytes, &expected).is_ok());
-        assert!(verify_integrity(b"changed", &expected).is_err());
+        let expected = Checksum::parse(&integrity).unwrap();
+        assert!(expected.verify(bytes).is_ok());
+        assert!(expected.verify(b"changed").is_err());
+    }
+
+    #[test]
+    fn prefers_the_strongest_hash_a_registry_offers() {
+        let bytes = b"package bytes";
+        let integrity = format!(
+            "sha1-{} sha512-{}?foo=bar sha999-nonsense",
+            BASE64.encode(Sha1::digest(bytes)),
+            BASE64.encode(Sha512::digest(bytes)),
+        );
+        let checksum = Checksum::parse(&integrity).unwrap();
+        assert_eq!(checksum.algorithm, Algorithm::Sha512);
+        assert!(checksum.verify(bytes).is_ok());
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_shasum() {
+        let bytes = b"package bytes";
+        let distribution = Distribution {
+            tarball: "https://example.invalid/package.tgz".into(),
+            integrity: None,
+            shasum: Some(hex(&Sha1::digest(bytes))),
+        };
+        let checksum = distribution.checksum().unwrap();
+        assert_eq!(checksum.algorithm, Algorithm::Sha1);
+        assert!(checksum.verify(bytes).is_ok());
+        assert!(checksum.to_integrity().starts_with("sha1-"));
+
+        let neither = Distribution {
+            tarball: "https://example.invalid/package.tgz".into(),
+            integrity: None,
+            shasum: None,
+        };
+        assert!(neither.checksum().is_err());
+    }
+
+    #[test]
+    fn one_unreadable_version_does_not_fail_the_packument() {
+        // vue's packument really does look like this: releases from before
+        // npm 5 carry a shasum and no integrity, and the 2014 entries have no
+        // dist at all worth reading.
+        let metadata: Metadata = serde_json::from_value::<RawMetadata>(serde_json::json!({
+            "dist-tags": {"latest": "3.5.41"},
+            "versions": {
+                "0.8.6": {"name": "vue", "version": "0.8.6", "dist": {
+                    "shasum": "a8d10dc5550a89db4f054da991a8f2ab7c196f55",
+                    "tarball": "https://example.invalid/vue-0.8.6.tgz"
+                }},
+                "0.0.0": {"name": "vue"},
+                "3.5.41": package_version("3.5.41")
+            }
+        }))
+        .unwrap()
+        .into();
+        assert_eq!(metadata.versions.len(), 2);
+        assert_eq!(metadata.unusable.len(), 1);
+        assert_eq!(
+            select_version(&metadata, "latest").unwrap().version,
+            "3.5.41"
+        );
+        assert_eq!(
+            select_version(&metadata, "^0.8.0")
+                .unwrap()
+                .dist
+                .checksum()
+                .unwrap()
+                .algorithm,
+            Algorithm::Sha1
+        );
     }
 
     #[test]

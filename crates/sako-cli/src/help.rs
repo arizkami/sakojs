@@ -12,11 +12,32 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct Command {
     pub name: &'static str,
+    /// Other spellings that reach this command.
+    ///
+    /// The short ones are the point: every package manager takes `i` for
+    /// install, and typing it into Sako used to produce "did you mean x?".
+    /// The first entry doubles as the one shown beside the name in the
+    /// overview, so put the shortest, most-typed spelling first.
+    pub aliases: &'static [&'static str],
     pub usage: &'static str,
     pub summary: &'static str,
     pub group: Group,
     pub details: &'static [&'static str],
     pub examples: &'static [(&'static str, &'static str)],
+}
+
+impl Command {
+    /// The name and its first alias, which is what the overview lists.
+    pub fn label(&self) -> String {
+        match self.aliases.first() {
+            Some(alias) => format!("{}, {alias}", self.name),
+            None => self.name.to_owned(),
+        }
+    }
+
+    pub fn answers_to(&self, name: &str) -> bool {
+        self.name == name || self.aliases.contains(&name)
+    }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -37,6 +58,7 @@ impl Group {
 pub const COMMANDS: &[Command] = &[
     Command {
         name: "run",
+        aliases: &["r"],
         usage: "sako run <script|name> [args...]",
         summary: "Run a file, or a script from package.json",
         group: Group::Run,
@@ -57,6 +79,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "x",
+        aliases: &["exec", "dlx"],
         usage: "sako x <command> [args...]",
         summary: "Execute a package binary, like npx or bunx",
         group: Group::Run,
@@ -78,6 +101,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "create",
+        aliases: &[],
         usage: "sako create <initializer> [args...]",
         summary: "Scaffold a project from an initializer package",
         group: Group::Run,
@@ -102,6 +126,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "eval",
+        aliases: &[],
         usage: "sako eval <source> [args...]",
         summary: "Evaluate JavaScript from the command line",
         group: Group::Run,
@@ -110,6 +135,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "repl",
+        aliases: &[],
         usage: "sako repl",
         summary: "Start an interactive session",
         group: Group::Run,
@@ -118,10 +144,14 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "install",
-        usage: "sako install",
+        aliases: &["i", "in"],
+        usage: "sako install [package...] [--dev]",
         summary: "Install everything in package.json",
         group: Group::Packages,
         details: &[
+            "Given package names it adds them first, the way npm install does;",
+            "with no arguments it installs what package.json already declares.",
+            "",
             "Also links each dependency's declared binaries into node_modules/.bin",
             "so package scripts and `sako x` can find them.",
             "",
@@ -129,10 +159,14 @@ pub const COMMANDS: &[Command] = &[
             "and only when stderr is a terminal. SAKO_PROGRESS=0 turns it off,",
             "SAKO_PROGRESS=1 forces it on for a captured stream.",
         ],
-        examples: &[],
+        examples: &[
+            ("sako i", "install what package.json declares"),
+            ("sako i lodash", "add a dependency and install"),
+        ],
     },
     Command {
         name: "add",
+        aliases: &["a"],
         usage: "sako add <package>... [--dev]",
         summary: "Add dependencies and install them",
         group: Group::Packages,
@@ -144,6 +178,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "remove",
+        aliases: &["rm", "uninstall", "un"],
         usage: "sako remove <package>...",
         summary: "Remove dependencies",
         group: Group::Packages,
@@ -152,6 +187,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "update",
+        aliases: &["up", "upgrade"],
         usage: "sako update",
         summary: "Update dependencies within their declared ranges",
         group: Group::Packages,
@@ -177,7 +213,7 @@ pub const PACKAGE_OPTIONS: &[(&str, &str)] = &[
 ];
 
 pub fn find(name: &str) -> Option<&'static Command> {
-    COMMANDS.iter().find(|command| command.name == name)
+    COMMANDS.iter().find(|command| command.answers_to(name))
 }
 
 /// Pads to a *visible* width.
@@ -225,12 +261,21 @@ pub fn overview(painter: Painter) -> String {
         painter.dim("<command> [options] [args...]"),
     ));
 
+    // Sized from the table so adding a command or an alias cannot silently
+    // misalign the column.
+    let width = COMMANDS
+        .iter()
+        .map(|command| command.label().chars().count())
+        .max()
+        .unwrap_or(10)
+        + 2;
     for group in [Group::Run, Group::Packages] {
         out.push_str(&format!("  {}\n", painter.heading(group.title())));
         for command in COMMANDS.iter().filter(|entry| entry.group == group) {
+            let label = command.label();
             out.push_str(&format!(
                 "    {}  {}\n",
-                column(&painter.command(command.name), command.name, 10),
+                column(&painter.command(&label), &label, width),
                 command.summary,
             ));
         }
@@ -273,6 +318,16 @@ pub fn command_page(painter: Painter, command: &Command) -> String {
     ));
     out.push_str(&format!("  {}\n", painter.heading("USAGE")));
     out.push_str(&format!("    {}\n\n", painter.cyan(command.usage)));
+
+    if !command.aliases.is_empty() {
+        out.push_str(&format!("  {}\n", painter.heading("ALIASES")));
+        let spellings: Vec<String> = command
+            .aliases
+            .iter()
+            .map(|alias| painter.cyan(alias))
+            .collect();
+        out.push_str(&format!("    {}\n\n", spellings.join(", ")));
+    }
 
     if !command.details.is_empty() {
         for line in command.details {

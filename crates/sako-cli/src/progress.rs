@@ -112,11 +112,11 @@ impl Bar {
     fn render(&self, state: &mut State, label: &str) {
         let head = match state.total {
             Some(total) => {
-                let filled = if total == 0 {
-                    BAR_WIDTH
-                } else {
-                    (state.installed.min(total) * BAR_WIDTH) / total
-                };
+                // A plan of zero packages is already finished, so the bar is
+                // full rather than divided by nothing.
+                let filled = (state.installed.min(total) * BAR_WIDTH)
+                    .checked_div(total)
+                    .unwrap_or(BAR_WIDTH);
                 format!(
                     "{}{}{}{} {}",
                     self.painter.dim("["),
@@ -141,7 +141,11 @@ impl Bar {
         // the unpainted text: the escapes the painter adds occupy no columns.
         let used = match state.total {
             Some(total) => {
-                BAR_WIDTH + 3 + format!("{}/{total}", state.installed.min(total)).chars().count()
+                BAR_WIDTH
+                    + 3
+                    + format!("{}/{total}", state.installed.min(total))
+                        .chars()
+                        .count()
             }
             None => 2 + state.installed.to_string().chars().count(),
         };
@@ -193,8 +197,10 @@ impl ProgressReporter for Bar {
                     self.painter.green("done"),
                     self.painter.bold(&packages(installed)),
                     self.painter.bold(&duration(elapsed.as_millis())),
-                    self.painter
-                        .dim(&format!(" ({cached} from the store, {} fetched)", state.downloaded)),
+                    self.painter.dim(&format!(
+                        " ({cached} from the store, {} fetched)",
+                        state.downloaded
+                    )),
                 );
             }
         }

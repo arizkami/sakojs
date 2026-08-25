@@ -40,12 +40,12 @@ pub fn path_with(directories: &[PathBuf]) -> OsString {
             prefix.push(directory.clone());
         }
     }
-    if let Ok(executable) = env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            let parent = parent.to_path_buf();
-            if !prefix.contains(&parent) {
-                prefix.push(parent);
-            }
+    if let Ok(executable) = env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        let parent = parent.to_path_buf();
+        if !prefix.contains(&parent) {
+            prefix.push(parent);
         }
     }
     match env::var_os("PATH") {

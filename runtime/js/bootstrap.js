@@ -988,12 +988,38 @@
     realpathSync: __sakoRealPathSync,
     openSync: __sakoOpenSync,
     closeSync: __sakoCloseSync,
-    readSync(fd, buffer, offset = 0, length = buffer.length - offset, position = null) {
-      return __sakoReadSync(fd, buffer, offset, length, position);
+    readSync(fd, buffer, offset = 0, length, position = null) {
+      // The options form: readSync(fd, buffer, { offset, length, position }).
+      if (offset !== null && typeof offset === "object") {
+        const settings = offset;
+        return __sakoReadSync(fd, buffer,
+          settings.offset ?? 0,
+          settings.length ?? buffer.byteLength - (settings.offset ?? 0),
+          settings.position ?? null);
+      }
+      return __sakoReadSync(fd, buffer, offset,
+        length === undefined ? buffer.byteLength - offset : length, position);
     },
-    writeSync(fd, buffer, offset = 0, length, position = null) {
-      const bytes = typeof buffer === "string" ? Buffer.from(buffer) : buffer;
-      return __sakoWriteSync(fd, bytes, offset, length === undefined ? bytes.length - offset : length, position);
+    // Node gives this two shapes, and which one applies is decided by the
+    // second argument rather than by the count:
+    //
+    //   writeSync(fd, buffer[, offset[, length[, position]]])
+    //   writeSync(fd, string[, position[, encoding]])
+    //
+    // Reading a string call as a buffer call takes the encoding as a length
+    // and writes nothing at all. That does not fail -- it produces an empty
+    // file -- so the damage only surfaces later, when whatever wrote its
+    // configuration this way reads it back and finds it empty.
+    writeSync(fd, data, ...rest) {
+      if (typeof data === "string") {
+        const position = rest[0] === undefined ? null : rest[0];
+        const bytes = Buffer.from(data, rest[1] === undefined ? "utf8" : rest[1]);
+        return __sakoWriteSync(fd, bytes, 0, bytes.length, position);
+      }
+      const offset = rest[0] === undefined ? 0 : rest[0];
+      const length = rest[1] === undefined ? data.byteLength - offset : rest[1];
+      const position = rest[2] === undefined ? null : rest[2];
+      return __sakoWriteSync(fd, data, offset, length, position);
     },
     // The copy family, expressed through readFileSync/writeFileSync rather
     // than native calls. Scaffolding tools lean on these heavily -- copying a
@@ -1060,10 +1086,128 @@
     // does not exist here.
     chmodSync() {},
   };
+  // The values Node reports on win32. O_SYMLINK is deliberately absent, as it
+  // is there: libraries feature-detect it with hasOwnProperty and take a
+  // different path when it is missing, so inventing one would be worse than
+  // not having it.
   fs.constants = {
     F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+    O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
+    O_CREAT: 0x0100, O_EXCL: 0x0400, O_TRUNC: 0x0200, O_APPEND: 0x0008,
+    S_IFMT: 0xf000, S_IFREG: 0x8000, S_IFDIR: 0x4000, S_IFCHR: 0x2000,
+    S_IFLNK: 0xa000,
+    S_IRUSR: 0o400, S_IWUSR: 0o200,
     COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
+    UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2,
+    UV_DIRENT_UNKNOWN: 0, UV_DIRENT_FILE: 1, UV_DIRENT_DIR: 2,
+    UV_DIRENT_LINK: 3, UV_DIRENT_FIFO: 4, UV_DIRENT_SOCKET: 5,
+    UV_DIRENT_CHAR: 6, UV_DIRENT_BLOCK: 7,
   };
+  // The native descriptor table does not carry the name a file was opened
+  // under, and fstat and ftruncate are defined in terms of it. Remembering the
+  // path on the way through openSync is cheaper than teaching the native side
+  // to answer, and openSync is the only door in.
+  const descriptorPaths = new Map();
+  const nativeOpenSync = fs.openSync;
+  fs.openSync = (target, flags, mode) => {
+    const descriptor = nativeOpenSync(target, flags, mode);
+    descriptorPaths.set(descriptor, String(target));
+    return descriptor;
+  };
+  const nativeCloseSync = fs.closeSync;
+  fs.closeSync = (descriptor) => {
+    descriptorPaths.delete(descriptor);
+    return nativeCloseSync(descriptor);
+  };
+  const descriptorPath = (descriptor, operation) => {
+    const target = descriptorPaths.get(descriptor);
+    if (target === undefined) {
+      const error = new Error(`EBADF: bad file descriptor, ${operation}`);
+      error.code = "EBADF";
+      throw error;
+    }
+    return target;
+  };
+
+  Object.assign(fs, {
+    fstatSync: (descriptor) => fs.statSync(descriptorPath(descriptor, "fstat")),
+    truncateSync(target, length = 0) {
+      const existing = __sakoExistsSync(String(target))
+        ? Buffer.from(__sakoReadFileSync(String(target), false))
+        : Buffer.alloc(0);
+      // Node pads with zeroes when the new length is longer, so an allocated
+      // buffer overwritten with the prefix does both cases at once.
+      const resized = Buffer.alloc(length);
+      resized.set(existing.subarray(0, Math.min(length, existing.length)));
+      __sakoWriteFileSync(String(target), resized);
+    },
+    ftruncateSync: (descriptor, length = 0) =>
+      fs.truncateSync(descriptorPath(descriptor, "ftruncate"), length),
+    writevSync(descriptor, buffers, position = null) {
+      let written = 0;
+      for (const buffer of buffers) {
+        written += fs.writeSync(descriptor, buffer, 0, buffer.length,
+          position === null ? null : position + written);
+      }
+      return written;
+    },
+    opendirSync(target) {
+      const directory = String(target);
+      const names = readdirSync(directory);
+      let index = 0;
+      const next = () => {
+        if (index >= names.length) return null;
+        const name = names[index++];
+        const stats = statSync(path.join(directory, name), false);
+        return {
+          name,
+          path: directory,
+          parentPath: directory,
+          isFile: () => stats.isFile(),
+          isDirectory: () => stats.isDirectory(),
+          isSymbolicLink: () => stats.isSymbolicLink(),
+        };
+      };
+      return {
+        path: directory,
+        readSync: next,
+        async read() { return next(); },
+        closeSync() {},
+        async close() {},
+        [Symbol.asyncIterator]() {
+          return {
+            async next() {
+              const entry = next();
+              return entry === null
+                ? { done: true, value: undefined }
+                : { done: false, value: entry };
+            },
+          };
+        },
+      };
+    },
+    // Windows has no POSIX ownership or mode bits, and Sako sets no
+    // timestamps. These accept the call and change nothing rather than failing
+    // a build step that only wanted to mark a file executable.
+    chownSync() {},
+    lchownSync() {},
+    lchmodSync() {},
+    fchmodSync() {},
+    fchownSync() {},
+    futimesSync() {},
+    utimesSync() {},
+    // Writes reach the OS as they are made, so nothing is buffered here to
+    // flush.
+    fsyncSync() {},
+    fdatasyncSync() {},
+    statfsSync(target) {
+      // No filesystem statistics are available. The shape is what callers
+      // destructure; the existence check keeps a bad path reporting ENOENT.
+      fs.accessSync(target);
+      return { type: 0, bsize: 4096, blocks: 0, bfree: 0, bavail: 0, files: 0, ffree: 0 };
+    },
+  });
+
   fs.readFile = (...args) => { const callback = args.pop(); callbackOperation(() => fs.readFileSync(...args), callback); };
   fs.writeFile = (...args) => { const callback = args.pop(); callbackOperation(() => fs.writeFileSync(...args), callback); };
   fs.stat = (value, callback) => callbackOperation(() => fs.statSync(value), callback);
@@ -1106,11 +1250,13 @@
       catch (error) { callback(error, 0, buffer); }
     });
   };
-  fs.write = (fd, buffer, offset, length, position, callback) => {
+  // Same two shapes as writeSync, with the callback last in either.
+  fs.write = (fd, data, ...rest) => {
+    const callback = rest.pop();
     if (typeof callback !== "function") throw new TypeError("callback must be a function");
     queueMicrotask(() => {
-      try { callback(null, fs.writeSync(fd, buffer, offset, length, position), buffer); }
-      catch (error) { callback(error, 0, buffer); }
+      try { callback(null, fs.writeSync(fd, data, ...rest), data); }
+      catch (error) { callback(error, 0, data); }
     });
   };
   class FileHandle {
@@ -1140,6 +1286,43 @@
     async open(value, flags, mode) { return new FileHandle(fs.openSync(value, flags, mode)); },
   };
   fs.promises = fsPromises;
+
+  // Every fs entry point exists in three spellings and only the synchronous
+  // one is real here. Deriving the other two keeps them in step: a library
+  // reaching for the callback or promise form of something gets the same
+  // behaviour instead of `undefined`. fs-extra wraps a fixed list of callback
+  // functions at import time and crashes on the first one that is missing,
+  // which stops everything built on it before it runs a line.
+  const FS_CALLBACK_FORMS = [
+    "access", "appendFile", "chmod", "chown", "copyFile", "cp", "fchmod",
+    "fchown", "fdatasync", "fstat", "fsync", "ftruncate", "futimes", "lchmod",
+    "lchown", "mkdtemp", "opendir", "rmdir", "statfs", "truncate", "utimes",
+    "writev",
+  ];
+  for (const name of FS_CALLBACK_FORMS) {
+    const sync = fs[`${name}Sync`];
+    if (typeof sync !== "function" || typeof fs[name] === "function") continue;
+    fs[name] = (...args) => {
+      const callback = args.pop();
+      callbackOperation(() => sync(...args), callback);
+    };
+  }
+  // The promise namespace is narrower than the callback one: the descriptor
+  // operations live on FileHandle there, not on the module.
+  const FS_PROMISE_FORMS = [
+    "access", "appendFile", "chmod", "chown", "copyFile", "cp", "lchmod",
+    "lchown", "mkdtemp", "opendir", "rmdir", "statfs", "truncate", "utimes",
+  ];
+  for (const name of FS_PROMISE_FORMS) {
+    const sync = fs[`${name}Sync`];
+    if (typeof sync !== "function" || typeof fsPromises[name] === "function") continue;
+    fsPromises[name] = async (...args) => sync(...args);
+  }
+  // The one callback in the module that takes no error argument.
+  fs.exists = (target, callback) => {
+    if (typeof callback !== "function") throw new TypeError("callback must be a function");
+    queueMicrotask(() => callback(__sakoExistsSync(String(target))));
+  };
 
   // util.styleText, added in Node 20.12. CLI tooling has adopted it quickly as
   // a way to colour output without a dependency, so a missing export here
@@ -1845,6 +2028,167 @@
     }
   }
 
+  // node:http and node:https clients, over the same bounded native fetch the
+  // fetch() global uses. The shape is the one callers expect -- a writable
+  // request, a "response" event, a readable response -- while the transport
+  // underneath still blocks and delivers the whole body at once.
+  //
+  // Two differences worth knowing. Redirects are followed by the transport, so
+  // a caller that meant to inspect a 302 sees the destination instead. And the
+  // response arrives complete, so backpressure does nothing.
+  //
+  // The absence of this was not a missing feature so much as a confusing one:
+  // a tool checking a registry got an empty body and reported the server as
+  // corrupt.
+  const clientTarget = (input, options) => {
+    if (input instanceof URL) return { url: new URL(input.href), settings: options || {} };
+    if (typeof input === "string") return { url: new URL(input), settings: options || {} };
+    const settings = input || {};
+    const protocol = settings.protocol || "http:";
+    const authority = settings.hostname
+      ? `${settings.hostname}${settings.port ? `:${settings.port}` : ""}`
+      : String(settings.host || "localhost");
+    const target = settings.path || "/";
+    return { url: new URL(`${protocol}//${authority}${target}`), settings };
+  };
+
+  class ClientResponse extends IncomingMessage {
+    constructor() {
+      super();
+      this._encoding = null;
+      this.statusCode = 0;
+      this.statusMessage = "";
+    }
+    setEncoding(encoding) { this._encoding = encoding; return this; }
+    push(chunk) {
+      if (chunk === null) {
+        this.readableEnded = true;
+        this.complete = true;
+        this.emit("end");
+        return false;
+      }
+      this.emit("data", this._encoding ? Buffer.from(chunk).toString(this._encoding) : chunk);
+      return true;
+    }
+    // A server request cannot be piped -- its body arrives through events the
+    // native bridge drives -- but a client response is an ordinary readable,
+    // and downloading anything depends on piping it.
+    pipe(destination) { return Stream.prototype.pipe.call(this, destination); }
+  }
+
+  class ClientRequest extends Writable {
+    constructor(url, settings, callback) {
+      super();
+      this._url = url;
+      this._method = String(settings.method || "GET").toUpperCase();
+      this._headers = new Map();
+      this._chunks = [];
+      this._sent = false;
+      this.path = `${url.pathname}${url.search}`;
+      this.host = url.hostname;
+      this.protocol = url.protocol;
+      this.socket = this.connection = {
+        remoteAddress: url.hostname,
+        encrypted: url.protocol === "https:",
+      };
+      for (const [name, value] of Object.entries(settings.headers || {})) {
+        if (value !== undefined) this.setHeader(name, value);
+      }
+      if (settings.auth) {
+        this.setHeader("Authorization", `Basic ${Buffer.from(String(settings.auth)).toString("base64")}`);
+      }
+      if (typeof callback === "function") this.once("response", callback);
+    }
+    setHeader(name, value) { this._headers.set(String(name).toLowerCase(), [String(name), value]); return this; }
+    getHeader(name) { return this._headers.get(String(name).toLowerCase())?.[1]; }
+    getHeaders() { return Object.fromEntries(Array.from(this._headers, ([name, pair]) => [name, pair[1]])); }
+    hasHeader(name) { return this._headers.has(String(name).toLowerCase()); }
+    removeHeader(name) { this._headers.delete(String(name).toLowerCase()); return this; }
+    // Nothing here is connection-oriented, so these record intent and return.
+    setTimeout(milliseconds, callback) {
+      if (typeof callback === "function") this.once("timeout", callback);
+      return this;
+    }
+    setNoDelay() { return this; }
+    setSocketKeepAlive() { return this; }
+    abort() { return this.destroy(); }
+    write(chunk, encoding, callback) {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (chunk !== undefined && chunk !== null) {
+        this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding));
+      }
+      if (typeof callback === "function") queueMicrotask(callback);
+      return true;
+    }
+    end(chunk, encoding, callback) {
+      if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+      else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+      this.writableEnded = true;
+      if (typeof callback === "function") queueMicrotask(callback);
+      // Deferred by a microtask so the caller can attach its "response" and
+      // "error" listeners after end(), which is the usual order.
+      queueMicrotask(() => this._send());
+      return this;
+    }
+    _send() {
+      if (this._sent || this.destroyed) return;
+      this._sent = true;
+      const headers = [];
+      for (const [, [name, value]] of this._headers) {
+        if (Array.isArray(value)) {
+          for (const item of value) headers.push(name, String(item));
+        } else {
+          headers.push(name, String(value));
+        }
+      }
+      // The native bridge wants bytes even when there are none of them.
+      const body = Buffer.concat(this._chunks);
+      let native;
+      try {
+        native = __sakoFetchSync(this._url.href, this._method, headers, body);
+      } catch (error) {
+        this.emit("error", error);
+        return;
+      }
+      const response = new ClientResponse();
+      response.statusCode = native.status;
+      response.statusMessage = native.statusText;
+      response.httpVersion = "1.1";
+      response.httpVersionMajor = 1;
+      response.httpVersionMinor = 1;
+      response.url = native.url;
+      response.socket = response.connection = this.socket;
+      response.rawHeaders = native.headers.slice();
+      response.req = this;
+      this.res = response;
+      this.emit("response", response);
+      // A microtask later, so a listener attached from inside the "response"
+      // handler still sees the body.
+      queueMicrotask(() => {
+        const bytes = typeof native.body === "string" ? Buffer.from(native.body) : Buffer.from(native.body);
+        if (bytes.length !== 0) response.push(bytes);
+        response.push(null);
+        this.emit("close");
+      });
+    }
+  }
+
+  const clientRequest = (defaultProtocol) => (input, options, callback) => {
+    if (typeof options === "function") { callback = options; options = undefined; }
+    const { url, settings } = clientTarget(input, options);
+    if (typeof input === "object" && !(input instanceof URL) && input !== null && !input.protocol) {
+      url.protocol = defaultProtocol;
+    }
+    return new ClientRequest(url, settings, callback);
+  };
+
+  const clientGet = (request) => (input, options, callback) => {
+    const outgoing = request(input, options, callback);
+    outgoing.end();
+    return outgoing;
+  };
+
   const http = {
     METHODS,
     STATUS_CODES,
@@ -1854,13 +2198,9 @@
     createServer: (handler) => new Server(handler),
     Agent: class Agent {},
     globalAgent: {},
-    // Sako serves HTTP but cannot yet act as a streaming client. These exist
-    // because a named ESM import that is missing is a SyntaxError before any
-    // code runs -- a module that merely imports `get` would fail even if it
-    // never calls it. Calling one still fails loudly, matching https below.
-    // Use fetch() for client requests.
-    request: unavailable("http.request"),
-    get: unavailable("http.get"),
+    ClientRequest,
+    request: clientRequest("http:"),
+    get: clientGet(clientRequest("http:")),
   };
 
   // node:tls. Present so a namespace import resolves; there is no TLS client
@@ -1940,8 +2280,42 @@
   };
 
   const isWindows = globalThis.__sakoPlatform === "win32";
+  // Error numbers and signal numbers as Node reports them on win32. Code reads
+  // these to recognise a failure -- `error.errno === -constants.ENOENT` is the
+  // older spelling of the same check `error.code` answers now.
+  const errnoConstants = {
+    E2BIG: 7, EACCES: 13, EADDRINUSE: 100, EADDRNOTAVAIL: 101, EAGAIN: 11,
+    EALREADY: 103, EBADF: 9, EBUSY: 16, ECANCELED: 105, ECONNABORTED: 106,
+    ECONNREFUSED: 107, ECONNRESET: 108, EDEADLK: 36, EEXIST: 17, EFAULT: 14,
+    EFBIG: 27, EHOSTUNREACH: 110, EINPROGRESS: 112, EINTR: 4, EINVAL: 22,
+    EIO: 5, EISCONN: 113, EISDIR: 21, ELOOP: 114, EMFILE: 24, EMLINK: 31,
+    EMSGSIZE: 115, ENAMETOOLONG: 38, ENETDOWN: 116, ENETRESET: 117,
+    ENETUNREACH: 118, ENFILE: 23, ENOBUFS: 119, ENODEV: 19, ENOENT: 2,
+    ENOMEM: 12, ENOPROTOOPT: 123, ENOSPC: 28, ENOSYS: 40, ENOTCONN: 126,
+    ENOTDIR: 20, ENOTEMPTY: 41, ENOTSOCK: 128, ENOTSUP: 129, ENOTTY: 25,
+    ENXIO: 6, EOPNOTSUPP: 130, EOVERFLOW: 132, EPERM: 1, EPIPE: 32,
+    EPROTO: 134, EPROTONOSUPPORT: 135, ERANGE: 34, EROFS: 30, ESPIPE: 29,
+    ESRCH: 3, ETIMEDOUT: 138, EWOULDBLOCK: 140, EXDEV: 18,
+  };
+  const signalConstants = {
+    SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6,
+    SIGBUS: 7, SIGFPE: 8, SIGKILL: 9, SIGUSR1: 10, SIGSEGV: 11, SIGUSR2: 12,
+    SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGBREAK: 21, SIGWINCH: 28,
+  };
+
   const os = {
     EOL: isWindows ? "\r\n" : "\n",
+    constants: {
+      UV_UDP_REUSEADDR: 4,
+      dlopen: {},
+      errno: errnoConstants,
+      signals: signalConstants,
+      priority: {
+        PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0,
+        PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14,
+        PRIORITY_HIGHEST: -20,
+      },
+    },
     devNull: isWindows ? "\\\\.\\nul" : "/dev/null",
     arch: () => process.arch,
     platform: () => process.platform,
@@ -1979,8 +2353,9 @@
       }
       return new HttpsServer(options, handler);
     },
-    request: unavailable("https.request"),
-    get: unavailable("https.get"),
+    ClientRequest,
+    request: clientRequest("https:"),
+    get: clientGet(clientRequest("https:")),
   };
   class ChildProcess extends EventEmitter {
     constructor() {
@@ -2007,9 +2382,19 @@
     fork: unavailable("child_process.fork"),
     spawnSync(file, args = [], options = {}) {
       if (!Array.isArray(args)) { options = args || {}; args = []; }
-      const native = __sakoSpawnSync(String(file), args.map(String), options.cwd === undefined ? undefined : String(options.cwd));
+      const plan = shellInvocationFor(String(file), args.map(String), options);
+      const native = __sakoSpawnSync(plan.file, plan.args,
+        options.cwd === undefined ? undefined : String(options.cwd), plan.verbatim);
       const stdout = Buffer.from(native.stdout);
       const stderr = Buffer.from(native.stderr);
+      // "inherit" means the child owns the console. Sako captures its output
+      // through pipes either way, so the closest honest thing is to replay it
+      // here -- losing the live feed, but not the output itself, which is what
+      // an install log or a compiler's errors amount to.
+      if (inheritsOutput(options)) {
+        if (stdout.length !== 0) process.stdout.write(stdout);
+        if (stderr.length !== 0) process.stderr.write(stderr);
+      }
       const encoding = options.encoding && options.encoding !== "buffer" ? options.encoding : undefined;
       return {
         pid: 0,
@@ -2021,6 +2406,34 @@
         error: undefined,
       };
     },
+  };
+
+  const inheritsOutput = (options) => {
+    const stdio = options && options.stdio;
+    if (stdio === "inherit") return true;
+    return Array.isArray(stdio) && (stdio[1] === "inherit" || stdio[2] === "inherit");
+  };
+
+  // Applies the `shell` option, and reports whether the command line the
+  // caller assembled should be passed through untouched.
+  //
+  // `windowsVerbatimArguments` is how a caller says "I have already quoted
+  // this". cross-spawn -- which is what npm's ecosystem shells out through --
+  // sets it and hands over a line `cmd` is ready to read; quoting it again
+  // produces something `cmd` cannot parse, and the child fails without ever
+  // starting.
+  const shellInvocationFor = (file, args, options) => {
+    const verbatim = Boolean(options && options.windowsVerbatimArguments);
+    const shell = options && options.shell;
+    if (!shell) return { file, args, verbatim };
+    const commandLine = [file, ...args].join(" ");
+    if (globalThis.__sakoPlatform === "win32") {
+      const interpreter = typeof shell === "string" ? shell : "cmd.exe";
+      // /d skips AutoRun scripts, /s makes cmd strip exactly the outer quotes.
+      return { file: interpreter, args: ["/d", "/s", "/c", `"${commandLine}"`], verbatim: true };
+    }
+    const interpreter = typeof shell === "string" ? shell : "/bin/sh";
+    return { file: interpreter, args: ["-c", commandLine], verbatim };
   };
   childProcess.spawn = (file, args = [], options = {}) => {
     if (!Array.isArray(args)) { options = args || {}; args = []; }
@@ -2202,32 +2615,78 @@
   };
   const url = { URL, URLSearchParams, pathToFileURL, fileURLToPath };
 
-  // process.stdin. Absent entirely before, which meant anything that reads
-  // input -- a prompt, a piped payload -- had nothing to attach to. Backed by
-  // synchronous reads on descriptor 0, so it is a line source rather than a
-  // full duplex stream.
+  // process.stdin.
+  //
+  // Reads used to go through fs.readSync on descriptor 0, which resolves
+  // through Sako's table of *opened* files -- and 0 was never in it. Every
+  // read threw, the throw was read as end-of-input, and process.stdin reported
+  // EOF on its first read no matter what was actually attached. The native
+  // __sakoStdinRead below reads the descriptor itself, with a bounded wait so
+  // a blocking read can live inside a single-threaded event loop.
   const STDIN_FD = 0;
-  const stdinState = { buffer: Buffer.alloc(0), ended: false };
+  // How long one native read waits before handing control back. Long enough
+  // that waiting for a keystroke costs nothing, short enough that a timer due
+  // in the meantime is not visibly late.
+  const STDIN_POLL_MS = 20;
+  // What a terminal is given to finish an escape sequence before a lone ESC is
+  // taken to mean the Escape key. The same 50ms Node uses, and the same value
+  // prompt libraries pass in as escapeCodeTimeout.
+  const ESCAPE_TIMEOUT_MS = 50;
 
-  const readStdinChunk = () => {
+  const stdinState = {
+    buffer: Buffer.alloc(0),
+    ended: false,
+    endEmitted: false,
+    raw: false,
+    flowing: false,
+    encoding: null,
+    pump: null,
+    // Whether the reader should hold the process open. Remembered rather than
+    // applied straight to the timer, because unref() is routinely called
+    // before anything has started one -- and each pause/resume makes a new
+    // one that would otherwise come back referenced.
+    referenced: true,
+  };
+
+  /// One bounded read. Returns a Buffer, `undefined` when the wait expired
+  /// with nothing to show for it, or null at end of input.
+  const readStdinChunk = (timeout = STDIN_POLL_MS) => {
     if (stdinState.ended) return null;
-    const chunk = Buffer.alloc(8192);
-    let read = 0;
+    let bytes;
     try {
-      read = fs.readSync(STDIN_FD, chunk, 0, chunk.length, null);
+      bytes = __sakoStdinRead(timeout);
     } catch {
-      stdinState.ended = true;
+      markStdinEnded();
       return null;
     }
-    if (read === 0) {
-      stdinState.ended = true;
+    // Null is end of input; undefined is the wait expiring with nothing to
+    // show for it, which costs no allocation on the native side.
+    if (bytes === undefined) return undefined;
+    if (bytes === null) {
+      markStdinEnded();
       return null;
     }
-    return chunk.subarray(0, read);
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length);
+  };
+
+  /// Records that input is finished, and makes sure the stream says so.
+  ///
+  /// A blocking read discovers the end just as often as the pump does -- a
+  /// script that calls read() once, or iterates -- and latching the flag
+  /// without announcing it left `end` listeners and stream.finished() waiting
+  /// on an event that could no longer arrive. Deferred by a turn so a listener
+  /// attached on the line after the read still hears it.
+  const markStdinEnded = () => {
+    if (stdinState.ended) return;
+    stdinState.ended = true;
+    setTimeout(() => endStdin(), 0);
   };
 
   /// Reads one line, or null once input is exhausted. The trailing newline is
   /// stripped, and a lone \r before it, so Windows input matches POSIX.
+  ///
+  /// Blocking on purpose: this backs readline's callback-style question() and
+  /// the REPL, both of which are written as though input were synchronous.
   const readStdinLine = () => {
     for (;;) {
       const newline = stdinState.buffer.indexOf(0x0a);
@@ -2237,6 +2696,7 @@
         return line.endsWith("\r") ? line.slice(0, -1) : line;
       }
       const chunk = readStdinChunk();
+      if (chunk === undefined) continue;
       if (chunk === null) {
         if (stdinState.buffer.length === 0) return null;
         const rest = stdinState.buffer.toString("utf8");
@@ -2258,26 +2718,182 @@
     // (and, once snapshotted, baked into the binary at build time), so a value
     // captured here would report the build machine's terminal state forever.
     get isTTY() { return Boolean(tty.isatty(this.fd)); }
-    // Sako has no raw console mode, so character-at-a-time prompts cannot be
-    // supported. Reporting the failure honestly is better than pretending:
-    // a caller that checks can fall back to line input.
-    setRawMode() { return this; }
-    setEncoding() { return this; }
-    resume() { return this; }
-    pause() { return this; }
+    // Node exposes this and prompt libraries read it back to decide whether
+    // their request for raw mode was honoured.
+    get isRaw() { return stdinState.raw; }
+    /// Turns off line buffering and echo so a prompt sees each keystroke.
+    ///
+    /// Returns `this` either way, as Node does, but `isRaw` reports what
+    /// actually happened: a redirected stdin has no terminal to configure.
+    setRawMode(mode) {
+      // Node coerces, so setRawMode(0) and setRawMode() both mean off.
+      const wanted = Boolean(mode);
+      stdinState.raw = Boolean(__sakoStdinSetRawMode(wanted)) && wanted;
+      return this;
+    }
+    setEncoding(encoding) {
+      stdinState.encoding = encoding || null;
+      return this;
+    }
+    resume() {
+      stdinState.flowing = true;
+      startStdinPump();
+      return this;
+    }
+    pause() {
+      stdinState.flowing = false;
+      stopStdinPump();
+      return this;
+    }
+    // Attaching a consumer starts the flow, which is what Node does and what
+    // every prompt library depends on: none of them call resume() themselves.
+    on(name, listener) {
+      const result = super.on(name, listener);
+      if (name === "data" || name === "keypress") this.resume();
+      return result;
+    }
+    prependListener(name, listener) {
+      const result = super.prependListener(name, listener);
+      if (name === "data" || name === "keypress") this.resume();
+      return result;
+    }
+    pipe(destination) {
+      const result = super.pipe(destination);
+      this.resume();
+      return result;
+    }
+    unpipe() { return this; }
+    // The pump is a referenced timer, so it already holds the process open;
+    // unref hands that back for a reader that is not the reason to stay alive.
+    ref() {
+      stdinState.referenced = true;
+      if (stdinState.pump !== null) __sakoTimerRef(stdinState.pump, true);
+      return this;
+    }
+    unref() {
+      stdinState.referenced = false;
+      if (stdinState.pump !== null) __sakoTimerRef(stdinState.pump, false);
+      return this;
+    }
+    hasRef() { return stdinState.referenced; }
     read() {
+      // Node's contract: a stream in flowing mode delivers through `data`, and
+      // read() returns null rather than racing it. Reading here would take
+      // bytes away from the listener and block the loop while it waited.
+      if (stdinState.flowing) return null;
       const line = readStdinLine();
       return line === null ? null : `${line}\n`;
     }
+    destroy() {
+      this.pause();
+      return super.destroy();
+    }
+    // Lines rather than chunks, which is what this runtime has always yielded
+    // here. Fed by the pump instead of by a blocking read, so iterating does
+    // not compete with a `data` listener for the same descriptor and does not
+    // hold the event loop between lines.
     async *[Symbol.asyncIterator]() {
-      for (;;) {
-        const line = readStdinLine();
-        if (line === null) return;
-        yield line;
+      const ready = [];
+      const decoder = new StringDecoder("utf8");
+      let carry = "";
+      let finished = false;
+      let wake = null;
+      const notify = () => {
+        if (wake === null) return;
+        const resolve = wake;
+        wake = null;
+        resolve();
+      };
+      const onData = (chunk) => {
+        carry += typeof chunk === "string" ? chunk : decoder.write(Buffer.from(chunk));
+        let newline;
+        while ((newline = carry.indexOf("\n")) !== -1) {
+          const line = carry.slice(0, newline);
+          carry = carry.slice(newline + 1);
+          ready.push(line.endsWith("\r") ? line.slice(0, -1) : line);
+        }
+        notify();
+      };
+      const onEnd = () => { finished = true; notify(); };
+      this.on("data", onData);
+      this.once("end", onEnd);
+      try {
+        for (;;) {
+          while (ready.length > 0) yield ready.shift();
+          if (finished) {
+            const rest = carry + decoder.end();
+            if (rest.length > 0) yield rest.endsWith("\r") ? rest.slice(0, -1) : rest;
+            return;
+          }
+          await new Promise((resolve) => { wake = resolve; });
+        }
+      } finally {
+        this.off("data", onData);
+        this.off("end", onEnd);
       }
     }
   }
   const stdin = new Stdin();
+
+  // A read can land mid-character: 8 KiB is a byte count, not a boundary in
+  // the text. Decoding each chunk on its own turned a split multi-byte
+  // character into two replacement characters.
+  const stdinDecoder = new StringDecoder("utf8");
+
+  const deliverStdin = (chunk) => {
+    stdin.emit("data", stdinState.encoding ? chunk.toString(stdinState.encoding) : chunk);
+  };
+
+  const endStdin = () => {
+    if (stdinState.endEmitted) return;
+    stdinState.endEmitted = true;
+    stopStdinPump();
+    stdinState.flowing = false;
+    stdin.readable = false;
+    stdin.readableEnded = true;
+    // Whatever a line read left behind is still input, and belongs to the
+    // stream before it closes.
+    if (stdinState.buffer.length > 0) {
+      const pending = stdinState.buffer;
+      stdinState.buffer = Buffer.alloc(0);
+      deliverStdin(pending);
+    }
+    stdin.emit("end");
+  };
+
+  const pumpStdin = () => {
+    if (!stdinState.flowing) return;
+    // Anything a line read left behind belongs to the flow first, or a prompt
+    // opened after a piped read would silently lose the rest of its input.
+    if (stdinState.buffer.length > 0) {
+      const pending = stdinState.buffer;
+      stdinState.buffer = Buffer.alloc(0);
+      deliverStdin(pending);
+      return;
+    }
+    const chunk = readStdinChunk();
+    if (chunk === null) { endStdin(); return; }
+    if (chunk !== undefined) deliverStdin(chunk);
+  };
+
+  /// Starts the reader that turns bounded native reads into `data` events.
+  ///
+  /// A referenced interval is the whole mechanism: the event loop already
+  /// counts one as work, so an open prompt keeps the runtime alive without
+  /// stdin needing to become a new kind of pending operation. The interval is
+  /// 1ms and each read waits up to STDIN_POLL_MS, so the loop spends its time
+  /// blocked in the read rather than spinning.
+  const startStdinPump = () => {
+    if (stdinState.pump !== null || stdinState.ended) return;
+    stdinState.pump = setInterval(pumpStdin, 1);
+    if (!stdinState.referenced) __sakoTimerRef(stdinState.pump, false);
+  };
+
+  const stopStdinPump = () => {
+    if (stdinState.pump === null) return;
+    clearInterval(stdinState.pump);
+    stdinState.pump = null;
+  };
 
   // process.stdout / process.stderr.
   //
@@ -2355,8 +2971,26 @@
       { bigint: () => BigInt(Date.now()) * 1000000n },
     ),
     memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
+    // process.binding is one of Node's internals, deprecated there and absent
+    // here -- except that execa reaches for the "uv" one to name error codes,
+    // and prints a paragraph of alarm on every run when it cannot. Only that
+    // one binding is answered, from the error numbers node:os already knows;
+    // anything else says plainly that there are no internals to bind to.
+    binding(name) {
+      if (name !== "uv") {
+        throw new Error(`process.binding('${name}') is not supported`);
+      }
+      const names = new Map(
+        Object.entries(errnoConstants).map(([code, value]) => [-value, code]),
+      );
+      return {
+        errname: (value) => names.get(Number(value)) ?? `Unknown system error ${value}`,
+        getErrorMap: () => new Map(
+          Object.entries(errnoConstants).map(([code, value]) => [-value, [code, code]]),
+        ),
+      };
+    },
     uptime: () => (Date.now() - processEpoch()) / 1000,
-    chdir() { throw new Error("process.chdir is not supported"); },
     umask: () => 0,
     emitWarning(warning) {
       const text = warning instanceof Error ? warning.stack ?? warning.message : String(warning);
@@ -2372,19 +3006,198 @@
   };
   Object.defineProperty(globalThis, "__sakoProcessExtras", { value: processExtras });
 
-  // node:readline. Line-oriented only -- see Stdin.setRawMode above.
+  // node:readline.
+  //
+  // Two modes, as in Node. Without a terminal it reads whole lines, which is
+  // what a piped payload and the REPL want. With one it decodes keystrokes and
+  // keeps a line buffer, which is what every prompt library wants: they render
+  // the prompt themselves and read `rl.line` and `rl.cursor` back after each
+  // keypress. Neither existed before -- `emitKeypressEvents` returned
+  // undefined and nothing ever emitted a key -- which is why an interactive
+  // scaffolder drew its first question and exited.
   const writeTo = (output, text) => {
     if (output && typeof output.write === "function") output.write(text);
   };
+
+  // The sequences a terminal sends for keys that are not characters. Windows
+  // produces the same ones once the console is switched to virtual terminal
+  // input, so one table serves both platforms.
+  const KEYPRESS_ATTACHED = Symbol("sako:keypress");
+
+  const CSI_LETTER_KEYS = {
+    A: "up", B: "down", C: "right", D: "left", E: "clear",
+    F: "end", H: "home", P: "f1", Q: "f2", R: "f3", S: "f4",
+    Z: "tab", // shift-tab, distinguished by the shift flag below
+  };
+  const CSI_NUMBER_KEYS = {
+    1: "home", 2: "insert", 3: "delete", 4: "end", 5: "pageup", 6: "pagedown",
+    7: "home", 8: "end", 11: "f1", 12: "f2", 13: "f3", 14: "f4", 15: "f5",
+    17: "f6", 18: "f7", 19: "f8", 20: "f9", 21: "f10", 23: "f11", 24: "f12",
+  };
+  // xterm encodes modifiers as a bitmask offset by one: 2 is shift, 3 alt,
+  // 5 ctrl, and combinations add together.
+  const applyModifier = (key, modifier) => {
+    if (!modifier) return;
+    const bits = modifier - 1;
+    key.shift = (bits & 1) !== 0;
+    key.meta = key.meta || (bits & 2) !== 0;
+    key.ctrl = (bits & 4) !== 0;
+  };
+
+  const SEQUENCE_PATTERN = /^\x1b(O|\[)(?:(\d+)(?:;(\d+))?([~^$])|(?:1;(\d+))?([A-Za-z]))/;
+
+  /// Reads one key off the front of `text`.
+  ///
+  /// Returns the key and how much of the text it consumed, or null when the
+  /// text so far could still be the start of a longer sequence -- an escape
+  /// arrives one byte ahead of the rest of what it introduces.
+  const decodeKey = (text) => {
+    const first = text[0];
+    const key = { sequence: first, name: undefined, ctrl: false, meta: false, shift: false };
+
+    if (first === "\x1b") {
+      if (text.length === 1) return null;
+      const second = text[1];
+      if (second === "[" || second === "O") {
+        const match = SEQUENCE_PATTERN.exec(text);
+        if (match === null) {
+          if (/^\x1b(O|\[)[\d;?<>!$"']*$/.test(text)) return null;  // still arriving
+          // A sequence this decoder has no name for -- a terminal's reply to a
+          // status query, a bracketed paste marker -- still has to be consumed
+          // whole. Releasing one character at a time typed the rest of it into
+          // whatever prompt was open.
+          const end = /^\x1b(?:O.|\[[\d;?<>!$"']*[\x40-\x7e])/.exec(text);
+          if (end === null) return { key: escapeKey(), consumed: 1 };
+          key.sequence = end[0];
+          key.meta = false;
+          return { key, consumed: end[0].length };
+        }
+        const [sequence, , number, numberModifier, , letterModifier, letter] = match;
+        key.sequence = sequence;
+        key.meta = false;
+        if (letter !== undefined) {
+          key.name = CSI_LETTER_KEYS[letter] ?? undefined;
+          if (letter === "Z") key.shift = true;
+          applyModifier(key, letterModifier ? Number(letterModifier) : 0);
+        } else {
+          key.name = CSI_NUMBER_KEYS[Number(number)] ?? undefined;
+          applyModifier(key, numberModifier ? Number(numberModifier) : 0);
+        }
+        return { key, consumed: sequence.length };
+      }
+      // Escape followed by anything else is that key with Alt held.
+      const inner = decodeKey(text.slice(1));
+      if (inner === null) return { key: escapeKey(), consumed: 1 };
+      inner.key.meta = true;
+      inner.key.sequence = `\x1b${inner.key.sequence}`;
+      return { key: inner.key, consumed: inner.consumed + 1 };
+    }
+
+    if (first === "\r") { key.name = "return"; return { key, consumed: 1 }; }
+    if (first === "\n") { key.name = "enter"; return { key, consumed: 1 }; }
+    if (first === "\t") { key.name = "tab"; return { key, consumed: 1 }; }
+    // Both spellings of Backspace, and Delete, which some terminals send as
+    // 0x7f rather than as a sequence.
+    if (first === "\b" || first === "\x7f") { key.name = "backspace"; return { key, consumed: 1 }; }
+    if (first === " ") { key.name = "space"; return { key, consumed: 1 }; }
+
+    const code = first.charCodeAt(0);
+    if (code === 0) { key.name = "space"; key.ctrl = true; return { key, consumed: 1 }; }
+    if (code <= 26) {
+      // Ctrl+letter arrives as the letter's position in the alphabet.
+      key.name = String.fromCharCode(code + 96);
+      key.ctrl = true;
+      return { key, consumed: 1 };
+    }
+    if (code === 27) { return { key: escapeKey(), consumed: 1 }; }
+    if (/^[A-Z]$/.test(first)) {
+      key.name = first.toLowerCase();
+      key.shift = true;
+      return { key, consumed: 1 };
+    }
+    if (/^[a-z]$/.test(first)) { key.name = first; return { key, consumed: 1 }; }
+    // A surrogate pair is one key, not two.
+    if (code >= 0xd800 && code <= 0xdbff && text.length > 1) {
+      key.sequence = text.slice(0, 2);
+      return { key, consumed: 2 };
+    }
+    return { key, consumed: 1 };
+  };
+
+  const escapeKey = () => ({
+    sequence: "\x1b", name: "escape", ctrl: false, meta: true, shift: false,
+  });
+
+  /// Turns a stream's bytes into `keypress` events.
+  ///
+  /// Attached once per stream: a prompt library calls this and so does the
+  /// terminal-mode Interface, and emitting every key twice would double every
+  /// keystroke the user typed.
+  const emitKeypressEvents = (stream, _interface) => {
+    if (stream === null || typeof stream !== "object" || stream[KEYPRESS_ATTACHED]) return;
+    Object.defineProperty(stream, KEYPRESS_ATTACHED, { value: true, enumerable: false });
+    let pending = "";
+    let escapeTimer = null;
+
+    const flush = (force) => {
+      for (;;) {
+        if (pending.length === 0) return;
+        const decoded = decodeKey(pending);
+        if (decoded === null) {
+          if (!force) return;
+          // The terminal stopped mid-sequence, so what arrived was the Escape
+          // key itself. Release one character and re-read the rest.
+          const released = decodeKey(pending[0]) ?? { key: escapeKey(), consumed: 1 };
+          pending = pending.slice(released.consumed);
+          emit(released.key);
+          continue;
+        }
+        pending = pending.slice(decoded.consumed);
+        emit(decoded.key);
+      }
+    };
+
+    const emit = (key) => {
+      // Node passes the character for printable keys and undefined otherwise,
+      // and prompt libraries branch on exactly that.
+      const character = key.sequence && key.sequence.charCodeAt(0) !== 0x1b ? key.sequence : undefined;
+      stream.emit("keypress", character, key);
+    };
+
+    stream.on("data", (chunk) => {
+      if (escapeTimer !== null) { clearTimeout(escapeTimer); escapeTimer = null; }
+      // See stdinDecoder: a character split across two reads has to be carried
+      // over rather than decoded twice into replacement characters.
+      pending += typeof chunk === "string" ? chunk : stdinDecoder.write(Buffer.from(chunk));
+      flush(false);
+      if (pending.length > 0) {
+        escapeTimer = setTimeout(() => { escapeTimer = null; flush(true); }, ESCAPE_TIMEOUT_MS);
+      }
+    });
+    stream.on("end", () => {
+      if (escapeTimer !== null) { clearTimeout(escapeTimer); escapeTimer = null; }
+      flush(true);
+    });
+  };
+
   class Interface extends EventEmitter {
     constructor(options = {}) {
       super();
       const settings = typeof options.write === "function" || options.read ? { input: options } : options;
       this.input = settings.input ?? stdin;
-      this.output = settings.output ?? process.stdout;
+      this.output = settings.output ?? null;
       this.terminal = settings.terminal ?? Boolean(this.output && this.output.isTTY);
       this._prompt = settings.prompt ?? "> ";
       this.closed = false;
+      this.paused = false;
+      // The line buffer a prompt library reads back after every keypress.
+      this.line = "";
+      this.cursor = 0;
+      this.history = [];
+      if (this.terminal && this.input && typeof this.input.on === "function") {
+        emitKeypressEvents(this.input, this);
+        this.input.on("keypress", (character, key) => this._onKeypress(character, key));
+      }
     }
     setPrompt(prompt) { this._prompt = prompt; }
     getPrompt() { return this._prompt; }
@@ -2392,27 +3205,158 @@
     question(query, ...rest) {
       const callback = rest[rest.length - 1];
       writeTo(this.output, query);
-      const answer = readStdinLine() ?? "";
+      // A terminal-mode Interface is already consuming keystrokes, so the line
+      // has to come from the editor rather than from a second reader competing
+      // with it for the same descriptor.
+      // A blocking read only reaches descriptor 0, so it is only correct for
+      // the standard input. Any other stream -- and any terminal-mode
+      // interface, which is already consuming keystrokes -- has to wait for
+      // the line the editor assembles.
+      const answer = this.terminal || this.input !== stdin || stdinState.flowing
+        ? new Promise((resolve) => this.once("line", resolve))
+        : Promise.resolve(readStdinLine() ?? "");
       if (typeof callback === "function") {
-        callback(answer);
+        Promise.resolve(answer).then(callback);
         return undefined;
       }
-      return Promise.resolve(answer);
+      return answer;
     }
-    write(text) { writeTo(this.output, text); }
-    pause() { return this; }
-    resume() { return this; }
+    /// Applies text, or a synthetic keystroke, to the line buffer.
+    ///
+    /// The second form is how prompt libraries clear or edit the buffer they
+    /// do not otherwise own: `rl.write(null, {ctrl: true, name: 'u'})`.
+    write(text, key) {
+      if (this.closed) return;
+      if (text === null || text === undefined) {
+        if (key) this._onKeypress(undefined, { ctrl: false, meta: false, shift: false, ...key });
+        return;
+      }
+      if (!this.terminal) { writeTo(this.output, text); return; }
+      for (const character of String(text)) this._insert(character);
+    }
+    _insert(text) {
+      this.line = this.line.slice(0, this.cursor) + text + this.line.slice(this.cursor);
+      this.cursor += text.length;
+    }
+    _onKeypress(character, key) {
+      if (this.closed || !key) return;
+      if (key.ctrl && !key.meta) {
+        switch (key.name) {
+          // The editing shortcuts a prompt library actually sends.
+          case "h": this._backspace(); return;
+          case "u": this.line = this.line.slice(this.cursor); this.cursor = 0; return;
+          case "k": this.line = this.line.slice(0, this.cursor); return;
+          case "a": this.cursor = 0; return;
+          case "e": this.cursor = this.line.length; return;
+          case "w": {
+            const head = this.line.slice(0, this.cursor).replace(/\s*\S+\s*$/, "");
+            this.line = head + this.line.slice(this.cursor);
+            this.cursor = head.length;
+            return;
+          }
+          // Node's rule: a listener owns the interrupt, and without one the
+          // interface closes so the program can end. Raw mode clears ISIG, so
+          // this is the only path Ctrl+C has -- swallowing it left a prompt
+          // with no way out.
+          case "c":
+            if (this.listenerCount("SIGINT") > 0) this.emit("SIGINT");
+            else this.close();
+            return;
+          case "d":
+            if (this.line.length === 0) this.close();
+            return;
+          default: return;
+        }
+      }
+      switch (key.name) {
+        case "return":
+        case "enter": {
+          const line = this.line;
+          this.line = "";
+          this.cursor = 0;
+          if (line.length > 0) this.history.unshift(line);
+          this.emit("line", line);
+          return;
+        }
+        case "backspace": this._backspace(); return;
+        case "delete":
+          this.line = this.line.slice(0, this.cursor) + this.line.slice(this._stepRight(this.cursor));
+          return;
+        case "left": this.cursor = this._stepLeft(this.cursor); return;
+        case "right": this.cursor = this._stepRight(this.cursor); return;
+        case "home": this.cursor = 0; return;
+        case "end": this.cursor = this.line.length; return;
+        default: break;
+      }
+      // Anything that produced a character goes into the buffer; a bare
+      // navigation key produced none and must not.
+      if (character !== undefined && !key.meta && character.charCodeAt(0) >= 0x20 && character !== "\x7f") {
+        this._insert(character);
+      }
+    }
+    // The line is measured in UTF-16 units but edited in characters: an emoji
+    // is two units, and deleting or stepping over half of one leaves a lone
+    // surrogate that renders as a replacement character.
+    _stepLeft(from) {
+      if (from <= 1) return 0;
+      const previous = this.line.charCodeAt(from - 1);
+      const before = this.line.charCodeAt(from - 2);
+      const pair = previous >= 0xdc00 && previous <= 0xdfff && before >= 0xd800 && before <= 0xdbff;
+      return from - (pair ? 2 : 1);
+    }
+    _stepRight(from) {
+      if (from >= this.line.length) return this.line.length;
+      const current = this.line.charCodeAt(from);
+      const pair = current >= 0xd800 && current <= 0xdbff && from + 1 < this.line.length;
+      return from + (pair ? 2 : 1);
+    }
+    _backspace() {
+      if (this.cursor === 0) return;
+      const start = this._stepLeft(this.cursor);
+      this.line = this.line.slice(0, start) + this.line.slice(this.cursor);
+      this.cursor = start;
+    }
+    // These reach the input, as Node's do, and that is load-bearing rather
+    // than cosmetic: on a terminal there is no end-of-input to stop the reader
+    // on its own, so a prompt that finished and closed its interface would
+    // leave the runtime waiting for a keystroke nobody is going to type.
+    // Every prompt library ends by calling close().
+    pause() {
+      if (this.paused) return this;
+      this.paused = true;
+      if (this.input && typeof this.input.pause === "function") this.input.pause();
+      this.emit("pause");
+      return this;
+    }
+    resume() {
+      if (!this.paused) return this;
+      this.paused = false;
+      if (this.input && typeof this.input.resume === "function") this.input.resume();
+      this.emit("resume");
+      return this;
+    }
     close() {
       if (this.closed) return;
+      this.pause();
       this.closed = true;
       this.emit("close");
     }
     async *[Symbol.asyncIterator]() {
-      for (;;) {
-        const line = readStdinLine();
-        if (line === null) { this.close(); return; }
-        yield line;
+      if (this.terminal || this.input !== stdin) {
+        // See question(): the lines come from the editor, not the descriptor.
+        for (;;) {
+          const line = await new Promise((resolve) => {
+            this.once("line", resolve);
+            this.once("close", () => resolve(null));
+          });
+          if (line === null) return;
+          yield line;
+        }
       }
+      // Otherwise the input's own iteration already assembles lines from the
+      // pump, which is the one reader that must not be duplicated.
+      yield* this.input;
+      this.close();
     }
   }
   const readline = {
@@ -2446,9 +3390,7 @@
       if (typeof callback === "function") callback();
       return true;
     },
-    // Keypress events need raw mode, which Sako lacks; the stream simply never
-    // emits them rather than the import failing.
-    emitKeypressEvents: () => undefined,
+    emitKeypressEvents,
   };
   readline.promises = {
     Interface,
@@ -2631,7 +3573,7 @@
     "assert", "buffer", "child_process", "console", "crypto", "dns",
     "dns/promises", "events", "fs", "fs/promises", "http", "https", "module",
     "net", "os", "path", "process", "querystring",
-    "async_hooks", "diagnostics_channel", "http2", "inspector", "perf_hooks", "readline",
+    "async_hooks", "constants", "diagnostics_channel", "http2", "inspector", "perf_hooks", "readline",
     "readline/promises", "stream", "stream/promises", "string_decoder",
     "timers", "timers/promises", "tls", "v8", "worker_threads",
     "tty", "url", "util", "zlib",
@@ -2708,6 +3650,10 @@
       }),
       "node:fs": fs,
       "node:fs/promises": Object.assign({}, fsPromises, { constants: fs.constants }),
+      // The deprecated flat module Node still ships. graceful-fs -- which
+      // half the ecosystem loads before anything else -- requires it by bare
+      // name on its very first line.
+      "node:constants": Object.assign({}, errnoConstants, signalConstants, fs.constants),
       "node:http": http,
       "node:https": https,
       "node:net": net,

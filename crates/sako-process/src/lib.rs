@@ -28,7 +28,9 @@ fn read_bounded(mut stream: impl Read, maximum_bytes: usize) -> io::Result<Vec<u
 #[cfg(windows)]
 mod windows_impl {
     use super::{BoundedOutput, read_bounded};
-    use std::ffi::c_void;
+    use std::collections::BTreeMap;
+    use std::env;
+    use std::ffi::{OsStr, OsString, c_void};
     use std::io;
     use std::io::Read as _;
     use std::mem::size_of;
@@ -51,8 +53,8 @@ mod windows_impl {
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
         InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
         ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject,
@@ -184,6 +186,30 @@ mod windows_impl {
         arguments: &[String],
         cwd: Option<&Path>,
         maximum_output_bytes: usize,
+        verbatim_arguments: bool,
+    ) -> io::Result<BoundedOutput> {
+        spawn_native_with_bounded_output_in(
+            executable,
+            arguments,
+            cwd,
+            maximum_output_bytes,
+            verbatim_arguments,
+            &[],
+        )
+    }
+
+    /// As above, with `environment` layered over the inherited variables.
+    ///
+    /// Package lifecycle scripts need this: npm runs them with
+    /// `node_modules/.bin` on PATH and a set of `npm_*` variables describing
+    /// the package, and published scripts are written against both.
+    pub fn spawn_native_with_bounded_output_in(
+        executable: &str,
+        arguments: &[String],
+        cwd: Option<&Path>,
+        maximum_output_bytes: usize,
+        verbatim_arguments: bool,
+        environment: &[(OsString, OsString)],
     ) -> io::Result<BoundedOutput> {
         if executable.is_empty() || executable.contains('\0') || maximum_output_bytes == 0 {
             return Err(io::Error::new(
@@ -216,7 +242,7 @@ mod windows_impl {
         startup.StartupInfo.hStdError = inherited[2];
         startup.lpAttributeList = attributes.pointer();
 
-        let command_line = build_command_line(executable, arguments);
+        let command_line = build_command_line(executable, arguments, verbatim_arguments);
         if command_line.encode_utf16().count() >= 32_767 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -242,6 +268,7 @@ mod windows_impl {
                 "child working directory contains a null character",
             ));
         }
+        let environment_block = build_environment_block(environment)?;
         let mut process_info = unsafe { std::mem::zeroed::<PROCESS_INFORMATION>() };
         // SAFETY: all pointers refer to initialized storage that remains live for
         // the synchronous call. The handle-list attribute restricts inheritance.
@@ -252,8 +279,16 @@ mod windows_impl {
                 ptr::null(),
                 ptr::null(),
                 1,
-                CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
-                ptr::null(),
+                CREATE_SUSPENDED
+                    | EXTENDED_STARTUPINFO_PRESENT
+                    | if environment_block.is_some() {
+                        CREATE_UNICODE_ENVIRONMENT
+                    } else {
+                        0
+                    },
+                environment_block
+                    .as_ref()
+                    .map_or(ptr::null(), |block| block.as_ptr().cast()),
                 cwd_wide.as_ref().map_or(ptr::null(), |path| path.as_ptr()),
                 (&raw const startup.StartupInfo),
                 &mut process_info,
@@ -315,6 +350,55 @@ mod windows_impl {
             stdout,
             stderr,
         })
+    }
+
+    /// Builds the child's environment: everything this process has, with
+    /// `overrides` layered on top.
+    ///
+    /// Returns `None` when there is nothing to override, so the ordinary case
+    /// still inherits directly rather than rebuilding the block. Windows
+    /// matches variable names case-insensitively and wants the block sorted,
+    /// so both are done against an upper-cased key.
+    fn build_environment_block(overrides: &[(OsString, OsString)]) -> io::Result<Option<Vec<u16>>> {
+        if overrides.is_empty() {
+            return Ok(None);
+        }
+        fn upper(name: &OsStr) -> Vec<u16> {
+            name.encode_wide()
+                .map(|unit| {
+                    if (b'a' as u16..=b'z' as u16).contains(&unit) {
+                        unit - 32
+                    } else {
+                        unit
+                    }
+                })
+                .collect()
+        }
+        let mut variables: BTreeMap<Vec<u16>, (OsString, OsString)> = BTreeMap::new();
+        for (name, value) in env::vars_os() {
+            variables.insert(upper(&name), (name, value));
+        }
+        for (name, value) in overrides {
+            variables.insert(upper(name), (name.clone(), value.clone()));
+        }
+        let mut block: Vec<u16> = Vec::new();
+        for (name, value) in variables.into_values() {
+            // An embedded null would truncate the block and silently drop
+            // every variable after it.
+            if name.encode_wide().any(|unit| unit == 0) || value.encode_wide().any(|unit| unit == 0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "child environment contains a null character",
+                ));
+            }
+            block.extend(name.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        Ok(Some(block))
     }
 
     fn create_named_capture_pipe(label: &str) -> io::Result<(std::fs::File, OwnedHandle)> {
@@ -392,7 +476,28 @@ mod windows_impl {
         Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
     }
 
-    fn build_command_line(executable: &str, arguments: &[String]) -> String {
+    /// Joins a program and its arguments into the single string Windows
+    /// actually passes to a process.
+    ///
+    /// `verbatim` turns the quoting off. Callers that have already quoted the
+    /// line themselves need that: cross-spawn -- which almost everything in
+    /// npm's ecosystem shells out through -- hands over
+    /// `cmd.exe /d /s /c "npm.cmd install ..."` with the quotes exactly where
+    /// `cmd` wants them, and quoting that again produces a line `cmd` cannot
+    /// parse. The executable is still quoted when it has to be, because a path
+    /// with a space in it is not the caller's mistake to own.
+    fn build_command_line(executable: &str, arguments: &[String], verbatim: bool) -> String {
+        if verbatim {
+            let program = if executable.contains(' ') || executable.contains('"') {
+                quote_windows_argument(executable)
+            } else {
+                executable.to_owned()
+            };
+            return std::iter::once(program)
+                .chain(arguments.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
         std::iter::once(executable)
             .chain(arguments.iter().map(String::as_str))
             .map(quote_windows_argument)
@@ -596,7 +701,7 @@ mod windows_impl {
                 "echo native-out & echo native-error 1>&2 & exit /b 7".to_owned(),
             ];
             let output =
-                spawn_native_with_bounded_output("cmd.exe", &arguments, None, 1024).unwrap();
+                spawn_native_with_bounded_output("cmd.exe", &arguments, None, 1024, false).unwrap();
             assert_eq!(output.status.code(), Some(7));
             assert!(String::from_utf8_lossy(&output.stdout).contains("native-out"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("native-error"));
@@ -609,8 +714,8 @@ mod windows_impl {
                 "/c".to_owned(),
                 "echo output-longer-than-eight-bytes".to_owned(),
             ];
-            let error =
-                spawn_native_with_bounded_output("cmd.exe", &arguments, None, 8).unwrap_err();
+            let error = spawn_native_with_bounded_output("cmd.exe", &arguments, None, 8, false)
+                .unwrap_err();
             assert!(error.to_string().contains("exceeds byte limit"));
         }
 
@@ -628,6 +733,7 @@ mod windows_impl {
 #[cfg(unix)]
 mod unix_impl {
     use super::{BoundedOutput, read_bounded};
+    use std::ffi::OsString;
     use std::io;
     use std::os::unix::process::CommandExt as _;
     use std::path::Path;
@@ -666,11 +772,33 @@ mod unix_impl {
     /// and bounded piped output. `std::process::Command` already restricts fd
     /// inheritance to the standard streams on POSIX, so this needs none of the
     /// manual named-pipe/attribute-list plumbing the Windows path requires.
+    /// `verbatim_arguments` is accepted and ignored: POSIX passes an argv, so
+    /// there is no command line for a caller to have pre-quoted.
     pub fn spawn_native_with_bounded_output(
         executable: &str,
         arguments: &[String],
         cwd: Option<&Path>,
         maximum_output_bytes: usize,
+        verbatim_arguments: bool,
+    ) -> io::Result<BoundedOutput> {
+        spawn_native_with_bounded_output_in(
+            executable,
+            arguments,
+            cwd,
+            maximum_output_bytes,
+            verbatim_arguments,
+            &[],
+        )
+    }
+
+    /// As above, with `environment` layered over the inherited variables.
+    pub fn spawn_native_with_bounded_output_in(
+        executable: &str,
+        arguments: &[String],
+        cwd: Option<&Path>,
+        maximum_output_bytes: usize,
+        _verbatim_arguments: bool,
+        environment: &[(OsString, OsString)],
     ) -> io::Result<BoundedOutput> {
         if executable.is_empty() || maximum_output_bytes == 0 {
             return Err(io::Error::new(
@@ -680,6 +808,9 @@ mod unix_impl {
         }
         let mut command = Command::new(executable);
         command.args(arguments).stdin(Stdio::null());
+        for (name, value) in environment {
+            command.env(name, value);
+        }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -804,7 +935,7 @@ mod unix_impl {
                 "echo native-out; echo native-error 1>&2; exit 7".to_owned(),
             ];
             let output =
-                spawn_native_with_bounded_output("/bin/sh", &arguments, None, 1024).unwrap();
+                spawn_native_with_bounded_output("/bin/sh", &arguments, None, 1024, false).unwrap();
             assert_eq!(output.status.code(), Some(7));
             assert!(String::from_utf8_lossy(&output.stdout).contains("native-out"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("native-error"));
@@ -816,8 +947,8 @@ mod unix_impl {
                 "-c".to_owned(),
                 "echo output-longer-than-eight-bytes".to_owned(),
             ];
-            let error =
-                spawn_native_with_bounded_output("/bin/sh", &arguments, None, 8).unwrap_err();
+            let error = spawn_native_with_bounded_output("/bin/sh", &arguments, None, 8, false)
+                .unwrap_err();
             assert!(error.to_string().contains("exceeds byte limit"));
         }
 
@@ -829,6 +960,7 @@ mod unix_impl {
                 &["-c".to_owned(), "pwd".to_owned()],
                 Some(&directory),
                 4096,
+                false,
             )
             .unwrap();
             let canonical = std::fs::canonicalize(&directory).unwrap();
@@ -839,10 +971,14 @@ mod unix_impl {
 }
 
 #[cfg(windows)]
-pub use windows_impl::{ChildJob, spawn_native_with_bounded_output};
+pub use windows_impl::{
+    ChildJob, spawn_native_with_bounded_output, spawn_native_with_bounded_output_in,
+};
 
 #[cfg(all(unix, not(windows)))]
-pub use unix_impl::{ChildJob, spawn_native_with_bounded_output};
+pub use unix_impl::{
+    ChildJob, spawn_native_with_bounded_output, spawn_native_with_bounded_output_in,
+};
 
 /// Ends this process immediately, skipping the orderly shutdown the C runtime
 /// and the Windows loader would otherwise perform.

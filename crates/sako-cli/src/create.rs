@@ -107,6 +107,21 @@ pub fn run(arguments: &[OsString]) -> Result<u8, String> {
         ));
     };
     let requested = requested.to_string_lossy().into_owned();
+    // `sako create --help` asked for a package called `create---help` and went
+    // to the registry for it. Nothing that starts with a dash names an
+    // initializer, so answer with create's own help instead.
+    if requested.starts_with('-') {
+        if matches!(requested.as_str(), "--help" | "-h") {
+            let entry = crate::help::find("create").expect("create is in the command table");
+            print!("{}", crate::help::command_page(Painter::stdout(), entry));
+            return Ok(0);
+        }
+        return Err(format!(
+            "create needs an initializer name, not {}\n       {}",
+            painter.bold(&requested),
+            painter.dim("example: sako create vite my-app"),
+        ));
+    }
     let (specifier, package) = initializer(&requested)?;
 
     let directory =
@@ -134,6 +149,11 @@ pub fn run(arguments: &[OsString]) -> Result<u8, String> {
             "SAKO_EXECUTABLE",
             env::current_exe().unwrap_or_else(|_| PathBuf::from("sako")),
         )
+        // Initializers read this to decide which package manager to name in
+        // the commands they print at the end. Unset, every one of them assumed
+        // npm -- which is why `sako create vite` finished by telling the user
+        // to run `npm install` for a project Sako had just scaffolded.
+        .env("npm_config_user_agent", sako_package::user_agent())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

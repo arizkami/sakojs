@@ -92,7 +92,10 @@ fn reports_the_cause_chain_behind_a_wrapped_error() {
 
     assert!(!output.status.success());
     assert!(stderr.contains("a misleading summary"), "stderr: {stderr}");
-    assert!(stderr.contains("[cause]: Error: the real reason"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("[cause]: Error: the real reason"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -592,6 +595,88 @@ fn serves_http_responses_produced_after_the_handler_returns() {
     assert!(child.wait().unwrap().success());
 }
 
+/// The HTTP client, pointed at a Sako server so nothing leaves the machine.
+///
+/// The server runs in a second process on purpose: the client blocks the loop
+/// while a request is in flight, so it cannot call a server that shares it.
+#[test]
+fn requests_http_as_a_client() {
+    use std::io::BufRead as _;
+    use std::net::TcpListener;
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("http-echo.mjs"))
+        .arg(port.to_string())
+        .arg("2")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Sako HTTP fixture should start");
+    let mut stdout = std::io::BufReader::new(server.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready, "http-ready\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("node-client.mjs"))
+        .arg(port.to_string())
+        .output()
+        .expect("sako should start");
+    let _ = server.wait();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "node-client\n");
+}
+
+/// The two child-process options npm's ecosystem depends on. cross-spawn hands
+/// over a command line it has already quoted and says so with
+/// `windowsVerbatimArguments`; quoting it again produces something the shell
+/// cannot parse, and the child fails without ever starting.
+#[test]
+fn spawns_children_through_a_shell_and_verbatim() {
+    let root = std::env::temp_dir().join(format!("sako-spawn-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let script = if cfg!(windows) {
+        concat!(
+            "const { spawnSync } = require('node:child_process');\n",
+            "const shell = spawnSync('echo', ['through-a-shell'], { shell: true, encoding: 'utf8' });\n",
+            "const verbatim = spawnSync('cmd.exe', ['/d', '/s', '/c', '\"echo\" verbatim-line'],\n",
+            "  { encoding: 'utf8', windowsVerbatimArguments: true });\n",
+            "console.log(shell.status, JSON.stringify(shell.stdout.trim()));\n",
+            "console.log(verbatim.status, JSON.stringify(verbatim.stdout.trim()));\n",
+        )
+    } else {
+        concat!(
+            "const { spawnSync } = require('node:child_process');\n",
+            "const shell = spawnSync('echo', ['through-a-shell'], { shell: true, encoding: 'utf8' });\n",
+            "const verbatim = spawnSync('/bin/sh', ['-c', 'echo verbatim-line'], { encoding: 'utf8' });\n",
+            "console.log(shell.status, JSON.stringify(shell.stdout.trim()));\n",
+            "console.log(verbatim.status, JSON.stringify(verbatim.stdout.trim()));\n",
+        )
+    };
+    std::fs::write(root.join("spawn.cjs"), script).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(root.join("spawn.cjs"))
+        .output()
+        .expect("sako should start");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("0 \"through-a-shell\""), "stdout: {stdout}");
+    assert!(stdout.contains("0 \"verbatim-line\""), "stdout: {stdout}");
+}
+
 /// Builds a Node-API addon against the executable's own export table and runs
 /// it, which is how a real binding reaches the runtime: it resolves `napi_*`
 /// from whatever process loaded it.
@@ -606,10 +691,12 @@ fn loads_and_runs_node_api_addons() {
     let build_dir = executable.parent().unwrap();
     // link.exe writes the import library beside the object files, not beside
     // the executable it describes.
-    let Some(import_library) = [build_dir.join("deps").join("sako.lib"), build_dir.join("sako.lib")]
-        .into_iter()
-        .find(|path| path.is_file())
-    else {
+    let Some(import_library) = [
+        build_dir.join("deps").join("sako.lib"),
+        build_dir.join("sako.lib"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
         eprintln!("skipping: no import library for the Sako executable");
         return;
     };
@@ -964,4 +1051,132 @@ fn process_exit_reports_its_code() {
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "before\n");
     }
+}
+
+/// Every spelling a user is likely to type has to reach the right command.
+///
+/// `sako i` reported "unknown command i / did you mean x?" -- a suggestion
+/// that shares nothing with what was typed, for the single most common command
+/// in any package manager.
+#[test]
+fn resolves_command_aliases_and_their_help() {
+    for alias in ["i", "in", "install"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+            .args([alias, "--help"])
+            .output()
+            .expect("sako should start");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "sako {alias} --help: {stdout}");
+        assert!(
+            stdout.contains("Install everything in package.json"),
+            "sako {alias} --help: {stdout}"
+        );
+    }
+
+    // `help <alias>` resolves to the canonical page as well.
+    for (alias, expected) in [
+        ("rm", "Remove dependencies"),
+        ("up", "Update dependencies"),
+        ("a", "Add dependencies"),
+        ("r", "Run a file"),
+        ("exec", "Execute a package binary"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+            .args(["help", alias])
+            .output()
+            .expect("sako should start");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "sako help {alias}: {stdout}");
+        assert!(stdout.contains(expected), "sako help {alias}: {stdout}");
+    }
+
+    // The overview advertises the short spellings, so they are discoverable
+    // rather than folklore.
+    let overview = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg("--help")
+        .output()
+        .expect("sako should start");
+    let stdout = String::from_utf8_lossy(&overview.stdout);
+    assert!(stdout.contains("install, i"), "overview: {stdout}");
+    assert!(stdout.contains("remove, rm"), "overview: {stdout}");
+}
+
+/// A mistyped command should suggest something that resembles it, and say
+/// nothing when nothing does.
+#[test]
+fn suggests_only_plausible_commands() {
+    let suggestion = |name: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+            .arg(name)
+            .output()
+            .expect("sako should start");
+        assert!(!output.status.success(), "sako {name} should fail");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+
+    let installl = suggestion("installl");
+    assert!(installl.contains("did you mean"), "{installl}");
+    assert!(installl.contains("install"), "{installl}");
+
+    // Nothing shares enough with a single unknown letter to be worth
+    // proposing; `x` used to be offered for every one of them.
+    let single = suggestion("q");
+    assert!(!single.contains("did you mean"), "{single}");
+    assert!(single.contains("unknown command"), "{single}");
+}
+
+/// A flag is never an option's value, and a repeated flag is fully removed.
+#[test]
+fn rejects_a_flag_where_a_value_belongs() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .args(["install", "--registry", "--token", "secret"])
+        .output()
+        .expect("sako should start");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--registry needs a value"), "{stderr}");
+}
+
+/// `-v` is what people type for a version, and it used to be read as a file
+/// path.
+#[test]
+fn accepts_the_short_version_flag() {
+    for flag in ["-v", "-V", "--version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+            .arg(flag)
+            .output()
+            .expect("sako should start");
+        assert!(output.status.success(), "sako {flag}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "sako 0.1.0\n");
+    }
+}
+
+/// process.stdin has to deliver what is piped into it, and node:readline has
+/// to decode terminal key sequences into the events prompt libraries listen
+/// for. Both were missing: reads went to a descriptor table that never held 0,
+/// so stdin reported end-of-input immediately, and nothing ever emitted a
+/// keypress.
+#[test]
+fn reads_standard_input_and_decodes_keys() {
+    use std::io::Write as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("stdin-keys.mjs"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sako should start");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"piped-payload\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "stdin-keys ok\n");
 }
