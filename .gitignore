@@ -2,4 +2,4 @@
 /.deps/
 node_modules
 /benchmark-results/
-/.deps.windows/
+/.deps.*

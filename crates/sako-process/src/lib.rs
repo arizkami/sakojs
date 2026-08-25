@@ -30,6 +30,7 @@ mod windows_impl {
     use super::{BoundedOutput, read_bounded};
     use std::ffi::c_void;
     use std::io;
+    use std::io::Read as _;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -283,10 +284,12 @@ mod windows_impl {
         drop(stdout_writer);
         drop(stderr_writer);
 
-        let stdout_thread =
-            std::thread::spawn(move || read_named_pipe_bounded(stdout_reader, maximum_output_bytes));
-        let stderr_thread =
-            std::thread::spawn(move || read_named_pipe_bounded(stderr_reader, maximum_output_bytes));
+        let stdout_thread = std::thread::spawn(move || {
+            read_named_pipe_bounded(stdout_reader, maximum_output_bytes)
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            read_named_pipe_bounded(stderr_reader, maximum_output_bytes)
+        });
         // SAFETY: process is a live owned process handle.
         if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
             return Err(io::Error::last_os_error());
@@ -450,7 +453,8 @@ mod windows_impl {
             let mut child = command.spawn()?;
             // SAFETY: both handles are live and owned outside this call. Assignment
             // changes kernel membership but transfers neither HANDLE.
-            if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0
+            {
                 let error = io::Error::last_os_error();
                 let _ = child.kill();
                 let _ = child.wait();
@@ -501,8 +505,10 @@ mod windows_impl {
                 .stderr
                 .take()
                 .ok_or_else(|| io::Error::other("child stderr pipe is unavailable"))?;
-            let stdout_thread = std::thread::spawn(move || read_bounded(stdout, maximum_output_bytes));
-            let stderr_thread = std::thread::spawn(move || read_bounded(stderr, maximum_output_bytes));
+            let stdout_thread =
+                std::thread::spawn(move || read_bounded(stdout, maximum_output_bytes));
+            let stderr_thread =
+                std::thread::spawn(move || read_bounded(stderr, maximum_output_bytes));
             let status = owned.wait()?;
             let stdout = stdout_thread
                 .join()
@@ -589,7 +595,8 @@ mod windows_impl {
                 "/c".to_owned(),
                 "echo native-out & echo native-error 1>&2 & exit /b 7".to_owned(),
             ];
-            let output = spawn_native_with_bounded_output("cmd.exe", &arguments, None, 1024).unwrap();
+            let output =
+                spawn_native_with_bounded_output("cmd.exe", &arguments, None, 1024).unwrap();
             assert_eq!(output.status.code(), Some(7));
             assert!(String::from_utf8_lossy(&output.stdout).contains("native-out"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("native-error"));
@@ -602,7 +609,8 @@ mod windows_impl {
                 "/c".to_owned(),
                 "echo output-longer-than-eight-bytes".to_owned(),
             ];
-            let error = spawn_native_with_bounded_output("cmd.exe", &arguments, None, 8).unwrap_err();
+            let error =
+                spawn_native_with_bounded_output("cmd.exe", &arguments, None, 8).unwrap_err();
             assert!(error.to_string().contains("exceeds byte limit"));
         }
 
@@ -727,8 +735,10 @@ mod unix_impl {
                 .stderr
                 .take()
                 .ok_or_else(|| io::Error::other("child stderr pipe is unavailable"))?;
-            let stdout_thread = std::thread::spawn(move || read_bounded(stdout, maximum_output_bytes));
-            let stderr_thread = std::thread::spawn(move || read_bounded(stderr, maximum_output_bytes));
+            let stdout_thread =
+                std::thread::spawn(move || read_bounded(stdout, maximum_output_bytes));
+            let stderr_thread =
+                std::thread::spawn(move || read_bounded(stderr, maximum_output_bytes));
             let status = owned.wait()?;
             let stdout = stdout_thread
                 .join()
@@ -793,7 +803,8 @@ mod unix_impl {
                 "-c".to_owned(),
                 "echo native-out; echo native-error 1>&2; exit 7".to_owned(),
             ];
-            let output = spawn_native_with_bounded_output("/bin/sh", &arguments, None, 1024).unwrap();
+            let output =
+                spawn_native_with_bounded_output("/bin/sh", &arguments, None, 1024).unwrap();
             assert_eq!(output.status.code(), Some(7));
             assert!(String::from_utf8_lossy(&output.stdout).contains("native-out"));
             assert!(String::from_utf8_lossy(&output.stderr).contains("native-error"));
@@ -805,7 +816,8 @@ mod unix_impl {
                 "-c".to_owned(),
                 "echo output-longer-than-eight-bytes".to_owned(),
             ];
-            let error = spawn_native_with_bounded_output("/bin/sh", &arguments, None, 8).unwrap_err();
+            let error =
+                spawn_native_with_bounded_output("/bin/sh", &arguments, None, 8).unwrap_err();
             assert!(error.to_string().contains("exceeds byte limit"));
         }
 
@@ -821,10 +833,7 @@ mod unix_impl {
             .unwrap();
             let canonical = std::fs::canonicalize(&directory).unwrap();
             let printed = String::from_utf8_lossy(&output.stdout);
-            assert_eq!(
-                std::fs::canonicalize(printed.trim()).unwrap(),
-                canonical
-            );
+            assert_eq!(std::fs::canonicalize(printed.trim()).unwrap(), canonical);
         }
     }
 }
@@ -834,3 +843,44 @@ pub use windows_impl::{ChildJob, spawn_native_with_bounded_output};
 
 #[cfg(all(unix, not(windows)))]
 pub use unix_impl::{ChildJob, spawn_native_with_bounded_output};
+
+/// Ends this process immediately, skipping the orderly shutdown the C runtime
+/// and the Windows loader would otherwise perform.
+///
+/// A normal return from `main` walks the C runtime's onexit table -- every
+/// C++ static destructor the image carries, V8's among them -- and then makes
+/// the loader detach each loaded module. None of that changes anything the
+/// process has already written; all of it is bookkeeping over memory the
+/// kernel unmaps a moment later. Chrome and Firefox both leave this way for
+/// the same reason.
+///
+/// Anything buffered in this process is lost. Callers must flush their own
+/// streams first; nothing after this call runs.
+pub fn exit_immediately(code: u8) -> ! {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> *mut core::ffi::c_void;
+            fn TerminateProcess(process: *mut core::ffi::c_void, code: u32) -> i32;
+        }
+        // SAFETY: both calls take no memory of ours and never return here.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), u32::from(code));
+        }
+    }
+    #[cfg(all(unix, not(windows)))]
+    {
+        unsafe extern "C" {
+            fn _exit(code: i32) -> !;
+        }
+        // SAFETY: _exit is always available and never returns.
+        unsafe { _exit(i32::from(code)) }
+    }
+    // TerminateProcess on the current process does not return, but the
+    // compiler cannot know that.
+    #[allow(unreachable_code)]
+    {
+        std::process::exit(i32::from(code))
+    }
+}

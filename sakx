@@ -1,0 +1,19 @@
+#!/bin/sh
+# Shorthand for `sako x`, in the spirit of npx and bunx.
+# Searches next to this script, then the local build output, then PATH, so it
+# works both from an install and straight out of a checkout.
+basedir=$(dirname "$0")
+for candidate in \
+  "$basedir/sako" \
+  "$basedir/target/x86_64-unknown-linux-gnu/release/sako" \
+  "$basedir/target/release/sako"
+do
+  if [ -x "$candidate" ]; then
+    exec "$candidate" x "$@"
+  fi
+done
+if command -v sako >/dev/null 2>&1; then
+  exec sako x "$@"
+fi
+echo "sakx: cannot find sako. Build it with \`cargo build --release\` or put it on PATH." >&2
+exit 127

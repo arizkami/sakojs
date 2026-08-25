@@ -19,18 +19,172 @@
   };
   globalThis.clearImmediate = (id) => immediateTasks.delete(id);
 
+  // Node hands back a Timeout object rather than a number, and `.unref()` on
+  // it is how a program says "do not stay alive for this one". Everything that
+  // takes a timer keeps working because the object coerces to its own id, and
+  // node:timers reads these off the global, so its exports stay identical to
+  // the globals.
+  class Timeout {
+    constructor(id) { this._id = id; this._referenced = true; }
+    ref() { this._referenced = true; __sakoTimerRef(this._id, true); return this; }
+    unref() { this._referenced = false; __sakoTimerRef(this._id, false); return this; }
+    hasRef() { return this._referenced; }
+    refresh() { return this; }
+    close() { clearTimeout(this._id); return this; }
+    valueOf() { return this._id; }
+    [Symbol.toPrimitive]() { return this._id; }
+  }
+  const scheduleTimeout = globalThis.setTimeout;
+  const scheduleInterval = globalThis.setInterval;
+  globalThis.setTimeout = (...args) => new Timeout(scheduleTimeout(...args));
+  globalThis.setInterval = (...args) => new Timeout(scheduleInterval(...args));
+
+  // Buffer encodings. Only utf8 was ever decoded, which is enough for reading
+  // a source file and nothing else: a bundler embedding an inline source map,
+  // a loader reading a data: URL, and anything hashing to hex all arrive as
+  // base64 or hex and used to fail at the first Buffer.from.
+  const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const BASE64_URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const BASE64_VALUES = (() => {
+    const table = new Int16Array(256).fill(-1);
+    for (let index = 0; index < BASE64_ALPHABET.length; index += 1) {
+      table[BASE64_ALPHABET.charCodeAt(index)] = index;
+    }
+    // base64url spells the last two digits differently; accepting both on the
+    // way in costs nothing and is what Node does.
+    table[45] = 62;
+    table[95] = 63;
+    return table;
+  })();
+
+  const normalizeEncoding = (encoding) => {
+    if (encoding === undefined || encoding === null) return "utf8";
+    switch (String(encoding).toLowerCase()) {
+      case "utf8": case "utf-8": return "utf8";
+      case "hex": return "hex";
+      case "base64": return "base64";
+      case "base64url": return "base64url";
+      case "latin1": case "binary": return "latin1";
+      case "ascii": return "ascii";
+      case "ucs2": case "ucs-2": case "utf16le": case "utf-16le": return "utf16le";
+      default: return null;
+    }
+  };
+
+  const encodeString = (value, encoding) => {
+    if (encoding === "utf8") return __sakoEncodeUtf8(value);
+    if (encoding === "hex") {
+      const pairs = value.length >> 1;
+      const bytes = new Uint8Array(pairs);
+      for (let index = 0; index < pairs; index += 1) {
+        const byte = Number.parseInt(value.substr(index * 2, 2), 16);
+        // Node stops at the first pair that is not hex rather than throwing.
+        if (Number.isNaN(byte)) return bytes.subarray(0, index);
+        bytes[index] = byte;
+      }
+      return bytes;
+    }
+    if (encoding === "base64" || encoding === "base64url") {
+      const output = [];
+      let bits = 0;
+      let count = 0;
+      for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        const digit = code < 256 ? BASE64_VALUES[code] : -1;
+        // Padding and whitespace are skipped rather than rejected.
+        if (digit < 0) continue;
+        bits = (bits << 6) | digit;
+        count += 6;
+        if (count >= 8) {
+          count -= 8;
+          output.push((bits >> count) & 255);
+        }
+      }
+      return new Uint8Array(output);
+    }
+    if (encoding === "utf16le") {
+      const bytes = new Uint8Array(value.length * 2);
+      for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        bytes[index * 2] = code & 255;
+        bytes[index * 2 + 1] = code >> 8;
+      }
+      return bytes;
+    }
+    // latin1 and ascii differ only in how much of each code unit survives.
+    const mask = encoding === "ascii" ? 127 : 255;
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      bytes[index] = value.charCodeAt(index) & mask;
+    }
+    return bytes;
+  };
+
+  const decodeBytes = (bytes, encoding) => {
+    if (encoding === "utf8") return __sakoDecodeUtf8(bytes);
+    if (encoding === "hex") {
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+    if (encoding === "base64" || encoding === "base64url") {
+      const alphabet = encoding === "base64" ? BASE64_ALPHABET : BASE64_URL_ALPHABET;
+      const padded = encoding === "base64";
+      let output = "";
+      for (let index = 0; index < bytes.length; index += 3) {
+        const first = bytes[index];
+        const second = bytes[index + 1];
+        const third = bytes[index + 2];
+        output += alphabet[first >> 2];
+        output += alphabet[((first & 3) << 4) | ((second || 0) >> 4)];
+        if (index + 1 < bytes.length) {
+          output += alphabet[((second & 15) << 2) | ((third || 0) >> 6)];
+        } else if (padded) {
+          output += "=";
+        }
+        if (index + 2 < bytes.length) {
+          output += alphabet[third & 63];
+        } else if (padded) {
+          output += "=";
+        }
+      }
+      return output;
+    }
+    if (encoding === "utf16le") {
+      let output = "";
+      for (let index = 0; index + 1 < bytes.length; index += 2) {
+        output += String.fromCharCode(bytes[index] | (bytes[index + 1] << 8));
+      }
+      return output;
+    }
+    const mask = encoding === "ascii" ? 127 : 255;
+    let output = "";
+    // Chunked, because one call per byte is slow and one call for the whole
+    // buffer overflows the argument limit on anything large.
+    for (let index = 0; index < bytes.length; index += 4096) {
+      const chunk = bytes.subarray(index, index + 4096);
+      output += String.fromCharCode.apply(null, Array.from(chunk, (byte) => byte & mask));
+    }
+    return output;
+  };
+
   class Buffer extends Uint8Array {
-    static from(value, encoding = "utf8") {
+    static from(value, encodingOrOffset, length) {
       let bytes;
       if (typeof value === "string") {
-        if (encoding !== "utf8" && encoding !== "utf-8") {
-          throw new TypeError(`Unsupported encoding: ${encoding}`);
+        const encoding = normalizeEncoding(encodingOrOffset);
+        if (encoding === null) {
+          throw new TypeError(`Unsupported encoding: ${encodingOrOffset}`);
         }
-        bytes = __sakoEncodeUtf8(value);
+        bytes = encodeString(value, encoding);
       } else if (value instanceof ArrayBuffer) {
-        bytes = new Uint8Array(value);
+        // The second argument is a byte offset here, not an encoding: the
+        // ArrayBuffer overload shares its position with the string form.
+        const offset = encodingOrOffset === undefined ? 0 : Number(encodingOrOffset);
+        const count = length === undefined ? value.byteLength - offset : Number(length);
+        bytes = new Uint8Array(value, offset, count);
       } else if (ArrayBuffer.isView(value) || Array.isArray(value)) {
         bytes = new Uint8Array(value);
+      } else if (value !== null && typeof value === "object" && typeof value.length === "number") {
+        bytes = Uint8Array.from(value, (byte) => Number(byte) & 255);
       } else {
         throw new TypeError("Buffer.from needs a string, ArrayBuffer, or byte array");
       }
@@ -56,9 +210,9 @@
     }
 
     static byteLength(value, encoding = "utf8") {
-      return Buffer.isBuffer(value) || ArrayBuffer.isView(value)
-        ? value.byteLength
-        : Buffer.from(String(value), encoding).length;
+      if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) return value.byteLength;
+      if (value instanceof ArrayBuffer) return value.byteLength;
+      return Buffer.from(String(value), encoding).length;
     }
 
     static concat(values, totalLength) {
@@ -78,26 +232,44 @@
     }
 
     toString(encoding = "utf8", start = 0, end = this.length) {
-      const bytes = this.subarray(start, end);
-      if (encoding === "utf8" || encoding === "utf-8") return __sakoDecodeUtf8(bytes);
-      if (encoding === "hex") return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-      if (encoding === "base64") {
-        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let output = "";
-        for (let index = 0; index < bytes.length; index += 3) {
-          const first = bytes[index];
-          const second = bytes[index + 1];
-          const third = bytes[index + 2];
-          output += alphabet[first >> 2];
-          output += alphabet[((first & 3) << 4) | ((second || 0) >> 4)];
-          output += index + 1 < bytes.length ? alphabet[((second & 15) << 2) | ((third || 0) >> 6)] : "=";
-          output += index + 2 < bytes.length ? alphabet[third & 63] : "=";
-        }
-        return output;
+      const name = normalizeEncoding(encoding);
+      if (name === null) throw new TypeError(`Unsupported encoding: ${encoding}`);
+      return decodeBytes(this.subarray(start, end), name);
+    }
+
+    write(value, offset = 0, length, encoding) {
+      // The trailing arguments slide the way Node's do: write(value, encoding)
+      // is as common as the full form, and tooling uses both.
+      if (typeof offset === "string") { encoding = offset; offset = 0; length = undefined; }
+      else if (typeof length === "string") { encoding = length; length = undefined; }
+      const name = normalizeEncoding(encoding);
+      if (name === null) throw new TypeError(`Unsupported encoding: ${encoding}`);
+      const bytes = encodeString(String(value), name);
+      const room = Math.min(bytes.length, this.length - offset,
+        length === undefined ? Number.MAX_SAFE_INTEGER : length);
+      if (room <= 0) return 0;
+      this.set(bytes.subarray(0, room), offset);
+      return room;
+    }
+
+    equals(other) {
+      if (!ArrayBuffer.isView(other)) throw new TypeError("Buffer.equals needs a byte array");
+      if (other.byteLength !== this.length) return false;
+      for (let index = 0; index < this.length; index += 1) {
+        if (this[index] !== other[index]) return false;
       }
-      throw new TypeError(`Unsupported encoding: ${encoding}`);
+      return true;
+    }
+
+    toJSON() {
+      return { type: "Buffer", data: Array.from(this) };
     }
   }
+
+  // atob and btoa predate typed arrays: both sides of them are "binary
+  // strings", one character per byte, which is latin1.
+  globalThis.btoa = (value) => decodeBytes(encodeString(String(value), 'latin1'), 'base64');
+  globalThis.atob = (value) => decodeBytes(encodeString(String(value), 'base64'), 'latin1');
 
   class TextEncoder {
     get encoding() { return "utf-8"; }
@@ -153,19 +325,51 @@
     [Symbol.iterator]() { return this.entries(); }
   }
 
+  // Collapses "." and ".." segments, which relative resolution otherwise leaves
+  // in the path: `new URL(".", base).pathname` has to end at the directory, not
+  // at a literal trailing dot.
+  const normalizePath = (pathname) => {
+    if (!/(^|\/)\.{1,2}(\/|$)/.test(pathname)) return pathname;
+    const segments = pathname.split("/");
+    const output = [];
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      const last = index === segments.length - 1;
+      if (segment === ".." && output.length > 1) output.pop();
+      if (segment === "." || segment === "..") {
+        // A dot segment at the end still leaves the trailing separator behind.
+        if (last) output.push("");
+        continue;
+      }
+      output.push(segment);
+    }
+    return output.join("/");
+  };
+
   class URL {
     constructor(input, base) {
       input = String(input);
       if (!/^[A-Za-z][A-Za-z\d+.-]*:/.test(input)) {
         if (base === undefined) throw new TypeError("Invalid URL");
         const baseUrl = base instanceof URL ? base : new URL(base);
+        // Resolve against the base's scheme and authority rather than its
+        // origin. `origin` is the string "null" for a file: URL by definition,
+        // and import.meta.url is a file: URL -- so a tool resolving anything
+        // relative to its own location, which bundlers emit constantly, used to
+        // parse "null/..." and throw.
+        const root = `${baseUrl.protocol}${baseUrl._slashes ? `//${baseUrl.host}` : ""}`;
         if (input.startsWith("//")) input = `${baseUrl.protocol}${input}`;
-        else if (input.startsWith("/")) input = `${baseUrl.origin}${input}`;
-        else input = `${baseUrl.origin}${baseUrl.pathname.slice(0, baseUrl.pathname.lastIndexOf("/") + 1)}${input}`;
+        else if (input.startsWith("/")) input = `${root}${input}`;
+        else if (input.startsWith("?") || input.startsWith("#")) input = `${root}${baseUrl.pathname}${input}`;
+        else input = `${root}${baseUrl.pathname.slice(0, baseUrl.pathname.lastIndexOf("/") + 1)}${input}`;
       }
       const match = /^([A-Za-z][A-Za-z\d+.-]*:)(?:\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(input);
       if (!match) throw new TypeError("Invalid URL");
       this.protocol = match[1].toLowerCase();
+      // Whether the input carried an authority at all, empty or not. "file:"
+      // and "file://" are different URLs, and only this tells them apart once
+      // the empty host has been parsed away.
+      this._slashes = match[2] !== undefined;
       let authority = match[2] || "";
       const at = authority.lastIndexOf("@");
       let credentials = "";
@@ -181,7 +385,7 @@
         this.hostname = authority.toLowerCase();
         this.port = "";
       }
-      this.pathname = match[3] || (authority ? "/" : "");
+      this.pathname = normalizePath(match[3] || (authority ? "/" : ""));
       this._searchParams = new URLSearchParams(match[4] || "");
       this.hash = match[5] || "";
     }
@@ -196,26 +400,105 @@
     get searchParams() { return this._searchParams; }
     get href() {
       const credentials = this.username || this.password ? `${encodeURIComponent(this.username)}${this.password ? `:${encodeURIComponent(this.password)}` : ""}@` : "";
-      return `${this.protocol}${this.hostname ? `//${credentials}${this.host}` : ""}${this.pathname}${this.search}${this.hash}`;
+      return `${this.protocol}${this._slashes ? `//${credentials}${this.host}` : ""}${this.pathname}${this.search}${this.hash}`;
     }
     set href(value) { Object.assign(this, new URL(value)); }
     toString() { return this.href; }
     toJSON() { return this.href; }
   }
 
-  class AbortSignal {
+  class Event {
+    constructor(type, options = {}) {
+      this.type = String(type);
+      this.bubbles = Boolean(options.bubbles);
+      this.cancelable = Boolean(options.cancelable);
+      this.composed = Boolean(options.composed);
+      this.defaultPrevented = false;
+      this.target = null;
+      this.currentTarget = null;
+      this.eventPhase = 0;
+      this.timeStamp = 0;
+      this._stopped = false;
+    }
+    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+    stopPropagation() { this._stopped = true; }
+    stopImmediatePropagation() { this._stopped = true; }
+  }
+
+  class CustomEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      this.detail = options.detail === undefined ? null : options.detail;
+    }
+  }
+
+  // EventTarget, because AbortSignal is one and a growing number of packages
+  // check for it by name rather than by capability. Only the parts that mean
+  // anything without a DOM tree are here: there is no propagation path, so
+  // capture and bubbling have nothing to do.
+  class EventTarget {
     constructor() {
-      this.aborted = false;
-      this.reason = undefined;
-      this.listeners = [];
+      Object.defineProperty(this, "_listeners", {
+        value: new Map(), writable: true, enumerable: false, configurable: true,
+      });
     }
     addEventListener(type, listener, options = {}) {
-      if (type === "abort" && typeof listener === "function") {
-        this.listeners.push({ listener, once: Boolean(options.once) });
-      }
+      if (listener === null || listener === undefined) return;
+      const callable = typeof listener === "function" ? listener : listener.handleEvent;
+      if (typeof callable !== "function") return;
+      const name = String(type);
+      const entries = this._listeners.get(name) ?? [];
+      if (entries.some((entry) => entry.listener === listener)) return;
+      entries.push({ listener, once: Boolean(options && options.once) });
+      this._listeners.set(name, entries);
     }
     removeEventListener(type, listener) {
-      if (type === "abort") this.listeners = this.listeners.filter((item) => item.listener !== listener);
+      const name = String(type);
+      const entries = this._listeners.get(name);
+      if (entries === undefined) return;
+      this._listeners.set(name, entries.filter((entry) => entry.listener !== listener));
+    }
+    dispatchEvent(event) {
+      const entries = this._listeners.get(String(event.type));
+      if (entries === undefined || entries.length === 0) return true;
+      event.target = this;
+      event.currentTarget = this;
+      // Copied first: a listener is allowed to add or remove listeners, and
+      // must not change who is called for the event already in flight.
+      const pending = entries.slice();
+      this._listeners.set(String(event.type), entries.filter((entry) => !entry.once));
+      for (const entry of pending) {
+        if (event._stopped) break;
+        const callable = typeof entry.listener === "function"
+          ? entry.listener
+          : entry.listener.handleEvent;
+        callable.call(entry.listener === callable ? this : entry.listener, event);
+      }
+      return !event.defaultPrevented;
+    }
+  }
+
+  class AbortSignal extends EventTarget {
+    constructor() {
+      super();
+      this.aborted = false;
+      this.reason = undefined;
+      this.onabort = null;
+    }
+    static abort(reason = undefined) {
+      const controller = new AbortController();
+      controller.abort(reason);
+      return controller.signal;
+    }
+    static timeout(milliseconds) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        const reason = new Error("The operation was aborted due to timeout");
+        reason.name = "TimeoutError";
+        controller.abort(reason);
+      }, milliseconds);
+      if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+      return controller.signal;
     }
     throwIfAborted() { if (this.aborted) throw this.reason; }
   }
@@ -230,9 +513,10 @@
       }
       this.signal.aborted = true;
       this.signal.reason = reason;
-      const listeners = this.signal.listeners.slice();
-      this.signal.listeners = this.signal.listeners.filter((item) => !item.once);
-      for (const { listener } of listeners) listener.call(this.signal, { type: "abort", target: this.signal });
+      if (typeof this.signal.onabort === "function") {
+        this.signal.onabort.call(this.signal, new Event("abort"));
+      }
+      this.signal.dispatchEvent(new Event("abort"));
     }
   }
 
@@ -361,6 +645,22 @@
       return this;
     }
     addListener(name, listener) { return this.on(name, listener); }
+    // Order matters to callers that install a handler ahead of one a library
+    // already registered -- Vite puts its own "error" listener in front of the
+    // HTTP server's to turn a port clash into a retry.
+    prependListener(name, listener) {
+      if (typeof listener !== "function") throw new TypeError("listener must be a function");
+      if (!this._events) this._events = new Map();
+      const listeners = this._events.get(name) || [];
+      listeners.unshift(listener);
+      this._events.set(name, listeners);
+      return this;
+    }
+    prependOnceListener(name, listener) {
+      const wrapper = (...args) => { this.off(name, wrapper); listener.apply(this, args); };
+      wrapper.listener = listener;
+      return this.prependListener(name, wrapper);
+    }
     once(name, listener) {
       const wrapper = (...args) => { this.off(name, wrapper); listener.apply(this, args); };
       wrapper.listener = listener;
@@ -392,6 +692,12 @@
       const listeners = this._events === null ? undefined : this._events.get(name);
       return listeners === undefined ? 0 : listeners.length;
     }
+    rawListeners(name) { return (this._events?.get(name) || []).slice(); }
+    eventNames() { return this._events === null ? [] : [...this._events.keys()]; }
+    // No listener ceiling is enforced, so these only keep the accessors honest
+    // for code that reads back what it set.
+    setMaxListeners(count) { this._maxListeners = count; return this; }
+    getMaxListeners() { return this._maxListeners ?? 10; }
   }
 
   console.error = console.error || console.log;
@@ -449,7 +755,15 @@
         value = `${index < 0 ? __sakoCwd : parts[index]}\\${value}`;
         if (pathWin32.isAbsolute(value)) break;
       }
-      return pathWin32.normalize(value);
+      // The loop above puts a separator after the last segment, and normalize
+      // preserves trailing separators by design. resolve must not: Node keeps
+      // one only when the result is a root, and a stray trailing separator
+      // makes stat reject the path as a directory name.
+      const resolved = pathWin32.normalize(value);
+      if (resolved === "\\" || /^[A-Za-z]:\\$/.test(resolved)) return resolved;
+      const trimmed = resolved.replace(/[\\/]+$/, "");
+      if (/^[A-Za-z]:$/.test(trimmed)) return `${trimmed}\\`;
+      return trimmed || "\\";
     },
     isAbsolute(value) { return /^(?:[A-Za-z]:[\\/]|[\\/]{2})/.test(String(value)); },
     basename(value, suffix = "") {
@@ -494,7 +808,10 @@
         value = `${index < 0 ? __sakoCwd : parts[index]}/${value}`;
         if (pathPosix.isAbsolute(value)) break;
       }
-      return pathPosix.normalize(value);
+      // See the win32 twin: the loop leaves a trailing separator that
+      // normalize keeps, and resolve must only keep one for the root.
+      const resolved = pathPosix.normalize(value);
+      return resolved === "/" ? resolved : resolved.replace(/\/+$/, "") || "/";
     },
     isAbsolute(value) { return String(value).startsWith("/"); },
     basename(value, suffix = "") {
@@ -518,15 +835,107 @@
   // `__sakoPlatform` is set before this script runs (see bridge.cc), so the
   // right flavor is already known at bootstrap-eval time, before `process`
   // itself exists.
+  // relative/parse/format/toNamespacedPath, shared by both flavors. Written
+  // once against a flavor's own primitives so the win32 and posix versions
+  // cannot drift.
+  const addPathExtras = (flavor, sep, delimiter, caseInsensitive) => {
+    flavor.sep = sep;
+    flavor.delimiter = delimiter;
+    flavor.relative = (from, to) => {
+      const start = flavor.resolve(String(from));
+      const end = flavor.resolve(String(to));
+      if (start === end) return "";
+      const fold = (value) => (caseInsensitive ? value.toLowerCase() : value);
+      const split = (value) => value.split(/[\\/]/).filter(Boolean);
+      const fromParts = split(start);
+      const toParts = split(end);
+      // A different root has no relative expression; Node returns the target.
+      if (fold(fromParts[0] ?? "") !== fold(toParts[0] ?? "")) return end;
+      let shared = 0;
+      while (shared < fromParts.length && shared < toParts.length &&
+             fold(fromParts[shared]) === fold(toParts[shared])) {
+        shared += 1;
+      }
+      const up = new Array(fromParts.length - shared).fill("..");
+      return [...up, ...toParts.slice(shared)].join(sep);
+    };
+    flavor.parse = (value) => {
+      const text = String(value);
+      const dir = flavor.dirname(text);
+      const base = flavor.basename(text);
+      const ext = flavor.extname(text);
+      const rootMatch = caseInsensitive
+        ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+[\\/]?|[\\/])/.exec(text)
+        : /^\//.exec(text);
+      return {
+        root: rootMatch ? rootMatch[0] : "",
+        dir: dir === "." && !text.includes(sep) ? "" : dir,
+        base,
+        ext,
+        name: ext ? base.slice(0, -ext.length) : base,
+      };
+    };
+    flavor.format = (parsed = {}) => {
+      const base = parsed.base ?? `${parsed.name ?? ""}${parsed.ext ?? ""}`;
+      const dir = parsed.dir ?? parsed.root ?? "";
+      if (!dir) return base;
+      return dir === parsed.root ? `${dir}${base}` : `${dir}${sep}${base}`;
+    };
+  };
+  addPathExtras(pathWin32, "\\", ";", true);
+  addPathExtras(pathPosix, "/", ":", false);
+  // Only Windows has a namespaced form; on posix Node returns the input.
+  pathWin32.toNamespacedPath = (value) => {
+    const text = String(value);
+    if (!pathWin32.isAbsolute(text) || text.startsWith("\\\\?\\")) return text;
+    const resolved = pathWin32.resolve(text);
+    return resolved.startsWith("\\\\")
+      ? `\\\\?\\UNC\\${resolved.slice(2)}`
+      : `\\\\?\\${resolved}`;
+  };
+  pathPosix.toNamespacedPath = (value) => value;
+  pathWin32.win32 = pathWin32;
+  pathWin32.posix = pathPosix;
+  pathPosix.win32 = pathWin32;
+  pathPosix.posix = pathPosix;
+
   const path = globalThis.__sakoPlatform === "win32" ? pathWin32 : pathPosix;
   path.win32 = pathWin32;
   path.posix = pathPosix;
 
   class Stats {
-    constructor(value) { Object.assign(this, value); }
+    constructor(value) {
+      Object.assign(this, value);
+      // Node exposes each timestamp twice, as milliseconds and as a Date, and
+      // callers reach for either: a build tool compares `mtimeMs`, a static
+      // file server stamps Last-Modified from `mtime`. Sako records one
+      // modification time, so the rest mirror it rather than being absent --
+      // reading a missing one is a crash, not a graceful fallback.
+      const stamp = typeof this.mtimeMs === "number" ? this.mtimeMs : 0;
+      this.mtimeMs = this.atimeMs = this.ctimeMs = this.birthtimeMs = stamp;
+      this.mtime = new Date(stamp);
+      this.atime = new Date(stamp);
+      this.ctime = new Date(stamp);
+      this.birthtime = new Date(stamp);
+      // Windows has no POSIX inode or ownership to report; the mode is the
+      // conventional default for a readable file or directory.
+      this.mode = this.directory ? 0o040755 : 0o100644;
+      this.nlink = 1;
+      this.ino = 0;
+      this.dev = 0;
+      this.rdev = 0;
+      this.uid = 0;
+      this.gid = 0;
+      this.blksize = 4096;
+      this.blocks = Math.ceil((this.size || 0) / 512);
+    }
     isFile() { return this.file; }
     isDirectory() { return this.directory; }
     isSymbolicLink() { return this.symbolicLink; }
+    isBlockDevice() { return false; }
+    isCharacterDevice() { return false; }
+    isFIFO() { return false; }
+    isSocket() { return false; }
   }
 
   const statSync = (value, followLinks = true) => new Stats(__sakoStatSync(value, followLinks));
@@ -586,6 +995,74 @@
       const bytes = typeof buffer === "string" ? Buffer.from(buffer) : buffer;
       return __sakoWriteSync(fd, bytes, offset, length === undefined ? bytes.length - offset : length, position);
     },
+    // The copy family, expressed through readFileSync/writeFileSync rather
+    // than native calls. Scaffolding tools lean on these heavily -- copying a
+    // template tree is the whole job -- so their absence stopped project
+    // generators immediately after they had already created the directory.
+    copyFileSync(source, destination, mode = 0) {
+      // COPYFILE_EXCL: fail rather than overwrite an existing destination.
+      if ((mode & 1) !== 0 && __sakoExistsSync(String(destination))) {
+        const error = new Error(`EEXIST: file already exists, copyfile '${source}' -> '${destination}'`);
+        error.code = "EEXIST";
+        throw error;
+      }
+      __sakoWriteFileSync(String(destination), __sakoReadFileSync(String(source), false));
+    },
+    cpSync(source, destination, options = {}) {
+      const from = String(source);
+      const to = String(destination);
+      // statSync/readdirSync/path.join rather than the raw __sako* calls: the
+      // wrappers normalize arguments and return a Stats object whose
+      // isDirectory is a method, and path.join avoids the doubled separators
+      // that hand-built paths produce.
+      if (!statSync(from).isDirectory()) {
+        if (options.force === false && __sakoExistsSync(to)) return;
+        fs.copyFileSync(from, to);
+        return;
+      }
+      if (options.recursive === false) {
+        const error = new Error(`EISDIR: illegal operation on a directory, cp '${from}'`);
+        error.code = "EISDIR";
+        throw error;
+      }
+      mkdirSync(to, { recursive: true });
+      for (const name of readdirSync(from)) {
+        if (!name) continue;
+        fs.cpSync(path.join(from, name), path.join(to, name), options);
+      }
+    },
+    appendFileSync(target, data, options) {
+      const existing = __sakoExistsSync(String(target)) ? __sakoReadFileSync(String(target), false) : Buffer.alloc(0);
+      const addition = typeof data === "string" ? Buffer.from(data, typeof options === "string" ? options : (options && options.encoding) || "utf8") : data;
+      __sakoWriteFileSync(String(target), Buffer.concat([Buffer.from(existing), Buffer.from(addition)]));
+    },
+    accessSync(target) {
+      if (!__sakoExistsSync(String(target))) {
+        const error = new Error(`ENOENT: no such file or directory, access '${target}'`);
+        error.code = "ENOENT";
+        throw error;
+      }
+    },
+    mkdtempSync(prefix) {
+      // Node guarantees six random characters; the loop guards the collision
+      // that Math.random alone does not.
+      for (let attempt = 0; attempt < 64; attempt += 1) {
+        const suffix = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+        const candidate = `${prefix}${suffix}`;
+        if (__sakoExistsSync(candidate)) continue;
+        __sakoMakeDirectorySync(candidate, true);
+        return candidate;
+      }
+      throw new Error("EEXIST: cannot create a unique temporary directory");
+    },
+    // Windows has no POSIX mode bits and Sako exposes no chmod, so this is a
+    // no-op rather than a failure: callers use it to set an execute bit that
+    // does not exist here.
+    chmodSync() {},
+  };
+  fs.constants = {
+    F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
+    COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
   };
   fs.readFile = (...args) => { const callback = args.pop(); callbackOperation(() => fs.readFileSync(...args), callback); };
   fs.writeFile = (...args) => { const callback = args.pop(); callbackOperation(() => fs.writeFileSync(...args), callback); };
@@ -612,6 +1089,11 @@
   };
   fs.readlink = (value, callback) => callbackOperation(() => fs.readlinkSync(value), callback);
   fs.realpath = (value, callback) => callbackOperation(() => fs.realpathSync(value), callback);
+  // Node exposes a second, OS-native resolver under .native. There is only one
+  // here, but tooling picks the native form when it exists and crashes on the
+  // property access rather than falling back.
+  fs.realpathSync.native = (value) => fs.realpathSync(value);
+  fs.realpath.native = (value, callback) => fs.realpath(value, callback);
   fs.open = (value, flags, mode, callback) => {
     if (typeof mode === "function") { callback = mode; mode = undefined; }
     callbackOperation(() => fs.openSync(value, flags, mode), callback);
@@ -659,7 +1141,151 @@
   };
   fs.promises = fsPromises;
 
+  // util.styleText, added in Node 20.12. CLI tooling has adopted it quickly as
+  // a way to colour output without a dependency, so a missing export here
+  // breaks such a tool at import time rather than at the call.
+  const STYLE_CODES = {
+    reset: [0, 0], bold: [1, 22], dim: [2, 22], italic: [3, 23],
+    underline: [4, 24], blink: [5, 25], inverse: [7, 27], hidden: [8, 28],
+    strikethrough: [9, 29],
+    black: [30, 39], red: [31, 39], green: [32, 39], yellow: [33, 39],
+    blue: [34, 39], magenta: [35, 39], cyan: [36, 39], white: [37, 39],
+    gray: [90, 39], grey: [90, 39], blackBright: [90, 39], redBright: [91, 39],
+    greenBright: [92, 39], yellowBright: [93, 39], blueBright: [94, 39],
+    magentaBright: [95, 39], cyanBright: [96, 39], whiteBright: [97, 39],
+    bgBlack: [40, 49], bgRed: [41, 49], bgGreen: [42, 49], bgYellow: [43, 49],
+    bgBlue: [44, 49], bgMagenta: [45, 49], bgCyan: [46, 49], bgWhite: [47, 49],
+  };
+  const styleText = (format, text, options = {}) => {
+    if (typeof text !== "string") throw new TypeError("styleText needs a string");
+    const formats = Array.isArray(format) ? format : [format];
+    // Node skips styling when the target stream is not a terminal, so piped
+    // output stays free of escapes.
+    const stream = options.stream;
+    if (stream && stream.isTTY === false) return text;
+    let result = text;
+    for (let index = formats.length - 1; index >= 0; index -= 1) {
+      const code = STYLE_CODES[formats[index]];
+      if (code === undefined) throw new TypeError(`unknown style: ${formats[index]}`);
+      result = `\x1b[${code[0]}m${result}\x1b[${code[1]}m`;
+    }
+    return result;
+  };
+
+  const isDeepStrictEqual = (left, right) => {
+    if (Object.is(left, right)) return true;
+    if (typeof left !== "object" || typeof right !== "object" || left === null || right === null) return false;
+    if (Object.getPrototypeOf(left) !== Object.getPrototypeOf(right)) return false;
+    if (Array.isArray(left) !== Array.isArray(right)) return false;
+    const leftKeys = Reflect.ownKeys(left);
+    const rightKeys = Reflect.ownKeys(right);
+    if (leftKeys.length !== rightKeys.length) return false;
+    return leftKeys.every((key) => Reflect.has(right, key) && isDeepStrictEqual(left[key], right[key]));
+  };
+
+  /// util.parseArgs. Supports the options CLIs actually use: long flags with
+  /// = or a following value, short aliases, booleans, and multiples. Not
+  /// supported: strict-mode error shapes beyond unknown-option detection.
+  const parseArgs = (config = {}) => {
+    const options = config.options ?? {};
+    const args = config.args ?? process.argv.slice(2);
+    const allowPositionals = config.allowPositionals ?? !config.strict;
+    const values = {};
+    const positionals = [];
+    const byShort = new Map(
+      Object.entries(options)
+        .filter(([, option]) => option.short)
+        .map(([name, option]) => [option.short, name]),
+    );
+    const assign = (name, value) => {
+      const option = options[name] ?? {};
+      if (option.multiple) (values[name] ??= []).push(value);
+      else values[name] = value;
+    };
+    for (let index = 0; index < args.length; index += 1) {
+      const argument = String(args[index]);
+      if (argument === "--") { positionals.push(...args.slice(index + 1).map(String)); break; }
+      let name = null;
+      let inline;
+      if (argument.startsWith("--")) {
+        const equals = argument.indexOf("=");
+        name = equals === -1 ? argument.slice(2) : argument.slice(2, equals);
+        if (equals !== -1) inline = argument.slice(equals + 1);
+      } else if (argument.startsWith("-") && argument.length > 1) {
+        name = byShort.get(argument.slice(1, 2)) ?? argument.slice(1, 2);
+        if (argument.length > 2) inline = argument.slice(2);
+      }
+      if (name === null) {
+        if (!allowPositionals && config.strict) throw new TypeError(`unexpected argument '${argument}'`);
+        positionals.push(argument);
+        continue;
+      }
+      const option = options[name];
+      if (option === undefined && config.strict) throw new TypeError(`unknown option '${argument}'`);
+      if ((option?.type ?? "boolean") === "boolean") { assign(name, true); if (inline !== undefined) positionals.push(inline); continue; }
+      if (inline !== undefined) { assign(name, inline); continue; }
+      index += 1;
+      if (index >= args.length) throw new TypeError(`option '${name}' needs a value`);
+      assign(name, String(args[index]));
+    }
+    for (const [name, option] of Object.entries(options)) {
+      if (values[name] === undefined && option.default !== undefined) values[name] = option.default;
+    }
+    return { values, positionals };
+  };
+
+  // Strips ANSI escapes. Tools use it to measure the printable width of
+  // already-coloured text, so the pattern has to cover the cursor and erase
+  // sequences a TUI emits, not just SGR colour.
+  const stripVTControlCharacters = (value) =>
+    String(value).replace(/(?:\[[0-?]*[ -/]*[@-~]|\][^]*(?:|\\)|[@-Z\\-_])/g, "");
+
+  /// Parses .env content the way util.parseEnv does: KEY=value per line, with
+  /// optional `export `, # comments, and single, double, or backtick quoting.
+  /// Escape sequences are expanded only inside double quotes, matching dotenv.
+  const parseEnv = (content) => {
+    const result = {};
+    for (let line of String(content).split(/\r?\n/)) {
+      line = line.trim();
+      if (!line || line.startsWith("#")) continue;
+      if (line.startsWith("export ")) line = line.slice(7).trim();
+      const equals = line.indexOf("=");
+      if (equals <= 0) continue;
+      const key = line.slice(0, equals).trim();
+      if (!/^[\w.-]+$/.test(key)) continue;
+      let value = line.slice(equals + 1).trim();
+      const quote = value[0];
+      if ((quote === '"' || quote === "'" || quote === "`") && value.endsWith(quote) && value.length > 1) {
+        value = value.slice(1, -1);
+        if (quote === '"') {
+          value = value.replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        }
+      } else {
+        // Unquoted values end at an inline comment.
+        const comment = value.indexOf(" #");
+        if (comment !== -1) value = value.slice(0, comment).trimEnd();
+      }
+      result[key] = value;
+    }
+    return result;
+  };
+
   const util = {
+    styleText,
+    parseArgs,
+    parseEnv,
+    stripVTControlCharacters,
+    isDeepStrictEqual,
+    types: {
+      isDate: (value) => value instanceof Date,
+      isRegExp: (value) => value instanceof RegExp,
+      isMap: (value) => value instanceof Map,
+      isSet: (value) => value instanceof Set,
+      isPromise: (value) => value instanceof Promise,
+      isTypedArray: (value) => ArrayBuffer.isView(value) && !(value instanceof DataView),
+      isArrayBuffer: (value) => value instanceof ArrayBuffer,
+      isNativeError: (value) => value instanceof Error,
+    },
     inherits(ctor, superCtor) {
       Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
       Object.setPrototypeOf(ctor, superCtor);
@@ -710,9 +1336,93 @@
     zlib[name] = class UnsupportedZlibStream {};
   }
 
+  // node:http2 exists so that bundles importing it up front can load. A dev
+  // server's proxy pulls it in whether or not any route is configured to use
+  // it, and a missing module stops the whole program at import time rather
+  // than at the call that would actually need HTTP/2.
+  const http2 = {
+    createServer: unavailable("http2.createServer"),
+    createSecureServer: unavailable("http2.createSecureServer"),
+    connect: unavailable("http2.connect"),
+    getDefaultSettings: () => ({}),
+    constants: {
+      HTTP2_HEADER_METHOD: ":method",
+      HTTP2_HEADER_PATH: ":path",
+      HTTP2_HEADER_STATUS: ":status",
+      HTTP2_HEADER_AUTHORITY: ":authority",
+      HTTP2_HEADER_SCHEME: ":scheme",
+    },
+  };
+
+  // Math.random is not a cryptographic source. These exist so tooling that
+  // wants an identifier or filler bytes works; nothing here should be used for
+  // keys, tokens, or anything an attacker gets to see and predict.
+  const randomFillBytes = (view) => {
+    for (let index = 0; index < view.length; index += 1) {
+      view[index] = Math.floor(Math.random() * 256);
+    }
+    return view;
+  };
+  const randomUUID = () => {
+    const bytes = randomFillBytes(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1
+    const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+
+  // Selectors for __sakoHash, mirroring SAKO_HASH_* in sako-v8's lib.rs. SHA-256
+  // is not optional in practice: TypeScript's build mode hashes every source
+  // file with it, so tsc could not run at all while SHA-1 was the only choice.
+  const HASH_ALGORITHMS = { sha1: 1, sha256: 2, sha512: 3 };
+
   const crypto = {
+    randomUUID,
+    randomBytes(size, callback) {
+      const bytes = Buffer.from(randomFillBytes(new Uint8Array(Number(size))));
+      if (typeof callback === "function") { callback(null, bytes); return undefined; }
+      return bytes;
+    },
+    getRandomValues: randomFillBytes,
+    // The one-shot form Node added in 20.12 / 21.7. Tooling reached for it
+    // immediately -- Vite hashes its lockfile with it on every start -- and it
+    // is only createHash without the ceremony.
+    hash(algorithm, data, outputEncoding = "hex") {
+      const digest = crypto.createHash(algorithm).update(data).digest();
+      return outputEncoding === "buffer" ? digest : digest.toString(outputEncoding);
+    },
+
+    createHmac(algorithm, key) {
+      // RFC 2104 on top of the digests the runtime already computes. The block
+      // size is the only thing that varies between them.
+      const blockSize = String(algorithm).toLowerCase().includes("512") ? 128 : 64;
+      let secret = Buffer.isBuffer(key) ? key : Buffer.from(key);
+      if (secret.length > blockSize) {
+        secret = crypto.createHash(algorithm).update(secret).digest();
+      }
+      const inner = Buffer.alloc(blockSize);
+      const outer = Buffer.alloc(blockSize);
+      for (let index = 0; index < blockSize; index += 1) {
+        const byte = index < secret.length ? secret[index] : 0;
+        inner[index] = byte ^ 0x36;
+        outer[index] = byte ^ 0x5c;
+      }
+      const stream = crypto.createHash(algorithm).update(inner);
+      return {
+        update(value, encoding) { stream.update(value, encoding); return this; },
+        digest(encoding) {
+          const digest = crypto.createHash(algorithm)
+            .update(outer)
+            .update(stream.digest())
+            .digest();
+          return encoding === undefined ? digest : digest.toString(encoding);
+        },
+      };
+    },
+
     createHash(algorithm) {
-      if (String(algorithm).toLowerCase().replace("-", "") !== "sha1") {
+      const selector = HASH_ALGORITHMS[String(algorithm).toLowerCase().replace(/-/g, "")];
+      if (selector === undefined) {
         throw new Error(`Unsupported hash algorithm: ${algorithm}`);
       }
       let chunks = [];
@@ -730,7 +1440,7 @@
         digest(encoding) {
           if (finalized) throw new Error("Digest already called");
           finalized = true;
-          const digest = Buffer.from(__sakoSha1(Buffer.concat(chunks, length)));
+          const digest = Buffer.from(__sakoHash(selector, Buffer.concat(chunks, length)));
           chunks = [];
           return encoding === undefined ? digest : digest.toString(encoding);
         },
@@ -796,8 +1506,76 @@
     return args[args.length - 1];
   };
   Stream.finished = (stream, callback) => { stream.once("finish", callback); stream.once("end", callback); return () => {}; };
-  fs.ReadStream = class ReadStream extends Readable {};
-  fs.WriteStream = class WriteStream extends Writable {};
+  // Sako reads and writes files whole, so these are streams in shape rather
+  // than in mechanism: a read stream delivers the file in one chunk a
+  // microtask later, a write stream collects everything and commits on end.
+  // What consumes them -- a static file server piping to a response, a
+  // download being saved -- only needs the events in the right order.
+  fs.ReadStream = class ReadStream extends Readable {
+    constructor(target, options) {
+      super();
+      const settings = typeof options === "string" ? { encoding: options } : (options || {});
+      this.path = target;
+      this.bytesRead = 0;
+      queueMicrotask(() => {
+        let bytes;
+        try {
+          bytes = fs.readFileSync(target);
+        } catch (error) {
+          this.emit("error", error);
+          return;
+        }
+        // start/end are inclusive in Node, which is what a Range request
+        // header means by them.
+        const start = Number.isInteger(settings.start) ? settings.start : 0;
+        const end = Number.isInteger(settings.end) ? settings.end + 1 : bytes.length;
+        const slice = bytes.subarray(start, Math.max(start, end));
+        this.bytesRead = slice.length;
+        this.emit("open", 0);
+        this.emit("ready");
+        this.push(settings.encoding ? slice.toString(settings.encoding) : slice);
+        this.push(null);
+        this.emit("close");
+      });
+    }
+  };
+  fs.WriteStream = class WriteStream extends Writable {
+    constructor(target, options) {
+      super();
+      this._settings = typeof options === "string" ? { encoding: options } : (options || {});
+      this.path = target;
+      this.bytesWritten = 0;
+      this._parts = [];
+    }
+    write(chunk, encoding, callback) {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      const bytes = Buffer.isBuffer(chunk)
+        ? chunk
+        : Buffer.from(String(chunk), encoding || this._settings.encoding);
+      this._parts.push(bytes);
+      this.bytesWritten += bytes.length;
+      if (typeof callback === "function") queueMicrotask(callback);
+      return true;
+    }
+    end(chunk, encoding, callback) {
+      if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+      else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+      this.writableEnded = true;
+      try {
+        fs.writeFileSync(this.path, Buffer.concat(this._parts));
+      } catch (error) {
+        this.emit("error", error);
+        return this;
+      }
+      if (typeof callback === "function") callback();
+      this.emit("finish");
+      this.emit("close");
+      return this;
+    }
+  };
+  fs.createReadStream = (target, options) => new fs.ReadStream(target, options);
+  fs.createWriteStream = (target, options) => new fs.WriteStream(target, options);
   const activeWatchers = new Set();
   const watchedFiles = new Map();
   const watchSnapshot = (value) => {
@@ -948,6 +1726,27 @@
     getHeaderNames() { return Array.from(this._headers.keys()); }
     getHeaders() { return Object.fromEntries(Array.from(this._headers, ([name, pair]) => [name, pair[1]])); }
     hasHeader(name) { return this._headers.has(String(name).toLowerCase()); }
+    // Node 18.3 added this, and middleware that adds a Vary or a Set-Cookie on
+    // top of one already set reaches for it rather than reading and rewriting.
+    appendHeader(name, value) {
+      const key = String(name).toLowerCase();
+      const existing = this._headers.get(key);
+      if (existing === undefined) return this.setHeader(name, value);
+      const merged = Array.isArray(existing[1]) ? existing[1].slice() : [existing[1]];
+      if (Array.isArray(value)) merged.push(...value); else merged.push(value);
+      this._headers.set(key, [existing[0], merged]);
+      return this;
+    }
+    setHeaders(headers) {
+      if (headers && typeof headers.forEach === 'function' && !Array.isArray(headers)) {
+        headers.forEach((value, name) => this.setHeader(name, value));
+      } else if (headers) {
+        for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
+      }
+      return this;
+    }
+    // Headers reach the socket with the body, so there is nothing to flush.
+    flushHeaders() { this.headersSent = true; }
     removeHeader(name) { this._headers.delete(String(name).toLowerCase()); }
     writeHead(statusCode, statusMessage, headers) {
       this.statusCode = Number(statusCode);
@@ -976,11 +1775,38 @@
       this.headersSent = true;
       this.finished = true;
       this.writableEnded = true;
+      // The dispatch already returned without an answer, so the connection is
+      // waiting on this call rather than on the handler's return.
+      if (this._deferred) {
+        this._deferred = false;
+        const [status, reason, headers, body] = describeResponse(this);
+        __sakoHttpRespond(this._serverId, this._ticket, status, reason, headers, body);
+      }
       if (typeof callback === "function") callback();
       this.emit("finish");
       return this;
     }
   }
+
+  /// The wire form of a finished response: [status, reason, headers, body].
+  const describeResponse = (response) => {
+    const headers = [];
+    for (const [, [name, value]] of response._headers) {
+      headers.push(name, Array.isArray(value) ? value.join(", ") : String(value));
+    }
+    const chunks = response._chunks;
+    let body;
+    if (chunks.length === 0) body = "";
+    else if (chunks.length === 1) body = chunks[0];
+    else if (chunks.every((chunk) => typeof chunk === "string")) body = chunks.join("");
+    else body = Buffer.concat(chunks.map((chunk) => typeof chunk === "string" ? Buffer.from(chunk) : chunk));
+    return [
+      response.statusCode,
+      response.statusMessage || STATUS_CODES[response.statusCode] || "Unknown",
+      headers,
+      body,
+    ];
+  };
 
   class Server extends EventEmitter {
     constructor(handler, tlsOptions = null) {
@@ -1026,6 +1852,32 @@
     ServerResponse,
     Server,
     createServer: (handler) => new Server(handler),
+    Agent: class Agent {},
+    globalAgent: {},
+    // Sako serves HTTP but cannot yet act as a streaming client. These exist
+    // because a named ESM import that is missing is a SyntaxError before any
+    // code runs -- a module that merely imports `get` would fail even if it
+    // never calls it. Calling one still fails loudly, matching https below.
+    // Use fetch() for client requests.
+    request: unavailable("http.request"),
+    get: unavailable("http.get"),
+  };
+
+  // node:tls. Present so a namespace import resolves; there is no TLS client
+  // here, so every entry point that would open a connection refuses.
+  const tls = {
+    TLSSocket: class TLSSocket {
+      constructor() { throw new Error("tls.TLSSocket is not implemented by Sako.js"); }
+    },
+    connect: unavailable("tls.connect"),
+    createServer: unavailable("tls.createServer"),
+    createSecureContext: unavailable("tls.createSecureContext"),
+    checkServerIdentity: unavailable("tls.checkServerIdentity"),
+    getCiphers: () => [],
+    rootCertificates: [],
+    DEFAULT_ECDH_CURVE: "auto",
+    DEFAULT_MIN_VERSION: "TLSv1.2",
+    DEFAULT_MAX_VERSION: "TLSv1.3",
   };
 
   const net = {
@@ -1236,7 +2088,7 @@
   const plainSocket = { remoteAddress: "127.0.0.1", encrypted: false };
   const secureSocket = { remoteAddress: "127.0.0.1", encrypted: true };
   Object.defineProperty(globalThis, "__sakoDispatchHttpRequest", {
-    value(handler, method, target, headerBytes, headerRanges, requestBody, secure = false) {
+    value(handler, method, target, headerBytes, headerRanges, requestBody, secure = false, serverId = 0, ticket = 0) {
       const request = new IncomingMessage();
       request.method = method;
       request.url = target;
@@ -1247,6 +2099,10 @@
       request._headerRanges = headerRanges;
       request.socket = request.connection = secure ? secureSocket : plainSocket;
       const response = new ServerResponse(request);
+      // Kept so a handler that finishes later can name the request it is
+      // answering; the native side has moved on by then.
+      response._serverId = serverId;
+      response._ticket = ticket;
       response.socket = response.connection = request.socket;
       request.res = response;
       handler(request, response);
@@ -1270,24 +2126,16 @@
   });
   Object.defineProperty(globalThis, "__sakoFinalizeHttpResponse", {
     value(response) {
-      if (!response.writableEnded) throw new Error("asynchronous HTTP responses are not implemented");
-      const headers = [];
-      for (const [, [name, value]] of response._headers) {
-        headers.push(name, Array.isArray(value) ? value.join(", ") : String(value));
+      // A handler that has not called end() yet is still working -- awaiting a
+      // file read, a transform, a proxied request. Null tells the native side
+      // to leave the connection open and wait for __sakoHttpRespond instead of
+      // demanding an answer the handler does not have.
+      if (!response.writableEnded) {
+        response._deferred = true;
+        return null;
       }
-      const chunks = response._chunks;
-      let body;
-      if (chunks.length === 0) body = "";
-      else if (chunks.length === 1) body = chunks[0];
-      else if (chunks.every((chunk) => typeof chunk === "string")) body = chunks.join("");
-      else body = Buffer.concat(chunks.map((chunk) => typeof chunk === "string" ? Buffer.from(chunk) : chunk));
       // Positional: the native side reads [status, reason, headers, body].
-      return [
-        response.statusCode,
-        response.statusMessage || STATUS_CODES[response.statusCode] || "Unknown",
-        headers,
-        body,
-      ];
+      return describeResponse(response);
     },
   });
 
@@ -1354,20 +2202,516 @@
   };
   const url = { URL, URLSearchParams, pathToFileURL, fileURLToPath };
 
-  Object.assign(globalThis, { Buffer, TextEncoder, TextDecoder, URL, URLSearchParams, AbortController, AbortSignal, Headers, Request, Response, fetch });
+  // process.stdin. Absent entirely before, which meant anything that reads
+  // input -- a prompt, a piped payload -- had nothing to attach to. Backed by
+  // synchronous reads on descriptor 0, so it is a line source rather than a
+  // full duplex stream.
+  const STDIN_FD = 0;
+  const stdinState = { buffer: Buffer.alloc(0), ended: false };
+
+  const readStdinChunk = () => {
+    if (stdinState.ended) return null;
+    const chunk = Buffer.alloc(8192);
+    let read = 0;
+    try {
+      read = fs.readSync(STDIN_FD, chunk, 0, chunk.length, null);
+    } catch {
+      stdinState.ended = true;
+      return null;
+    }
+    if (read === 0) {
+      stdinState.ended = true;
+      return null;
+    }
+    return chunk.subarray(0, read);
+  };
+
+  /// Reads one line, or null once input is exhausted. The trailing newline is
+  /// stripped, and a lone \r before it, so Windows input matches POSIX.
+  const readStdinLine = () => {
+    for (;;) {
+      const newline = stdinState.buffer.indexOf(0x0a);
+      if (newline !== -1) {
+        const line = stdinState.buffer.subarray(0, newline).toString("utf8");
+        stdinState.buffer = stdinState.buffer.subarray(newline + 1);
+        return line.endsWith("\r") ? line.slice(0, -1) : line;
+      }
+      const chunk = readStdinChunk();
+      if (chunk === null) {
+        if (stdinState.buffer.length === 0) return null;
+        const rest = stdinState.buffer.toString("utf8");
+        stdinState.buffer = Buffer.alloc(0);
+        return rest.endsWith("\r") ? rest.slice(0, -1) : rest;
+      }
+      stdinState.buffer = Buffer.concat([stdinState.buffer, chunk]);
+    }
+  };
+
+  class Stdin extends Readable {
+    constructor() {
+      super();
+      this.fd = STDIN_FD;
+      this.readable = true;
+    }
+    // Asked of the descriptor on every read rather than cached at construction.
+    // The bootstrap is evaluated once and its result is reused for every run
+    // (and, once snapshotted, baked into the binary at build time), so a value
+    // captured here would report the build machine's terminal state forever.
+    get isTTY() { return Boolean(tty.isatty(this.fd)); }
+    // Sako has no raw console mode, so character-at-a-time prompts cannot be
+    // supported. Reporting the failure honestly is better than pretending:
+    // a caller that checks can fall back to line input.
+    setRawMode() { return this; }
+    setEncoding() { return this; }
+    resume() { return this; }
+    pause() { return this; }
+    read() {
+      const line = readStdinLine();
+      return line === null ? null : `${line}\n`;
+    }
+    async *[Symbol.asyncIterator]() {
+      for (;;) {
+        const line = readStdinLine();
+        if (line === null) return;
+        yield line;
+      }
+    }
+  }
+  const stdin = new Stdin();
+
+  // process.stdout / process.stderr.
+  //
+  // The native side installs plain objects carrying only `write` and `fd`.
+  // Terminal UIs treat these as streams -- attaching "resize" listeners,
+  // calling end(), reading columns -- so a plain object fails at the first
+  // `.on(...)`. These are real Writables that emit, and delegate the actual
+  // write to the same descriptor.
+  class StandardOutput extends Writable {
+    constructor(fd) {
+      super();
+      this.fd = fd;
+    }
+    // See Stdin.isTTY: resolved per access, never captured at construction.
+    get isTTY() { return Boolean(tty.isatty(this.fd)); }
+    // Sized on each read: a terminal can be resized at any point, and Sako has
+    // no SIGWINCH to invalidate a cached value.
+    get columns() { return __sakoTerminalSize(this.fd)?.columns; }
+    get rows() { return __sakoTerminalSize(this.fd)?.rows; }
+    getWindowSize() {
+      const size = __sakoTerminalSize(this.fd);
+      return size ? [size.columns, size.rows] : undefined;
+    }
+    hasColors() { return this.isTTY; }
+    write(chunk, encoding, callback) {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      const bytes = typeof chunk === "string"
+        ? Buffer.from(chunk, typeof encoding === "string" ? encoding : "utf8")
+        : Buffer.from(chunk);
+      __sakoWriteStandard(this.fd, bytes);
+      if (typeof callback === "function") callback();
+      return true;
+    }
+    // Closing a standard stream would take the descriptor away from everything
+    // else writing to it, so end() only marks and notifies.
+    end(chunk, encoding, callback) {
+      if (chunk !== undefined && typeof chunk !== "function") this.write(chunk, encoding);
+      this.writableEnded = true;
+      this.emit("finish");
+      if (typeof callback === "function") callback();
+      return this;
+    }
+    cork() {}
+    uncork() {}
+    setDefaultEncoding() { return this; }
+  }
+  const stdout = new StandardOutput(1);
+  const stderr = new StandardOutput(2);
+
+  // Process members contributed from JavaScript. Parked on the global rather
+  // than assigned to `process`: the bootstrap runs once at context
+  // initialization, while the native side rebuilds `process` for every
+  // execution and would discard anything set here. InstallProcess copies these
+  // across on each execution.
+  const processEvents = new EventEmitter();
+  // Supplied by the native side on every execution. Calling Date.now() here
+  // would record when the bootstrap was evaluated -- which, once the context
+  // is snapshotted, is when the binary was built.
+  const processEpoch = () => globalThis.__sakoEpochMs ?? Date.now();
+  const processExtras = {
+    stdin,
+    stdout,
+    stderr,
+    // Terminates the process; the native side flushes and exits.
+    exit(code) { __sakoExit(code === undefined ? 0 : Number(code) | 0); },
+    // Node returns [seconds, nanoseconds]; hrtime.bigint returns nanoseconds.
+    // Date.now has millisecond resolution, so the low digits are zero rather
+    // than fabricated.
+    hrtime: Object.assign(
+      (previous) => {
+        const now = Date.now() * 1e6;
+        const nanoseconds = previous ? now - (previous[0] * 1e9 + previous[1]) : now;
+        return [Math.floor(nanoseconds / 1e9), Math.floor(nanoseconds % 1e9)];
+      },
+      { bigint: () => BigInt(Date.now()) * 1000000n },
+    ),
+    memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
+    uptime: () => (Date.now() - processEpoch()) / 1000,
+    chdir() { throw new Error("process.chdir is not supported"); },
+    umask: () => 0,
+    emitWarning(warning) {
+      const text = warning instanceof Error ? warning.stack ?? warning.message : String(warning);
+      process.stderr.write(`Warning: ${text}\n`);
+    },
+    // Lifecycle events are accepted so listeners can register, but nothing
+    // emits them: Sako has no signal handling or exit hook to drive them.
+    on: (...args) => { processEvents.on(...args); return process; },
+    once: (...args) => { processEvents.once(...args); return process; },
+    off: (...args) => { processEvents.off(...args); return process; },
+    removeListener: (...args) => { processEvents.off(...args); return process; },
+    emit: (...args) => processEvents.emit(...args),
+  };
+  Object.defineProperty(globalThis, "__sakoProcessExtras", { value: processExtras });
+
+  // node:readline. Line-oriented only -- see Stdin.setRawMode above.
+  const writeTo = (output, text) => {
+    if (output && typeof output.write === "function") output.write(text);
+  };
+  class Interface extends EventEmitter {
+    constructor(options = {}) {
+      super();
+      const settings = typeof options.write === "function" || options.read ? { input: options } : options;
+      this.input = settings.input ?? stdin;
+      this.output = settings.output ?? process.stdout;
+      this.terminal = settings.terminal ?? Boolean(this.output && this.output.isTTY);
+      this._prompt = settings.prompt ?? "> ";
+      this.closed = false;
+    }
+    setPrompt(prompt) { this._prompt = prompt; }
+    getPrompt() { return this._prompt; }
+    prompt() { writeTo(this.output, this._prompt); }
+    question(query, ...rest) {
+      const callback = rest[rest.length - 1];
+      writeTo(this.output, query);
+      const answer = readStdinLine() ?? "";
+      if (typeof callback === "function") {
+        callback(answer);
+        return undefined;
+      }
+      return Promise.resolve(answer);
+    }
+    write(text) { writeTo(this.output, text); }
+    pause() { return this; }
+    resume() { return this; }
+    close() {
+      if (this.closed) return;
+      this.closed = true;
+      this.emit("close");
+    }
+    async *[Symbol.asyncIterator]() {
+      for (;;) {
+        const line = readStdinLine();
+        if (line === null) { this.close(); return; }
+        yield line;
+      }
+    }
+  }
+  const readline = {
+    Interface,
+    createInterface: (options, output) =>
+      new Interface(output === undefined ? options : { input: options, output }),
+    // Cursor control is pure escape output, so it works whether or not the
+    // terminal is interactive.
+    clearLine(output, direction = 0, callback) {
+      const code = direction < 0 ? "\x1b[1K" : direction > 0 ? "\x1b[0K" : "\x1b[2K";
+      writeTo(output, code);
+      if (typeof callback === "function") callback();
+      return true;
+    },
+    clearScreenDown(output, callback) {
+      writeTo(output, "\x1b[0J");
+      if (typeof callback === "function") callback();
+      return true;
+    },
+    cursorTo(output, x = 0, y, callback) {
+      if (typeof y === "function") { callback = y; y = undefined; }
+      writeTo(output, y === undefined ? `\x1b[${x + 1}G` : `\x1b[${y + 1};${x + 1}H`);
+      if (typeof callback === "function") callback();
+      return true;
+    },
+    moveCursor(output, dx = 0, dy = 0, callback) {
+      let text = "";
+      if (dx < 0) text += `\x1b[${-dx}D`; else if (dx > 0) text += `\x1b[${dx}C`;
+      if (dy < 0) text += `\x1b[${-dy}A`; else if (dy > 0) text += `\x1b[${dy}B`;
+      writeTo(output, text);
+      if (typeof callback === "function") callback();
+      return true;
+    },
+    // Keypress events need raw mode, which Sako lacks; the stream simply never
+    // emits them rather than the import failing.
+    emitKeypressEvents: () => undefined,
+  };
+  readline.promises = {
+    Interface,
+    createInterface: readline.createInterface,
+  };
+
+  // node:perf_hooks. Build tools time themselves with this as a matter of
+  // course, so a missing module stops them before they do any work.
+  const performance = globalThis.performance ?? {
+    // Millisecond resolution: Date.now is the only clock available here, so
+    // the sub-millisecond digits Node reports are simply not measurable.
+    // See processEpoch: the origin is this run's start, not the build's.
+    now: () => Date.now() - processEpoch(),
+    get timeOrigin() { return processEpoch(); },
+    mark: () => undefined,
+    measure: () => undefined,
+    clearMarks: () => undefined,
+    clearMeasures: () => undefined,
+    getEntries: () => [],
+    getEntriesByName: () => [],
+    getEntriesByType: () => [],
+    toJSON: () => ({ timeOrigin: processEpoch() }),
+  };
+  if (globalThis.performance === undefined) {
+    Object.defineProperty(globalThis, "performance", { value: performance, configurable: true, writable: true });
+  }
+  // Observers accept registration and never fire: Sako emits no performance
+  // entries, so a callback would have nothing to receive.
+  class PerformanceObserver {
+    constructor(callback) { this._callback = callback; }
+    observe() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  }
+  PerformanceObserver.supportedEntryTypes = [];
+  const perfHooks = {
+    performance,
+    PerformanceObserver,
+    PerformanceEntry: class PerformanceEntry {},
+    monitorEventLoopDelay: () => ({
+      enable() {}, disable() {}, reset() {},
+      min: 0, max: 0, mean: 0, stddev: 0, percentile: () => 0,
+    }),
+    createHistogram: () => ({ record() {}, reset() {}, min: 0, max: 0, mean: 0, percentile: () => 0 }),
+  };
+
+  // Minimal surfaces for modules tooling imports but rarely drives. Each is
+  // shaped so the common read-only checks answer correctly rather than throw.
+  const workerThreads = {
+    isMainThread: true,
+    threadId: 0,
+    parentPort: null,
+    workerData: null,
+    // Sako has no worker threads; constructing one has to fail loudly rather
+    // than return something that silently never runs.
+    Worker: class Worker {
+      constructor() { throw new Error("worker_threads is not supported"); }
+    },
+    // Named exports consumers destructure at import time. A missing name is a
+    // SyntaxError before any code runs, so these have to exist even though
+    // nothing can be posted across a thread that cannot be created.
+    MessagePort: class MessagePort extends EventEmitter {
+      postMessage() {}
+      close() { this.emit("close"); }
+      ref() { return this; }
+      unref() { return this; }
+      start() {}
+    },
+    MessageChannel: class MessageChannel {
+      constructor() {
+        this.port1 = new workerThreads.MessagePort();
+        this.port2 = new workerThreads.MessagePort();
+      }
+    },
+    BroadcastChannel: class BroadcastChannel extends EventEmitter {
+      constructor(name) { super(); this.name = name; }
+      postMessage() {}
+      close() {}
+      ref() { return this; }
+      unref() { return this; }
+    },
+    receiveMessageOnPort: () => undefined,
+    markAsUntransferable: () => undefined,
+    moveMessagePortToContext: () => { throw new Error("worker_threads is not supported"); },
+    setEnvironmentData: () => undefined,
+    getEnvironmentData: () => undefined,
+    SHARE_ENV: Symbol("SHARE_ENV"),
+  };
+  const asyncHooks = {
+    createHook: () => ({ enable() { return this; }, disable() { return this; } }),
+    executionAsyncId: () => 0,
+    triggerAsyncId: () => 0,
+    AsyncLocalStorage: class AsyncLocalStorage {
+      constructor() { this._store = undefined; }
+      run(store, callback, ...args) {
+        const previous = this._store;
+        this._store = store;
+        try { return callback(...args); } finally { this._store = previous; }
+      }
+      getStore() { return this._store; }
+      enterWith(store) { this._store = store; }
+      exit(callback, ...args) {
+        const previous = this._store;
+        this._store = undefined;
+        try { return callback(...args); } finally { this._store = previous; }
+      }
+    },
+    AsyncResource: class AsyncResource {
+      constructor(type) { this.type = type; }
+      runInAsyncScope(fn, thisArg, ...args) { return fn.apply(thisArg, args); }
+      emitDestroy() { return this; }
+    },
+  };
+
+  // Small shims for modules tooling imports for capability checks or optional
+  // features. Each answers the common query truthfully -- "no, that is not
+  // available here" -- instead of failing the import outright.
+  const v8Module = {
+    // Vite calls this to size its cache; the numbers are inert but shaped
+    // correctly so arithmetic on them works.
+    getHeapStatistics: () => ({
+      total_heap_size: 0, total_heap_size_executable: 0, total_physical_size: 0,
+      total_available_size: 0, used_heap_size: 0, heap_size_limit: 0,
+      malloced_memory: 0, peak_malloced_memory: 0, does_zap_garbage: 0,
+      number_of_native_contexts: 0, number_of_detached_contexts: 0,
+    }),
+    getHeapSpaceStatistics: () => [],
+    setFlagsFromString: () => undefined,
+    serialize: () => { throw new Error("v8.serialize is not supported"); },
+    deserialize: () => { throw new Error("v8.deserialize is not supported"); },
+    takeCoverage: () => undefined,
+    stopCoverage: () => undefined,
+  };
+  const inspectorModule = {
+    // Reporting the session as unavailable lets callers skip profiling paths.
+    Session: class Session {
+      connect() { throw new Error("inspector is not supported"); }
+      disconnect() {}
+      post() { throw new Error("inspector is not supported"); }
+    },
+    open: () => undefined,
+    close: () => undefined,
+    url: () => undefined,
+  };
+  const diagnosticsChannel = {
+    channel: (name) => ({
+      name,
+      hasSubscribers: false,
+      publish: () => undefined,
+      subscribe: () => undefined,
+      unsubscribe: () => false,
+    }),
+    hasSubscribers: () => false,
+    subscribe: () => undefined,
+    unsubscribe: () => false,
+    tracingChannel: (name) => ({
+      name,
+      subscribe: () => undefined,
+      unsubscribe: () => false,
+      traceSync: (fn, context, thisArg, ...args) => fn.apply(thisArg, args),
+      tracePromise: (fn, context, thisArg, ...args) => fn.apply(thisArg, args),
+      traceCallback: (fn, position, context, thisArg, ...args) => fn.apply(thisArg, args),
+    }),
+  };
+  const timersPromises = {
+    setTimeout: (delay, value) => new Promise((resolve) => setTimeout(() => resolve(value), delay)),
+    setImmediate: (value) => new Promise((resolve) => queueMicrotask(() => resolve(value))),
+    setInterval: async function* (delay, value) {
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        yield value;
+      }
+    },
+  };
+
+  // node:module. Tools written for Node reach for createRequire constantly --
+  // to read their own package.json, or to resolve a dependency from an ES
+  // module -- so its absence stops most real CLIs at their first import.
+  const builtinModules = [
+    "assert", "buffer", "child_process", "console", "crypto", "dns",
+    "dns/promises", "events", "fs", "fs/promises", "http", "https", "module",
+    "net", "os", "path", "process", "querystring",
+    "async_hooks", "diagnostics_channel", "http2", "inspector", "perf_hooks", "readline",
+    "readline/promises", "stream", "stream/promises", "string_decoder",
+    "timers", "timers/promises", "tls", "v8", "worker_threads",
+    "tty", "url", "util", "zlib",
+  ];
+  const isBuiltin = (name) =>
+    builtinModules.includes(typeof name === "string" && name.startsWith("node:") ? name.slice(5) : name);
+  const createRequire = (referrer) => {
+    if (referrer instanceof URL || (typeof referrer === "string" && referrer.startsWith("file:"))) {
+      referrer = fileURLToPath(referrer);
+    }
+    if (typeof referrer !== "string" || referrer.length === 0) {
+      throw new TypeError("createRequire needs a path or file URL");
+    }
+    return __sakoCreateRequire(referrer);
+  };
+  const moduleBuiltin = {
+    createRequire,
+    builtinModules,
+    isBuiltin,
+    // Present so `Module.createRequire(...)` works: Node exposes the same
+    // functions both on the namespace and on the Module constructor.
+    Module: Object.assign(function Module() {}, { createRequire, builtinModules, isBuiltin }),
+    // A no-op keeps callers that register hooks working rather than crashing;
+    // Sako has no loader-hook pipeline for them to attach to.
+    register: () => undefined,
+    syncBuiltinESMExports: () => undefined,
+  };
+
+  Object.assign(globalThis, { Buffer, TextEncoder, TextDecoder, URL, URLSearchParams, Event, CustomEvent, EventTarget, AbortController, AbortSignal, Headers, Request, Response, fetch });
   Object.defineProperty(globalThis, "__sakoBuiltins", {
     value: {
+      "node:module": moduleBuiltin,
+      "node:perf_hooks": perfHooks,
+      "node:v8": v8Module,
+      "node:inspector": inspectorModule,
+      "node:inspector/promises": inspectorModule,
+      "node:diagnostics_channel": diagnosticsChannel,
+      "node:timers/promises": timersPromises,
+      "node:stream/promises": { pipeline: async (...parts) => parts, finished: async () => undefined },
+      "node:worker_threads": workerThreads,
+      "node:async_hooks": asyncHooks,
+      "node:readline": readline,
+      "node:readline/promises": readline.promises,
       "node:buffer": { Buffer, SlowBuffer: Buffer },
       "node:crypto": crypto,
       "node:child_process": childProcess,
       "node:dns": dns,
       "node:dns/promises": dns.promises,
-      "node:events": Object.assign(EventEmitter, { EventEmitter, defaultMaxListeners: 10 }),
+      "node:events": Object.assign(EventEmitter, {
+        EventEmitter,
+        defaultMaxListeners: 10,
+        // Static helpers Node exposes on the module itself.
+        once: (emitter, name) => new Promise((resolve, reject) => {
+          emitter.once(name, (...args) => resolve(args));
+          if (name !== "error" && typeof emitter.once === "function") {
+            emitter.once("error", reject);
+          }
+        }),
+        on: (emitter, name) => {
+          const queue = [];
+          let notify = null;
+          emitter.on(name, (...args) => {
+            if (notify) { const resume = notify; notify = null; resume(args); }
+            else queue.push(args);
+          });
+          return {
+            [Symbol.asyncIterator]() { return this; },
+            next: async () => ({
+              value: queue.length ? queue.shift() : await new Promise((resolve) => { notify = resolve; }),
+              done: false,
+            }),
+          };
+        },
+      }),
       "node:fs": fs,
-      "node:fs/promises": fsPromises,
+      "node:fs/promises": Object.assign({}, fsPromises, { constants: fs.constants }),
       "node:http": http,
       "node:https": https,
       "node:net": net,
+      "node:tls": tls,
       "node:os": os,
       "node:path": path,
       "node:querystring": querystring,
@@ -1377,6 +2721,7 @@
       "node:url": url,
       "node:util": util,
       "node:zlib": zlib,
+      "node:http2": http2,
     },
   });
 })();

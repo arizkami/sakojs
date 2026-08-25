@@ -13,6 +13,7 @@ sako-net = { path = "../sako-net" }
 sako-process = { path = "../sako-process" }
 sako-typescript = { path = "../sako-typescript" }
 sha1 = "0.10"
+sha2 = "0.10"
 ureq = "2.12"
 
 [build-dependencies]

@@ -15,4 +15,6 @@ cargo run -p sako-cli -- tests/hello.js
 
 Implemented experimental commands include `run`, `eval`, `repl`, `--version`, `--memory-stats`, `--detect-leaks`, `--workers=N|auto`, `install`, `add`, `remove`, and `update`. JavaScript and parser-backed TypeScript entry files run directly; see [TypeScript support](docs/typescript.md), the [architecture](docs/architecture.md), [Node compatibility](docs/node-compatibility.md), and [package manager status](docs/package-manager.md) before relying on ecosystem behavior.
 
+Compiled Node-API addons load and run: the runtime implements the Node-API C surface itself and exports it from the executable, which is where a napi-rs binding resolves its symbols. Vite 8 serves its dev server and produces a production build on Sako through Rolldown's native binding. See [native addons](docs/native-addons.md) for what differs from Node.
+
 The repository also contains bounded overlapped IOCP, native `CreateProcessW`/Job Object process ownership, connection slabs, native HTTP/1 and TLS server bridges, bounded Web Fetch, diagnostics, and measured scalar/SSE4.2/AVX2 foundations. Express 4.21.2 serves through the partial Node HTTP layer; public raw TCP sockets and Node HTTP/HTTPS clients remain unimplemented. The [roadmap](docs/roadmap.md) is authoritative.

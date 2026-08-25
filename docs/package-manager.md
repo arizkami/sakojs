@@ -11,6 +11,8 @@ sako remove <package>
 sako update [--ignore-scripts]
 ```
 
+Installs draw a progress bar on stderr: a bar and a `done/total` count when a lock file names the graph up front, a spinner and a running count while it is still being resolved from the registry, and one summary line with the package count, elapsed time, and how much came from the store rather than the network. It is drawn only when stderr is a terminal, so redirected output keeps just the summary and any warnings; `SAKO_PROGRESS=0` turns it off and `SAKO_PROGRESS=1` forces it on. Nothing is written to stdout.
+
 `sako.lock` version 2 is deterministic and human-readable. A compatible lock graph is replayed directly from integrity-addressed archives without fetching registry metadata. `sako update` intentionally discards the lock and resolves current matching versions.
 
 Package lifecycle scripts run through direct `CreateProcessW`/`STARTUPINFOEX` launch of `cmd.exe` in the extracted package directory and remain untrusted code with the user's permissions. Only named-pipe standard handles are inherited, each output stream is bounded to 16 MiB, and a kill-on-close Job Object owns the process tree. `--ignore-scripts` disables `preinstall`, `install`, and `postinstall`; richer npm environment emulation is not implemented yet.

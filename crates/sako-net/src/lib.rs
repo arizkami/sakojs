@@ -6,10 +6,10 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-#[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket};
 
 use sako_platform::{PostError, Reactor};
 

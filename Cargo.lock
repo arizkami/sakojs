@@ -1275,6 +1275,7 @@ dependencies = [
  "sako-process",
  "sako-typescript",
  "sha1",
+ "sha2",
  "ureq",
 ]
 

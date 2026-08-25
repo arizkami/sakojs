@@ -8,8 +8,7 @@ use std::env;
 // diagnostics -- so importing them eagerly charges a script that uses none of
 // them for four extra module loads. Delay loading keeps the entry points and
 // moves each load to the first call.
-const DELAY_LOADED_LIBRARIES: [&str; 4] =
-    ["dbghelp.dll", "winmm.dll", "ws2_32.dll", "psapi.dll"];
+const DELAY_LOADED_LIBRARIES: [&str; 4] = ["dbghelp.dll", "winmm.dll", "ws2_32.dll", "psapi.dll"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

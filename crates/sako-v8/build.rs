@@ -19,6 +19,52 @@ fn main() {
     }
 }
 
+/// The staged V8 is built with Chromium's hardened libc++, which is not a
+/// choice we can undo: `//BUILD.gn:853` asserts `!v8_enable_sandbox ||
+/// use_safe_libcxx`, and building with the sandbox off makes Torque and C++
+/// disagree about `JSInterceptorMap`'s field offsets (44 vs 41), so the
+/// generated static_assert fails. Sandbox on therefore implies libc++ on.
+///
+/// That renames every `std::` type into the `std::__Cr` inline namespace, so
+/// any V8 entry point whose signature carries one — `NewDefaultPlatform`
+/// returns `std::unique_ptr<Platform>` — only exists under the renamed name.
+/// `cl.exe` with MSVC's STL emits calls to the un-renamed name and cannot link.
+/// The fix mirrors what `build_linux` already does with `-stdlib=libc++`:
+/// compile our own C++ with the same libc++ headers, staged in
+/// `.deps/v8/include/libc++` together with the generated `__config_site` that
+/// sets `_LIBCPP_ABI_NAMESPACE=Cr`.
+fn clang_cl(v8_root: &Path) -> PathBuf {
+    if let Some(path) = env::var_os("SAKO_CLANG_CL") {
+        return PathBuf::from(path);
+    }
+    let staged = v8_root.join("toolchain").join("bin").join("clang-cl.exe");
+    if staged.is_file() {
+        return staged;
+    }
+    PathBuf::from("clang-cl.exe")
+}
+
+/// Defines that must match the flags V8 itself was compiled with. A mismatch
+/// changes struct layout in the public headers and is not a link error, so
+/// getting this wrong corrupts memory at runtime instead of failing the build.
+/// Keep in sync with `.deps/v8/meta/args.gn`.
+const V8_ABI_DEFINES: &[(&str, Option<&str>)] = &[
+    ("V8_COMPRESS_POINTERS", None),
+    ("V8_ENABLE_SANDBOX", None),
+    (
+        "_LIBCPP_HARDENING_MODE",
+        Some("_LIBCPP_HARDENING_MODE_EXTENSIVE"),
+    ),
+    ("_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS", None),
+];
+
+/// The ICU data file, when the staged V8 needs one. A build with
+/// icu_use_data_file=false has none and initializes from compiled-in data.
+fn icu_data_argument(v8_root: &Path) -> Option<PathBuf> {
+    let path = v8_root.join("bin").join("icudtl.dat");
+    path.is_file().then_some(path)
+}
+
 fn v8_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir
@@ -42,12 +88,34 @@ fn build_windows() {
         .expect("sako-v8 must be two levels below the workspace root");
     let v8_root = v8_root();
 
-    validate_v8(&v8_root, "v8_monolith.lib", true);
+    // icudtl.dat is optional: a V8 built with icu_use_data_file=false carries
+    // its ICU data compiled in, which removes a 10.8 MB read (~4.6 ms) from
+    // every startup. The Linux path has always treated it this way.
+    validate_v8(&v8_root, "v8_monolith.lib", false);
+    // Staged alongside V8 because the bridge has to be compiled with the same
+    // libc++ the monolith was built with; without these the failure mode is
+    // thousands of unresolved `std::__Cr::` symbols rather than a clear error.
+    for path in [
+        v8_root.join("lib").join("libc++.lib"),
+        v8_root.join("include").join("libc++").join("__config_site"),
+        v8_root
+            .join("include")
+            .join("libc++")
+            .join("__assertion_handler"),
+    ] {
+        if !path.is_file() {
+            panic!("required libc++ artifact is missing: {}", path.display());
+        }
+    }
 
     let include_dir = v8_root.join("include");
+    let libcxx_include_dir = include_dir.join("libc++");
     let lib_dir = v8_root.join("lib");
     let v8_monolith = lib_dir.join("v8_monolith.lib");
+    let libcxx_library = lib_dir.join("libc++.lib");
     let bridge = manifest_dir.join("src").join("bridge.cc");
+    let napi = manifest_dir.join("src").join("napi.cc");
+    let napi_include = manifest_dir.join("include");
     let bootstrap = workspace_root
         .join("runtime")
         .join("js")
@@ -56,41 +124,79 @@ fn build_windows() {
     let embedder_library = out_dir.join("v8_embedder.lib");
     let bootstrap_header = out_dir.join("bootstrap.generated.h");
     let bootstrap_cache_header = out_dir.join("bootstrap_cache.generated.h");
+    let snapshot_header = out_dir.join("snapshot.generated.h");
     let cache_generator = manifest_dir.join("src").join("bootstrap_cache.cc");
+    let icu_data = icu_data_argument(&v8_root);
 
     create_embedder_library(&v8_monolith, &embedder_library);
     generate_bootstrap_header(&bootstrap, &bootstrap_header);
-    generate_bootstrap_cache_windows(
+    // Order matters: the code cache header is compiled into the snapshot
+    // generator, and the snapshot header is compiled into the bridge library.
+    build_and_run_generator_windows(
+        &v8_root,
         &cache_generator,
+        &[],
+        "sako_bootstrap_cache.exe",
         &include_dir,
+        &libcxx_include_dir,
         &out_dir,
         &embedder_library,
-        &v8_root.join("bin").join("icudtl.dat"),
+        &libcxx_library,
+        icu_data.as_deref(),
         &bootstrap_cache_header,
+        "bootstrap code cache",
+    );
+    build_and_run_generator_windows(
+        &v8_root,
+        &bridge,
+        &["/DSAKO_SNAPSHOT_GENERATOR"],
+        "sako_snapshot.exe",
+        &include_dir,
+        &libcxx_include_dir,
+        &out_dir,
+        &embedder_library,
+        &libcxx_library,
+        icu_data.as_deref(),
+        &snapshot_header,
+        "context snapshot",
     );
 
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    build
         .cpp(true)
+        .compiler(clang_cl(&v8_root))
         .std("c++20")
         .static_crt(true)
+        // libc++ must precede the MSVC STL: /I directories are searched before
+        // the INCLUDE environment cc sets up for the MSVC toolchain.
+        .include(&libcxx_include_dir)
         .include(&include_dir)
+        .include(&napi_include)
         .include(&out_dir)
         .file(&bridge)
-        .define("V8_COMPRESS_POINTERS", None)
+        .file(&napi)
         .flag_if_supported("/EHsc")
-        .flag_if_supported("/Zc:__cplusplus")
         .flag_if_supported("/utf-8")
-        .warnings(true)
-        .compile("sako_v8_bridge");
+        .warnings(true);
+    for (name, value) in V8_ABI_DEFINES {
+        build.define(name, *value);
+    }
+    build.compile("sako_v8_bridge");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=v8_embedder");
-    for library in ["advapi32", "bcrypt", "dbghelp", "kernel32", "uuid", "winmm"] {
+    println!("cargo:rustc-link-lib=static=libc++");
+    for library in [
+        "advapi32", "bcrypt", "dbghelp", "kernel32", "uuid", "winmm", "shlwapi", "ole32",
+        "oleaut32", "version", "ws2_32", "dnsapi", "shell32", "user32", "userenv", "delayimp",
+    ] {
         println!("cargo:rustc-link-lib={library}");
     }
     println!("cargo:rustc-env=SAKO_V8_ROOT={}", v8_root.display());
     println!("cargo:rerun-if-env-changed=SAKO_V8_ROOT");
     println!("cargo:rerun-if-changed={}", bridge.display());
+    println!("cargo:rerun-if-changed={}", napi.display());
     println!("cargo:rerun-if-changed={}", cache_generator.display());
     println!("cargo:rerun-if-changed={}", bootstrap.display());
     println!("cargo:rerun-if-changed={}", v8_monolith.display());
@@ -109,6 +215,8 @@ fn build_linux() {
     let include_dir = v8_root.join("include");
     let lib_dir = v8_root.join("lib");
     let bridge = manifest_dir.join("src").join("bridge.cc");
+    let napi = manifest_dir.join("src").join("napi.cc");
+    let napi_include = manifest_dir.join("include");
     let bootstrap = workspace_root
         .join("runtime")
         .join("js")
@@ -116,6 +224,7 @@ fn build_linux() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let bootstrap_header = out_dir.join("bootstrap.generated.h");
     let bootstrap_cache_header = out_dir.join("bootstrap_cache.generated.h");
+    let snapshot_header = out_dir.join("snapshot.generated.h");
     let cache_generator_source = manifest_dir.join("src").join("bootstrap_cache.cc");
 
     generate_bootstrap_header(&bootstrap, &bootstrap_header);
@@ -123,13 +232,29 @@ fn build_linux() {
     // so there is no icudtl.dat to require; pass it through only if present.
     let icu_data = v8_root.join("bin").join("icudtl.dat");
     let icu_data = icu_data.is_file().then_some(icu_data.as_path());
-    generate_bootstrap_cache_linux(
+    // Order matters: the code cache header is compiled into the snapshot
+    // generator, and the snapshot header is compiled into the bridge library.
+    build_and_run_generator_linux(
         &cache_generator_source,
+        &[],
+        "sako_bootstrap_cache",
         &include_dir,
         &lib_dir,
         &out_dir,
         icu_data,
         &bootstrap_cache_header,
+        "bootstrap code cache",
+    );
+    build_and_run_generator_linux(
+        &bridge,
+        &["-DSAKO_SNAPSHOT_GENERATOR"],
+        "sako_snapshot",
+        &include_dir,
+        &lib_dir,
+        &out_dir,
+        icu_data,
+        &snapshot_header,
+        "context snapshot",
     );
 
     // This V8 build was compiled with Chromium's custom libc++
@@ -149,8 +274,10 @@ fn build_linux() {
         .flag("-stdlib=libc++")
         .define("_LIBCPP_ABI_NAMESPACE", "Cr")
         .include(&include_dir)
+        .include(&napi_include)
         .include(&out_dir)
         .file(&bridge)
+        .file(&napi)
         .define("V8_COMPRESS_POINTERS", None)
         .warnings(true)
         .compile("sako_v8_bridge");
@@ -162,10 +289,18 @@ fn build_linux() {
     for library in ["c++", "c++abi", "dl", "pthread", "m", "rt"] {
         println!("cargo:rustc-link-lib={library}");
     }
+    // An addon resolves `napi_*` against the process that loaded it, so the
+    // executable has to keep those symbols in its dynamic table. Without this
+    // the linker drops them as unreferenced -- nothing inside Sako calls them.
+    println!("cargo:rustc-link-arg-bins=-rdynamic");
     println!("cargo:rustc-env=SAKO_V8_ROOT={}", v8_root.display());
     println!("cargo:rerun-if-env-changed=SAKO_V8_ROOT");
     println!("cargo:rerun-if-changed={}", bridge.display());
-    println!("cargo:rerun-if-changed={}", cache_generator_source.display());
+    println!("cargo:rerun-if-changed={}", napi.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        cache_generator_source.display()
+    );
     println!("cargo:rerun-if-changed={}", bootstrap.display());
     println!(
         "cargo:rerun-if-changed={}",
@@ -191,20 +326,37 @@ fn generate_bootstrap_header(source_path: &Path, output_path: &Path) {
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", output_path.display()));
 }
 
-// Compiles and runs the code cache producer so the bridge can embed V8's
-// compiled form of the bootstrap instead of parsing the source on every run.
-fn generate_bootstrap_cache_windows(
+/// Compiles one build-time generator against the staged V8 and runs it.
+///
+/// Two tools share this: the bootstrap code cache producer, and the context
+/// snapshot producer (which is `bridge.cc` itself, compiled with
+/// `SAKO_SNAPSHOT_GENERATOR` so it grows a `main` and stubs the Rust-side
+/// bindings). Both link V8 the same way, so they build the same way.
+#[allow(clippy::too_many_arguments)]
+fn build_and_run_generator_windows(
+    v8_root: &Path,
     source: &Path,
+    extra_flags: &[&str],
+    executable_name: &str,
     include_dir: &Path,
+    libcxx_include_dir: &Path,
     out_dir: &Path,
     embedder_library: &Path,
-    icu_data: &Path,
+    libcxx_library: &Path,
+    icu_data: Option<&Path>,
     output_header: &Path,
+    description: &str,
 ) {
     let target = env::var("TARGET").unwrap();
-    let generator = out_dir.join("sako_bootstrap_cache.exe");
-    let mut compiler = cc::windows_registry::find(&target, "cl.exe")
-        .unwrap_or_else(|| Command::new("cl.exe"));
+    let generator = out_dir.join(executable_name);
+    // clang-cl, not cl.exe: this links against V8's libc++-mangled symbols, so
+    // it has to be built with the same standard library. See `clang_cl`.
+    let mut compiler = Command::new(clang_cl(v8_root));
+    // Borrow the MSVC toolchain's INCLUDE/LIB/PATH so clang-cl finds the CRT
+    // and Windows SDK. Our /I flags still win: they are searched before INCLUDE.
+    if let Some(tool) = cc::windows_registry::find_tool(&target, "cl.exe") {
+        compiler.envs(tool.env().iter().cloned());
+    }
     let status = compiler
         .current_dir(out_dir)
         .args([
@@ -213,16 +365,22 @@ fn generate_bootstrap_cache_windows(
             "/O2",
             "/EHsc",
             "/std:c++20",
-            "/Zc:__cplusplus",
             "/utf-8",
+            "-fuse-ld=lld",
         ])
-        .arg("/DV8_COMPRESS_POINTERS")
+        .args(extra_flags)
+        .args(V8_ABI_DEFINES.iter().map(|(name, value)| match value {
+            Some(value) => format!("/D{name}={value}"),
+            None => format!("/D{name}"),
+        }))
+        .arg(format!("/I{}", libcxx_include_dir.display()))
         .arg(format!("/I{}", include_dir.display()))
         .arg(format!("/I{}", out_dir.display()))
         .arg(source)
         .arg(format!("/Fe:{}", generator.display()))
         .arg("/link")
         .arg(embedder_library)
+        .arg(libcxx_library)
         .args([
             "advapi32.lib",
             "bcrypt.lib",
@@ -230,39 +388,45 @@ fn generate_bootstrap_cache_windows(
             "kernel32.lib",
             "uuid.lib",
             "winmm.lib",
+            "shlwapi.lib",
+            "ole32.lib",
+            "oleaut32.lib",
+            "version.lib",
+            "ws2_32.lib",
+            "dnsapi.lib",
+            "shell32.lib",
+            "user32.lib",
+            "userenv.lib",
         ])
         .status()
-        .unwrap_or_else(|error| panic!("failed to start the MSVC compiler: {error}"));
+        .unwrap_or_else(|error| panic!("failed to start clang-cl: {error}"));
     if !status.success() {
-        panic!("failed to build the bootstrap code cache producer");
+        panic!("failed to build the {description} producer");
     }
-    let status = Command::new(&generator)
-        .arg(icu_data)
-        .arg(output_header)
-        .status()
-        .unwrap_or_else(|error| {
-            panic!("failed to run {}: {error}", generator.display())
-        });
-    if !status.success() {
-        panic!("the bootstrap code cache producer failed");
-    }
+    run_generator(&generator, icu_data, output_header, description);
 }
 
-/// Same producer as the Windows path, built with the host g++/clang++
-/// toolchain and linked directly against the staged static V8 archives.
-/// Unlike Windows this needs no separate embedder-safe library step: that
-/// one works around an MSVC-specific allocator-shim symbol clash that does
-/// not apply to the GNU/Clang toolchain.
-fn generate_bootstrap_cache_linux(
+/// Same producers as the Windows path, built with the host clang++ toolchain
+/// and linked directly against the staged static V8 archives. Unlike Windows
+/// this needs no separate embedder-safe library step: that one works around
+/// an MSVC-specific allocator-shim symbol clash that does not apply here.
+#[allow(clippy::too_many_arguments)]
+fn build_and_run_generator_linux(
     source: &Path,
+    extra_flags: &[&str],
+    executable_name: &str,
     include_dir: &Path,
     lib_dir: &Path,
     out_dir: &Path,
     icu_data: Option<&Path>,
     output_header: &Path,
+    description: &str,
 ) {
-    let generator = out_dir.join("sako_bootstrap_cache");
-    let compiler = cc::Build::new().cpp(true).compiler("clang++").get_compiler();
+    let generator = out_dir.join(executable_name);
+    let compiler = cc::Build::new()
+        .cpp(true)
+        .compiler("clang++")
+        .get_compiler();
     let mut command = compiler.to_command();
     command
         .arg("-std=c++20")
@@ -270,6 +434,7 @@ fn generate_bootstrap_cache_linux(
         .arg("-stdlib=libc++")
         .arg("-D_LIBCPP_ABI_NAMESPACE=Cr")
         .arg("-DV8_COMPRESS_POINTERS")
+        .args(extra_flags)
         .arg(format!("-I{}", include_dir.display()))
         .arg(format!("-I{}", out_dir.display()))
         .arg(source)
@@ -284,15 +449,37 @@ fn generate_bootstrap_cache_linux(
         .status()
         .unwrap_or_else(|error| panic!("failed to start the C++ compiler: {error}"));
     if !status.success() {
-        panic!("failed to build the bootstrap code cache producer");
+        panic!("failed to build the {description} producer");
     }
-    let status = Command::new(&generator)
+    run_generator(&generator, icu_data, output_header, description);
+}
+
+/// Runs a generator and insists it produced a non-empty header.
+///
+/// A generator that fails has to stop the build: a missing or empty artifact
+/// would otherwise surface as a confusing compile error in `bridge.cc`, or
+/// worse, as a runtime that silently lost the optimization it was built for.
+fn run_generator(
+    generator: &Path,
+    icu_data: Option<&Path>,
+    output_header: &Path,
+    description: &str,
+) {
+    let status = Command::new(generator)
+        // An empty argument tells the generator the ICU data is compiled in.
         .arg(icu_data.unwrap_or_else(|| Path::new("")))
         .arg(output_header)
         .status()
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", generator.display()));
     if !status.success() {
-        panic!("the bootstrap code cache producer failed");
+        panic!("the {description} producer failed");
+    }
+    match fs::metadata(output_header) {
+        Ok(metadata) if metadata.len() > 0 => {}
+        _ => panic!(
+            "the {description} producer wrote no {}",
+            output_header.display()
+        ),
     }
 }
 

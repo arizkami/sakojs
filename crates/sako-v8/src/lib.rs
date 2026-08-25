@@ -597,8 +597,12 @@ pub unsafe extern "C" fn sako_dns_resolve(
     c_int::try_from(values.len()).unwrap_or(c_int::MAX)
 }
 
+/// Returns 0 when `response` was filled, 2 when the answer is deferred and
+/// will arrive through `sako_http_server_respond` quoting `ticket`, and
+/// anything else on failure.
 type NativeHttpHandler = unsafe extern "C" fn(
     context: *mut c_void,
+    ticket: u64,
     method: NativeBytes,
     target: NativeBytes,
     body: NativeBytes,
@@ -606,6 +610,9 @@ type NativeHttpHandler = unsafe extern "C" fn(
     header_count: usize,
     response: *mut NativeHttpResponse,
 ) -> c_int;
+
+/// The status a handler returns to keep a request and answer it later.
+const NATIVE_HTTP_DEFERRED: c_int = 2;
 
 struct NativeHttpServer {
     server: HttpServer,
@@ -731,15 +738,16 @@ pub unsafe extern "C" fn sako_http_server_tick(
         write_native_error(error, error_capacity, "HTTP server is null");
         return -1;
     };
-    let result = server.server.tick_with_body(|request, body| {
-        dispatch_native_http(handler, context, request, body).unwrap_or_else(|message| {
-            HttpResponse {
+    let result = server.server.tick_deferrable(|request, body, ticket| {
+        match dispatch_native_http(handler, context, request, body, ticket) {
+            Ok(outcome) => outcome,
+            Err(message) => Some(HttpResponse {
                 status: 500,
                 reason: "Internal Server Error".into(),
                 headers: vec![("Connection".into(), "close".into())],
                 body: message.into_bytes(),
-            }
-        })
+            }),
+        }
     });
     match result {
         Ok(handled) => c_int::try_from(handled).unwrap_or(c_int::MAX),
@@ -835,7 +843,8 @@ fn dispatch_native_http(
     context: *mut c_void,
     request: &RequestHead<'_>,
     body: &[u8],
-) -> Result<HttpResponse, String> {
+    ticket: u64,
+) -> Result<Option<HttpResponse>, String> {
     let request_headers = request
         .headers()
         .map(|(name, value)| NativeHeader {
@@ -861,6 +870,7 @@ fn dispatch_native_http(
     let status = unsafe {
         handler(
             context,
+            ticket,
             native_bytes(request.method()),
             native_bytes(request.target()),
             native_bytes(body),
@@ -869,25 +879,48 @@ fn dispatch_native_http(
             &mut response,
         )
     };
+    if status == NATIVE_HTTP_DEFERRED {
+        return Ok(None);
+    }
     if status != 0 {
         return Err("JavaScript HTTP handler failed".into());
     }
-    if response.header_count > 128 {
-        return Err("JavaScript HTTP response exceeds header count limit".into());
+    // SAFETY: every slice the callback handed back is live until this returns.
+    collect_native_response(
+        response.status,
+        response.reason,
+        response.headers,
+        response.header_count,
+        response.body,
+    )
+    .map(Some)
+}
+
+/// Reads the response a caller assembled in C into the owned form the server
+/// encodes from. Shared by the synchronous dispatch path and the deferred one.
+fn collect_native_response(
+    status: u16,
+    reason: NativeBytes,
+    headers: *const NativeHeader,
+    header_count: usize,
+    body: NativeBytes,
+) -> Result<HttpResponse, String> {
+    if header_count > 128 {
+        return Err("HTTP response exceeds header count limit".into());
     }
-    let reason = copy_utf8(response.reason, "HTTP reason")?;
-    let body = copy_bytes(response.body, "HTTP body")?;
-    let native_headers = if response.header_count == 0 {
+    let reason = copy_utf8(reason, "HTTP reason")?;
+    let body = copy_bytes(body, "HTTP body")?;
+    let native = if header_count == 0 {
         &[][..]
     } else {
-        if response.headers.is_null() {
+        if headers.is_null() {
             return Err("HTTP response header pointer is null".into());
         }
-        // SAFETY: the callback guarantees this array remains live until return.
-        unsafe { std::slice::from_raw_parts(response.headers, response.header_count) }
+        // SAFETY: the caller promises the array is live for this call.
+        unsafe { std::slice::from_raw_parts(headers, header_count) }
     };
-    let mut headers = Vec::with_capacity(native_headers.len());
-    for header in native_headers {
+    let mut collected = Vec::with_capacity(native.len());
+    for header in native {
         let name = copy_utf8(header.name, "HTTP header name")?;
         let value = copy_utf8(header.value, "HTTP header value")?;
         if name.eq_ignore_ascii_case("content-length") {
@@ -896,14 +929,48 @@ fn dispatch_native_http(
             }
             continue;
         }
-        headers.push((name, value));
+        collected.push((name, value));
     }
     Ok(HttpResponse {
-        status: response.status,
+        status,
         reason,
-        headers,
+        headers: collected,
         body,
     })
+}
+
+/// Delivers a response for a request the handler deferred.
+///
+/// Returns 0 when the answer reached the connection, 1 when the ticket is no
+/// longer owed -- the client hung up while the handler was working, which is
+/// ordinary -- and -1 on a malformed response.
+///
+/// # Safety
+/// `server` must be a live pointer from `sako_http_server_new` that is not in
+/// a concurrent tick/delete call, and the response slices must be readable for
+/// the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_http_server_respond(
+    server: *mut c_void,
+    ticket: u64,
+    status: u16,
+    reason: NativeBytes,
+    headers: *const NativeHeader,
+    header_count: usize,
+    body: NativeBytes,
+) -> c_int {
+    // SAFETY: the caller upholds the live, uniquely borrowed server contract.
+    let Some(server) = (unsafe { server.cast::<NativeHttpServer>().as_mut() }) else {
+        return -1;
+    };
+    let Ok(response) = collect_native_response(status, reason, headers, header_count, body) else {
+        return -1;
+    };
+    match server.server.respond(ticket, response) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(_) => -1,
+    }
 }
 
 fn native_bytes(bytes: &[u8]) -> NativeBytes {
@@ -931,27 +998,56 @@ fn copy_utf8(value: NativeBytes, label: &str) -> Result<String, String> {
         .map_err(|_| format!("{label} is not UTF-8"))
 }
 
-/// Computes the SHA-1 digest of `bytes` and writes the 20-byte result to
-/// `digest`. Runs identically on every platform (RustCrypto's `sha1` crate),
-/// which removes the need for a native crypto API (BCrypt on Windows,
-/// OpenSSL/libcrypto on Linux) in the C++ bridge entirely.
+/// Digest algorithms the runtime can compute, as small integers so the
+/// boundary with the C++ bridge carries no string and no allocation. The
+/// values are mirrored by `kHash*` in bridge.cc.
+pub const SAKO_HASH_SHA1: u32 = 1;
+pub const SAKO_HASH_SHA256: u32 = 2;
+pub const SAKO_HASH_SHA512: u32 = 3;
+
+/// Largest digest any supported algorithm produces, and so the buffer size a
+/// caller has to provide.
+pub const SAKO_HASH_MAXIMUM_BYTES: usize = 64;
+
+/// Computes a digest of `bytes` and writes it to `digest`, returning how many
+/// bytes were written, or 0 when `algorithm` is not one of the constants
+/// above.
+///
+/// Runs identically on every platform (RustCrypto), which removes the need for
+/// a native crypto API -- BCrypt on Windows, OpenSSL/libcrypto on Linux --
+/// from the C++ bridge entirely.
+///
+/// SHA-256 is here because it is what real toolchains reach for: TypeScript's
+/// build mode hashes every source file with it, and refused to run at all
+/// while SHA-1 was the only algorithm on offer.
 ///
 /// # Safety
 /// `bytes` must describe a readable range for this call. `digest` must be
-/// writable for at least 20 bytes.
+/// writable for at least `SAKO_HASH_MAXIMUM_BYTES` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sako_sha1(bytes: NativeBytes, digest: *mut u8) {
-    use sha1::{Digest as _, Sha1};
+pub unsafe extern "C" fn sako_hash(
+    algorithm: u32,
+    bytes: NativeBytes,
+    digest: *mut u8,
+) -> usize {
+    use sha1::Digest as _;
     let input = if bytes.length == 0 {
         &[][..]
     } else {
         // SAFETY: the caller promises a readable range for this call.
         unsafe { std::slice::from_raw_parts(bytes.data, bytes.length) }
     };
-    let output = Sha1::digest(input);
-    // SAFETY: the caller promises `digest` is writable for 20 bytes, which
-    // matches the fixed SHA-1 output size.
+    let output: Vec<u8> = match algorithm {
+        SAKO_HASH_SHA1 => sha1::Sha1::digest(input).to_vec(),
+        SAKO_HASH_SHA256 => sha2::Sha256::digest(input).to_vec(),
+        SAKO_HASH_SHA512 => sha2::Sha512::digest(input).to_vec(),
+        _ => return 0,
+    };
+    debug_assert!(output.len() <= SAKO_HASH_MAXIMUM_BYTES);
+    // SAFETY: the caller promises `digest` is writable for the maximum digest
+    // size, which every branch above stays within.
     unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), digest, output.len()) };
+    output.len()
 }
 
 fn write_native_error(output: *mut c_char, capacity: usize, message: &str) {
@@ -1021,6 +1117,7 @@ unsafe extern "C" {
         error_capacity: usize,
     ) -> c_int;
     fn sako_v8_runtime_delete(runtime: *mut c_void);
+    fn sako_v8_runtime_abandon(runtime: *mut c_void);
     fn sako_perf_enable();
     fn sako_perf_mark(name: *const c_char);
     fn sako_perf_report();
@@ -1289,6 +1386,28 @@ impl Runtime {
         } else {
             Err(error_from_buffer(&error))
         }
+    }
+}
+
+impl Runtime {
+    /// Abandons the isolate instead of tearing it down.
+    ///
+    /// Disposing an isolate walks the whole heap, and the platform's worker
+    /// threads go with it -- work whose only product is memory the kernel
+    /// unmaps a moment later anyway. A caller that exits the process next has
+    /// no use for any of it, and on a hello-world run that walk is a
+    /// measurable slice of the total.
+    ///
+    /// Safe because nothing the runtime writes is buffered on the C++ side:
+    /// output goes straight to the standard handles and open file descriptors
+    /// are closed by the kernel at exit. A caller that keeps running must let
+    /// the Runtime drop normally instead.
+    pub fn abandon(self) {
+        // SAFETY: raw was created by sako_v8_runtime_new and is still live;
+        // forgetting `self` afterwards is what keeps the matching delete from
+        // ever running.
+        unsafe { sako_v8_runtime_abandon(self.raw.as_ptr()) };
+        std::mem::forget(self);
     }
 }
 

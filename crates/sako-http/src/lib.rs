@@ -396,6 +396,14 @@ struct HttpConnection {
     tls: Option<ServerConnection>,
     tls_close_notify_sent: bool,
     close_after_write: bool,
+    /// The ticket a handler still owes this connection an answer for. Nothing
+    /// further is parsed from the connection while it is set: HTTP/1 responses
+    /// come back in request order, so a pipelined request behind an unanswered
+    /// one has to wait regardless.
+    deferred: Option<u64>,
+    /// Whether the deferred request asked to close the connection afterwards.
+    /// The request head is long gone by the time the answer arrives.
+    deferred_close: bool,
 }
 
 /// Per-server work counters. Every field is a plain count kept on paths that
@@ -444,6 +452,10 @@ pub struct HttpServer {
     tls_scratch: Vec<u8>,
     header_scratch: Vec<HeaderRange>,
     counters: HttpServerCounters,
+    /// Requests a handler has taken away to answer later, and the connection
+    /// each answer belongs to.
+    deferred: BTreeMap<u64, ConnectionId>,
+    next_ticket: u64,
 }
 
 /// Requests dispatched for one connection in a single tick before the server
@@ -473,6 +485,8 @@ impl HttpServer {
             tls_scratch: Vec::new(),
             header_scratch: Vec::new(),
             counters: HttpServerCounters::default(),
+            deferred: BTreeMap::new(),
+            next_ticket: 1,
         })
     }
 
@@ -559,6 +573,21 @@ impl HttpServer {
     pub fn tick_with_body<F>(&mut self, mut handler: F) -> io::Result<usize>
     where
         F: FnMut(&RequestHead<'_>, &[u8]) -> HttpResponse,
+    {
+        self.tick_deferrable(|request, body, _| Some(handler(request, body)))
+    }
+
+    /// Answers whatever the sockets have ready, letting the handler take a
+    /// request away to finish later.
+    ///
+    /// The handler is given a ticket with every request. Returning a response
+    /// answers it now; returning `None` keeps the ticket and promises a
+    /// `respond` call, which is what an asynchronous handler needs -- a server
+    /// that has to read a file or await a transform before it can reply cannot
+    /// produce the response inside this call.
+    pub fn tick_deferrable<F>(&mut self, mut handler: F) -> io::Result<usize>
+    where
+        F: FnMut(&RequestHead<'_>, &[u8], u64) -> Option<HttpResponse>,
     {
         self.tcp.poll_io(Duration::ZERO)?;
         for id in self.tcp.accept_ready()? {
@@ -713,6 +742,7 @@ impl HttpServer {
             let mut dispatched = 0;
             while dispatched < MAXIMUM_REQUESTS_PER_TICK
                 && !connection.close_after_write
+                && connection.deferred.is_none()
                 && connection.output.len() < config.maximum_response_bytes
             {
                 let pending = &connection.input[connection.consumed..];
@@ -783,17 +813,31 @@ impl HttpServer {
                     headers = parsed.head.headers;
                     break;
                 }
-                let response = if unsupported_encoding {
-                    HttpResponse {
+                let ticket = self.next_ticket;
+                let outcome = if unsupported_encoding {
+                    Some(HttpResponse {
                         status: 501,
                         reason: "Not Implemented".into(),
                         headers: Vec::new(),
                         body: b"transfer encoding is not implemented".to_vec(),
-                    }
+                    })
                 } else {
-                    handler(&parsed.head, &pending[parsed.consumed..request_bytes])
+                    self.next_ticket = self.next_ticket.wrapping_add(1);
+                    handler(&parsed.head, &pending[parsed.consumed..request_bytes], ticket)
                 };
                 headers = parsed.head.headers;
+                let Some(response) = outcome else {
+                    // Taken away to be answered later. The request bytes are
+                    // consumed now so they are not parsed again, and the
+                    // connection goes quiet until respond() delivers.
+                    connection.deferred = Some(ticket);
+                    connection.deferred_close = !keep_alive;
+                    self.deferred.insert(ticket, id);
+                    connection.consumed += request_bytes;
+                    handled += 1;
+                    dispatched += 1;
+                    break;
+                };
                 let close_after_write = !keep_alive || unsupported_encoding;
                 let close_header = close_after_write
                     && !response
@@ -847,6 +891,70 @@ impl HttpServer {
             self.counters.idle_ticks += 1;
         }
         Ok(handled)
+    }
+
+    /// Delivers an answer a handler took away earlier.
+    ///
+    /// Returns whether the ticket was still owed: a connection the client
+    /// dropped in the meantime is gone, and its response is discarded rather
+    /// than being an error the caller has to handle.
+    pub fn respond(&mut self, ticket: u64, response: HttpResponse) -> io::Result<bool> {
+        let Some(id) = self.deferred.remove(&ticket) else {
+            return Ok(false);
+        };
+        let config = self.config;
+        let mut closing = std::mem::take(&mut self.closing);
+        closing.clear();
+        let mut delivered = false;
+        if let Some(connection) = self.connections.get_mut(&id)
+            && connection.deferred == Some(ticket)
+        {
+            connection.deferred = None;
+            let close_after_write = connection.deferred_close;
+            let close_header = close_after_write
+                && !response
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("connection"));
+            encode_response_into(
+                &mut connection.output,
+                response.status,
+                &response.reason,
+                response
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .chain(close_header.then_some(("Connection", "close"))),
+                &response.body,
+                config.maximum_response_bytes,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            connection.close_after_write |= close_after_write;
+            // TLS wants plaintext handed to the session, not to the socket.
+            if connection.tls.is_some() && !connection.output.is_empty() {
+                connection
+                    .tls
+                    .as_mut()
+                    .unwrap()
+                    .writer()
+                    .write_all(&connection.output)?;
+                connection.output.clear();
+                connection.written = 0;
+                drain_tls_output(connection, config.maximum_response_bytes)?;
+            }
+            // A partial write is fine: the next tick flushes the remainder
+            // along with every other connection's.
+            flush_connection(&mut self.tcp, id, connection, &mut closing);
+            delivered = true;
+        }
+        closing.sort_unstable();
+        closing.dedup();
+        for id in closing.drain(..) {
+            self.connections.remove(&id);
+            self.tcp.close(id);
+        }
+        self.closing = closing;
+        Ok(delivered)
     }
 }
 

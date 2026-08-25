@@ -32,6 +32,146 @@ const MAXIMUM_STORE_FILES: usize = 50_000;
 const MAXIMUM_STORE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAXIMUM_SCRIPT_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Populates `node_modules/.bin` from every installed package's `bin` field.
+///
+/// Package scripts and `sako x` find executables the way npm does: by looking
+/// up `node_modules/.bin` on `PATH`. Nothing created that directory before, so
+/// a manifest script like `"dev": "vite"` had no `vite` to run even with the
+/// package installed.
+///
+/// The shims re-enter Sako rather than Node. They prefer `$SAKO_EXECUTABLE`,
+/// which the CLI sets to its own path before spawning, so a script gets the
+/// exact binary the user invoked instead of whichever `sako` is on `PATH`.
+fn link_binaries(node_modules: &Path) -> Result<(), PackageError> {
+    if !node_modules.is_dir() {
+        return Ok(());
+    }
+    let bin_dir = node_modules.join(".bin");
+    let mut packages: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(node_modules)?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if name == ".bin" || !path.is_dir() {
+            continue;
+        }
+        if name.starts_with('@') {
+            // Scoped packages nest one level deeper: node_modules/@scope/name.
+            for scoped in fs::read_dir(&path)?.flatten() {
+                if scoped.path().is_dir() {
+                    packages.push(scoped.path());
+                }
+            }
+        } else {
+            packages.push(path);
+        }
+    }
+
+    for package in packages {
+        let manifest_path = package.join("package.json");
+        let Ok(source) = fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&source) else {
+            continue;
+        };
+        for (command, relative) in package_binaries(&manifest) {
+            // A package cannot claim a name that escapes .bin.
+            if command.is_empty() || command.contains(['/', '\\']) || command.starts_with('.') {
+                continue;
+            }
+            let target = package.join(&relative);
+            if !target.is_file() {
+                continue;
+            }
+            fs::create_dir_all(&bin_dir)?;
+            write_binary_shim(&bin_dir, &command, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Normalizes the two shapes npm allows: `"bin": "cli.js"` names the command
+/// after the package (scope stripped), `"bin": {"a": "a.js"}` names each one.
+fn package_binaries(manifest: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(bin) = manifest.get("bin") else {
+        return Vec::new();
+    };
+    if let Some(path) = bin.as_str() {
+        let name = manifest
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let command = name.rsplit('/').next().unwrap_or(name);
+        if command.is_empty() {
+            return Vec::new();
+        }
+        return vec![(command.to_owned(), path.to_owned())];
+    }
+    bin.as_object()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(command, path)| {
+                    path.as_str().map(|path| (command.clone(), path.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_binary_shim(bin_dir: &Path, command: &str, target: &Path) -> Result<(), PackageError> {
+    // Relative so the tree stays movable, matching npm's shims.
+    let relative = pathdiff_from(bin_dir, target);
+    let posix_target = relative.replace('\\', "/");
+
+    let posix = format!(
+        "#!/bin/sh\n\
+         basedir=$(dirname \"$(echo \"$0\" | sed -e 's,\\\\,/,g')\")\n\
+         exec \"${{SAKO_EXECUTABLE:-sako}}\" \"$basedir/{posix_target}\" \"$@\"\n"
+    );
+    let posix_path = bin_dir.join(command);
+    fs::write(&posix_path, posix)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&posix_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    #[cfg(windows)]
+    {
+        let windows_target = relative.replace('/', "\\");
+        let cmd = format!(
+            "@ECHO off\r\n\
+             SETLOCAL\r\n\
+             IF DEFINED SAKO_EXECUTABLE (SET \"_sako=%SAKO_EXECUTABLE%\") ELSE (SET \"_sako=sako\")\r\n\
+             \"%_sako%\" \"%~dp0{windows_target}\" %*\r\n"
+        );
+        fs::write(bin_dir.join(format!("{command}.cmd")), cmd)?;
+    }
+    Ok(())
+}
+
+/// Expresses `target` relative to `base`. Both come from the same install tree,
+/// so this only has to handle the shared-prefix case.
+fn pathdiff_from(base: &Path, target: &Path) -> String {
+    let base_parts: Vec<_> = base.components().collect();
+    let target_parts: Vec<_> = target.components().collect();
+    let shared = base_parts
+        .iter()
+        .zip(target_parts.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts: Vec<String> = vec!["..".into(); base_parts.len() - shared];
+    parts.extend(
+        target_parts[shared..]
+            .iter()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned()),
+    );
+    parts.join("/")
+}
+
 #[derive(Debug)]
 struct RegistryConfig {
     registry: String,
@@ -249,6 +389,53 @@ impl From<serde_json::Error> for PackageError {
     }
 }
 
+/// What the installer is doing right now, for a caller that wants to show it.
+///
+/// Modelled as events rather than a shared counter so the package manager
+/// never learns whether anything is being drawn: it reports, and whoever
+/// installed a reporter decides between a progress bar, a log line, or
+/// nothing at all.
+pub enum ProgressEvent<'a> {
+    /// The lockfile named the whole graph up front. Not sent when the graph is
+    /// being resolved from the registry instead, where the total is only known
+    /// once the walk has finished.
+    Planned { total: usize },
+    /// Asking the registry which versions of `name` exist. This is the phase
+    /// with nothing on disk to show for it, so it is worth surfacing.
+    Resolving { name: &'a str },
+    /// `name@version` is unpacked under node_modules. `downloaded` separates a
+    /// tarball fetched from the registry from one the local store already had.
+    Installed {
+        name: &'a str,
+        version: &'a str,
+        downloaded: bool,
+    },
+    /// A problem that did not stop the install, usually an optional dependency
+    /// that would not build. Routed through the reporter so it can be printed
+    /// without tearing a half-drawn progress line.
+    Warning { message: &'a str },
+    /// Everything is on disk.
+    Finished { installed: usize },
+}
+
+pub trait ProgressReporter {
+    fn report(&self, event: ProgressEvent<'_>);
+}
+
+/// Holds the optional reporter. Exists only so `PackageManager` can keep its
+/// derived `Debug`, which a bare `Box<dyn ProgressReporter>` would deny it.
+#[derive(Default)]
+struct Reporter(Option<Box<dyn ProgressReporter>>);
+
+impl fmt::Debug for Reporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.0 {
+            Some(_) => "Reporter(installed)",
+            None => "Reporter(none)",
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct PackageManager {
     root: PathBuf,
@@ -263,6 +450,7 @@ pub struct PackageManager {
     ignore_scripts: bool,
     installed: BTreeMap<String, LockedPackage>,
     active: HashSet<String>,
+    reporter: Reporter,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -378,7 +566,31 @@ impl PackageManager {
             ignore_scripts: options.ignore_scripts,
             installed: BTreeMap::new(),
             active: HashSet::new(),
+            reporter: Reporter::default(),
         })
+    }
+
+    /// Attaches a progress reporter. Installs are otherwise silent until they
+    /// either finish or fail, which on a cold cache is a long time to look
+    /// like nothing is happening.
+    pub fn set_reporter(&mut self, reporter: Box<dyn ProgressReporter>) {
+        self.reporter = Reporter(Some(reporter));
+    }
+
+    fn report(&self, event: ProgressEvent<'_>) {
+        if let Some(reporter) = &self.reporter.0 {
+            reporter.report(event);
+        }
+    }
+
+    /// Reports something that did not stop the install. Falls back to stderr
+    /// when no reporter is attached, which is what these messages did before
+    /// there was one.
+    fn warn(&self, message: &str) {
+        match &self.reporter.0 {
+            Some(reporter) => reporter.report(ProgressEvent::Warning { message }),
+            None => eprintln!("sako: {message}"),
+        }
     }
 
     pub fn install(&mut self) -> Result<(), PackageError> {
@@ -400,6 +612,10 @@ impl PackageManager {
         let optional_dependencies = manifest_dependencies(&manifest, "optionalDependencies")?;
 
         if self.install_from_lock(&dependencies, &optional_dependencies)? {
+            link_binaries(&self.root.join("node_modules"))?;
+            self.report(ProgressEvent::Finished {
+                installed: self.installed.len(),
+            });
             return Ok(());
         }
 
@@ -420,11 +636,16 @@ impl PackageManager {
                 &node_modules,
                 &format!("node_modules/{name}"),
             ) {
-                eprintln!("sako: skipping optional dependency {name}: {error}");
+                self.warn(&format!("skipping optional dependency {name}: {error}"));
             }
         }
         validate_peer_dependencies(&self.installed)?;
-        self.write_lockfile()
+        link_binaries(&node_modules)?;
+        self.write_lockfile()?;
+        self.report(ProgressEvent::Finished {
+            installed: self.installed.len(),
+        });
+        Ok(())
     }
 
     pub fn add(&mut self, specifier: &str, development: bool) -> Result<(), PackageError> {
@@ -525,8 +746,13 @@ impl PackageManager {
         }
 
         let destination = package_install_path(parent_node_modules, name)?;
-        let archive = self.fetch_archive(&package.dist)?;
+        let (archive, downloaded) = self.fetch_archive(&package.dist)?;
         extract_archive(&archive, &destination)?;
+        self.report(ProgressEvent::Installed {
+            name: &package.name,
+            version: &package.version,
+            downloaded,
+        });
 
         self.installed.insert(
             lock_path.into(),
@@ -567,7 +793,7 @@ impl PackageManager {
                 &child_node_modules,
                 &child_lock_path,
             ) {
-                eprintln!("sako: skipping optional dependency {dependency}: {error}");
+                self.warn(&format!("skipping optional dependency {dependency}: {error}"));
             }
         }
         if !self.ignore_scripts {
@@ -592,6 +818,11 @@ impl PackageManager {
         }
         let destination = package_install_path(parent_node_modules, &workspace.name)?;
         copy_workspace(&workspace.path, &destination)?;
+        self.report(ProgressEvent::Installed {
+            name: &workspace.name,
+            version: &workspace.version,
+            downloaded: false,
+        });
         self.installed.insert(
             lock_path.into(),
             LockedPackage {
@@ -623,7 +854,7 @@ impl PackageManager {
                 &child_node_modules,
                 &format!("{lock_path}/node_modules/{dependency}"),
             ) {
-                eprintln!("sako: skipping optional dependency {dependency}: {error}");
+                self.warn(&format!("skipping optional dependency {dependency}: {error}"));
             }
         }
         if !self.ignore_scripts {
@@ -651,6 +882,9 @@ impl PackageManager {
             return Ok(false);
         }
 
+        self.report(ProgressEvent::Planned {
+            total: lockfile.packages.len(),
+        });
         self.installed = lockfile.packages.clone();
         self.active.clear();
         let node_modules = self.root.join("node_modules");
@@ -668,7 +902,7 @@ impl PackageManager {
                 && let Err(error) =
                     self.install_locked_dependency(&lockfile, &lock_path, &node_modules)
             {
-                eprintln!("sako: skipping optional dependency {name}: {error}");
+                self.warn(&format!("skipping optional dependency {name}: {error}"));
             }
         }
         validate_peer_dependencies(&self.installed)?;
@@ -705,12 +939,22 @@ impl PackageManager {
                 )));
             }
             copy_workspace(&workspace.path, &destination)?;
+            self.report(ProgressEvent::Installed {
+                name: &package.name,
+                version: &package.version,
+                downloaded: false,
+            });
         } else {
-            let archive = self.fetch_archive(&Distribution {
+            let (archive, downloaded) = self.fetch_archive(&Distribution {
                 tarball: package.resolved.clone(),
                 integrity: package.integrity.clone(),
             })?;
             extract_archive(&archive, &destination)?;
+            self.report(ProgressEvent::Installed {
+                name: &package.name,
+                version: &package.version,
+                downloaded,
+            });
         }
         let child_node_modules = destination.join("node_modules");
         for (dependency, requirement) in &package.dependencies {
@@ -729,7 +973,7 @@ impl PackageManager {
                 && let Err(error) =
                     self.install_locked_dependency(lockfile, &child_path, &child_node_modules)
             {
-                eprintln!("sako: skipping optional dependency {dependency}: {error}");
+                self.warn(&format!("skipping optional dependency {dependency}: {error}"));
             }
         }
         if !self.ignore_scripts {
@@ -746,6 +990,7 @@ impl PackageManager {
                     "registry metadata cache capacity exceeded".into(),
                 ));
             }
+            self.report(ProgressEvent::Resolving { name });
             let encoded = name.replace('/', "%2f");
             let registry = self.registry_for(name);
             let url = format!("{}/{encoded}", registry.trim_end_matches('/'));
@@ -774,7 +1019,13 @@ impl PackageManager {
         select_version(self.metadata.get(name).unwrap(), requirement)
     }
 
-    fn fetch_archive(&self, distribution: &Distribution) -> Result<Vec<u8>, PackageError> {
+    /// Returns the tarball bytes and whether they came off the network, which
+    /// is the difference between a warm and a cold store as far as anything
+    /// watching the install is concerned.
+    fn fetch_archive(
+        &self,
+        distribution: &Distribution,
+    ) -> Result<(Vec<u8>, bool), PackageError> {
         let expected = parse_sha512_integrity(&distribution.integrity)?;
         let digest_hex = hex(&expected);
         let cache_path = self
@@ -784,7 +1035,7 @@ impl PackageManager {
         if cache_path.is_file() {
             let bytes = fs::read(&cache_path)?;
             verify_integrity(&bytes, &expected)?;
-            return Ok(bytes);
+            return Ok((bytes, false));
         }
 
         let response = self
@@ -807,7 +1058,7 @@ impl PackageManager {
         fs::write(&temporary, &bytes)?;
         fs::rename(temporary, cache_path)?;
         prune_store(&self.cache_root)?;
-        Ok(bytes)
+        Ok((bytes, true))
     }
 
     fn registry_for(&self, name: &str) -> &str {
@@ -1520,14 +1771,34 @@ fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), PackageError>
         let mut entry = entry?;
         let archive_path = entry.path()?.into_owned();
         let mut components = archive_path.components();
-        if components.next() != Some(Component::Normal(OsStr::new("package"))) {
-            return Err(PackageError("tarball entry is outside package/".into()));
+        // npm strips one leading component whatever it is called, and that is
+        // the behaviour packages are published against. Most use `package/`,
+        // but plenty do not -- GitHub-generated tarballs use
+        // `<repo>-<sha>/`, and some publishers ship their own name -- so
+        // demanding `package/` rejected perfectly ordinary dependencies.
+        // Safety does not depend on the name: every remaining component is
+        // checked below, and the result is confined to `destination`.
+        match components.next() {
+            Some(Component::Normal(_)) => {}
+            // Anything else is absolute, a parent escape, or a prefix.
+            Some(_) => {
+                return Err(PackageError(format!(
+                    "unsafe tarball path: {}",
+                    archive_path.display()
+                )));
+            }
+            None => continue,
         }
         let mut relative = PathBuf::new();
         for component in components {
             match component {
                 Component::Normal(value) => relative.push(value),
-                _ => return Err(PackageError("unsafe tarball path".into())),
+                _ => {
+                    return Err(PackageError(format!(
+                        "unsafe tarball path: {}",
+                        archive_path.display()
+                    )));
+                }
             }
         }
         if relative.as_os_str().is_empty() {
@@ -1542,10 +1813,20 @@ fn extract_archive(bytes: &[u8], destination: &Path) -> Result<(), PackageError>
             return Err(PackageError("tarball entry escapes destination".into()));
         }
         let entry_type = entry.header().entry_type();
+        // PAX and GNU long-name records are metadata the tar reader has
+        // already applied to the following entry; they are not content.
+        if entry_type.is_pax_global_extensions()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+        {
+            continue;
+        }
         if !(entry_type.is_file() || entry_type.is_dir()) {
-            return Err(PackageError(
-                "tarball links and special files are unsupported".into(),
-            ));
+            return Err(PackageError(format!(
+                "tarball links and special files are unsupported: {}",
+                archive_path.display()
+            )));
         }
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
@@ -1606,7 +1887,12 @@ fn run_lifecycle_scripts(
         #[cfg(windows)]
         let (shell, arguments) = (
             "cmd.exe",
-            vec!["/d".to_owned(), "/s".to_owned(), "/c".to_owned(), script.to_owned()],
+            vec![
+                "/d".to_owned(),
+                "/s".to_owned(),
+                "/c".to_owned(),
+                script.to_owned(),
+            ],
         );
         #[cfg(unix)]
         let (shell, arguments) = ("/bin/sh", vec!["-c".to_owned(), script.to_owned()]);
@@ -1775,6 +2061,7 @@ mod tests {
             ignore_scripts: true,
             installed: BTreeMap::new(),
             active: HashSet::new(),
+            reporter: Reporter::default(),
         };
         manager.install().unwrap();
         assert_eq!(

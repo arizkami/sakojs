@@ -3,6 +3,7 @@
 import assert, { strictEqual } from "node:assert";
 import { Buffer } from "node:buffer";
 import childProcess from "node:child_process";
+import nodeCrypto from "node:crypto";
 import dns from "node:dns";
 import dnsPromises from "node:dns/promises";
 import EventEmitter, { EventEmitter as NamedEventEmitter } from "node:events";
@@ -162,6 +163,29 @@ url.searchParams.set("value", "two words");
 strictEqual(url.href, "https://example.com:8443/a?value=two+words#hash");
 strictEqual(new NodeURLSearchParams("a=1&a=2").getAll("a").length, 2);
 strictEqual(NodeURL, URL);
+
+// A relative reference against a file: base. `origin` is "null" for file:
+// URLs, so resolving through it produced "null/..." and threw; import.meta.url
+// is a file: URL, which is what tooling resolves its own assets against.
+const moduleBase = "file:///W:/project/dist/bindings.js";
+strictEqual(new NodeURL(".", moduleBase).pathname, "/W:/project/dist/");
+strictEqual(new NodeURL("./binding.node", moduleBase).href, "file:///W:/project/dist/binding.node");
+strictEqual(new NodeURL("../lib/main.js", moduleBase).href, "file:///W:/project/lib/main.js");
+strictEqual(new NodeURL("file:///a/b").href, "file:///a/b");
+strictEqual(new NodeURL("?q=1", "https://example.com/a/b").href, "https://example.com/a/b?q=1");
+
+// SHA-256 is what TypeScript's build mode hashes every source file with, so
+// tsc could not run at all while SHA-1 was the only algorithm on offer.
+strictEqual(nodeCrypto.createHash("sha1").update("").digest("hex"),
+  "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+strictEqual(nodeCrypto.createHash("sha256").update("").digest("hex"),
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+strictEqual(nodeCrypto.createHash("SHA-256").update("sako").digest("hex"),
+  nodeCrypto.createHash("sha256").update("sako").digest("hex"));
+strictEqual(nodeCrypto.createHash("sha512").update("").digest("hex").length, 128);
+let unsupportedHash = "";
+try { nodeCrypto.createHash("md5"); } catch (error) { unsupportedHash = error.message; }
+assert.ok(unsupportedHash.includes("Unsupported hash algorithm"), unsupportedHash);
 
 const controller = new AbortController();
 let aborted = false;

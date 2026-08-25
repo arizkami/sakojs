@@ -256,8 +256,14 @@ impl EpollReactor {
         };
         // SAFETY: the epoll instance is live and `fd` is a valid, open
         // descriptor for the duration of this call.
-        if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) }
-            == -1
+        if unsafe {
+            libc::epoll_ctl(
+                self.epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                fd,
+                &mut event,
+            )
+        } == -1
         {
             let error = io::Error::last_os_error();
             self.registrations.remove(&fd);
@@ -282,8 +288,14 @@ impl EpollReactor {
         };
         // SAFETY: the epoll instance is live and `fd` was already added via
         // `epoll_add` (associate_socket / an owning submit call).
-        if unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_MOD, fd, &mut event) }
-            == -1
+        if unsafe {
+            libc::epoll_ctl(
+                self.epoll_fd.as_raw_fd(),
+                libc::EPOLL_CTL_MOD,
+                fd,
+                &mut event,
+            )
+        } == -1
         {
             return Err(io::Error::last_os_error());
         }
@@ -580,11 +592,17 @@ impl EpollReactor {
         // epoll_ctl on an already-closed descriptor would fail.
         let clear_result = self.set_interest(
             fd,
-            if is_read { libc::EPOLLIN } else { libc::EPOLLOUT } as u32,
+            if is_read {
+                libc::EPOLLIN
+            } else {
+                libc::EPOLLOUT
+            } as u32,
             false,
         );
         self.operation_locations.remove(&id);
-        let buffer = taken_write.take().map_or_else(Vec::new, |pending| pending.buffer);
+        let buffer = taken_write
+            .take()
+            .map_or_else(Vec::new, |pending| pending.buffer);
         // `taken_read`'s owner (if any) drops here, closing an owned
         // descriptor only after epoll interest for it has already been
         // cleared above.
@@ -784,13 +802,7 @@ impl EpollReactor {
         }
         let milliseconds = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let mut events = std::mem::take(&mut self.events);
-        events.resize(
-            count,
-            libc::epoll_event {
-                events: 0,
-                u64: 0,
-            },
-        );
+        events.resize(count, libc::epoll_event { events: 0, u64: 0 });
         // SAFETY: events has writable storage for `count` entries and the
         // epoll instance remains live for this call.
         let ready = unsafe {
@@ -817,8 +829,10 @@ impl EpollReactor {
                 continue;
             }
             let fd = event.u64 as RawFd;
-            let readable = event.events & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
-            let writable = event.events & (libc::EPOLLOUT | libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
+            let readable =
+                event.events & (libc::EPOLLIN | libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
+            let writable =
+                event.events & (libc::EPOLLOUT | libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0;
             if readable {
                 if let Some(id) = self.resolve_pending_read(fd) {
                     if let Some(completed) = completed.as_deref_mut() {

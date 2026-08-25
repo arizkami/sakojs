@@ -254,11 +254,7 @@ impl IocpReactor {
     /// refuse it, and a caller that submits against such a socket must keep
     /// waiting for every completion, so the answer has to travel with the
     /// socket rather than being assumed.
-    pub fn associate_socket(
-        &self,
-        socket: BorrowedSocket<'_>,
-        key: usize,
-    ) -> io::Result<bool> {
+    pub fn associate_socket(&self, socket: BorrowedSocket<'_>, key: usize) -> io::Result<bool> {
         // SAFETY: Winsock SOCKET values are valid handles for IOCP association.
         // The borrowed socket and completion port are live for this call, and
         // association transfers ownership of neither resource.
