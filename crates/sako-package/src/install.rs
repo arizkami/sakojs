@@ -389,12 +389,13 @@ impl<'a> Planner<'a> {
         optional_dependencies: &BTreeMap<String, String>,
         group: Option<u32>,
     ) -> Result<(), PackageError> {
-        self.scopes
-            .push(self.scope_of(dependencies, optional_dependencies));
+        let (scope, adopted) = self.scope_of(dependencies, optional_dependencies);
+        self.scopes.push(scope);
         let outcome = self.expand_scoped(
             node_modules,
             lock_prefix,
             dependencies,
+            &adopted,
             optional_dependencies,
             group,
         );
@@ -402,17 +403,30 @@ impl<'a> Planner<'a> {
         outcome
     }
 
-    /// Everything this directory will hold, by name and resolved version.
+    /// Everything this directory will hold, and the peers it took on to get
+    /// there.
     ///
-    /// Resolution here is a lookup in a map the resolver already filled, not a
-    /// request, so knowing a directory's contents before planning it costs
-    /// nothing.
+    /// Two passes. The first resolves what the directory was asked for; the
+    /// second hands the directory every unmet peer of everything in it, as long
+    /// as the name is free here. That second pass is what makes a peer
+    /// *shared*: two siblings that both need React and no React above them
+    /// would otherwise get one private copy each, and two copies of React is
+    /// not a heavier install, it is a broken one.
+    ///
+    /// A name already claimed here is left alone. If the claim does not satisfy
+    /// the peer, `children_of` gives the package that needs it a private copy
+    /// instead -- the only remaining placement that cannot disturb the sibling
+    /// which claimed it first.
+    ///
+    /// Resolution is a lookup in a map the resolver already filled, not a
+    /// request, so knowing all of this before planning anything costs nothing.
     fn scope_of(
         &self,
         dependencies: &BTreeMap<String, String>,
         optional_dependencies: &BTreeMap<String, String>,
-    ) -> BTreeMap<String, String> {
-        let mut scope = BTreeMap::new();
+    ) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let mut resolved: BTreeMap<String, Arc<PackageVersion>> = BTreeMap::new();
+        let mut scope: BTreeMap<String, String> = BTreeMap::new();
         let required = required_only(dependencies, optional_dependencies);
         for (name, requirement) in required.chain(optional_dependencies.iter()) {
             if let Some(workspace) = self.manager.workspaces.get(name)
@@ -427,19 +441,71 @@ impl<'a> Planner<'a> {
                 && package.supports_host()
             {
                 scope.insert(name.clone(), package.version.clone());
+                resolved.insert(name.clone(), package);
             }
         }
-        scope
+
+        let mut adopted: BTreeMap<String, String> = BTreeMap::new();
+        if self.manager.legacy_peer_deps {
+            return (scope, adopted);
+        }
+        // A peer taken on here may bring peers of its own, so this repeats
+        // until nothing new appears. Bounded because each pass must add a name
+        // that was not in `scope`, and the graph holds finitely many.
+        loop {
+            let mut added = false;
+            for (_, package) in std::mem::take(&mut resolved) {
+                for (peer, requirement) in &package.peer_dependencies {
+                    if scope.contains_key(peer) {
+                        continue;
+                    }
+                    if self.peer_is_optional(&package, peer)
+                        || satisfied_in_scope(&self.scopes, peer, requirement)
+                    {
+                        continue;
+                    }
+                    let Ok(chosen) = self.graph.select(&self.manager.registry, peer, requirement)
+                    else {
+                        continue;
+                    };
+                    if !chosen.supports_host() {
+                        continue;
+                    }
+                    scope.insert(peer.clone(), chosen.version.clone());
+                    adopted.insert(peer.clone(), requirement.clone());
+                    resolved.insert(peer.clone(), chosen);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        (scope, adopted)
     }
 
-    /// A package's required children: what it depends on, plus the peers
-    /// nothing around it provides.
+    /// Whether `package` says it works without `peer`.
     ///
-    /// npm stopped making people install peer dependencies by hand in npm 7,
-    /// and a package manager that does not follow suit simply cannot install
-    /// `react-dom`. The copy goes inside the package that needs it, which is
-    /// the first place Node looks and the only placement that cannot disturb a
-    /// sibling that wanted a different version.
+    /// npm does not choose optional peers for you, and nearly every React
+    /// package marks `@types/react` optional -- installing those would put a
+    /// types package under half the tree for the benefit of nobody who is not
+    /// compiling TypeScript against it.
+    fn peer_is_optional(&self, package: &PackageVersion, peer: &str) -> bool {
+        package
+            .peer_dependencies_meta
+            .get(peer)
+            .is_some_and(|metadata| metadata.optional)
+    }
+
+    /// A package's required children: what it depends on, plus any peer still
+    /// unmet after its own directory has taken on what it could.
+    ///
+    /// By the time this runs, `scope_of` has already given the surrounding
+    /// directory every peer it had room for, so what reaches here is the
+    /// narrower case: a peer whose name a sibling already claimed at a version
+    /// that does not satisfy it. That copy goes inside the package that needs
+    /// it -- the first place Node looks, and the only placement left that
+    /// cannot disturb the sibling which claimed the name first.
     fn children_of(&self, package: &PackageVersion) -> BTreeMap<String, String> {
         let mut children = package.dependencies.clone();
         if self.manager.legacy_peer_deps {
@@ -452,17 +518,7 @@ impl<'a> Planner<'a> {
             if satisfied_in_scope(&self.scopes, peer, requirement) {
                 continue;
             }
-            // An optional peer is one the package works without, and npm
-            // leaves it out rather than choosing it for you. It matters more
-            // than it sounds: nearly every React library marks `@types/react`
-            // optional, and installing those would add a types package under
-            // half the tree for the benefit of nobody who is not compiling
-            // TypeScript against it.
-            if package
-                .peer_dependencies_meta
-                .get(peer)
-                .is_some_and(|metadata| metadata.optional)
-            {
+            if self.peer_is_optional(package, peer) {
                 continue;
             }
             // A peer that cannot be resolved or cannot run here is left out
@@ -485,12 +541,22 @@ impl<'a> Planner<'a> {
         node_modules: &Path,
         lock_prefix: &str,
         dependencies: &BTreeMap<String, String>,
+        adopted: &BTreeMap<String, String>,
         optional_dependencies: &BTreeMap<String, String>,
         group: Option<u32>,
     ) -> Result<(), PackageError> {
-        let required: Vec<(String, String)> = required_only(dependencies, optional_dependencies)
-            .map(|(name, requirement)| (name.clone(), requirement.clone()))
-            .collect();
+        // Declared and adopted together in one ordered map, so an adopted peer
+        // is planned in name order beside everything else rather than in a
+        // second pass whose position in the tree would depend on it.
+        let mut required: BTreeMap<String, String> =
+            required_only(dependencies, optional_dependencies)
+                .map(|(name, requirement)| (name.clone(), requirement.clone()))
+                .collect();
+        for (name, requirement) in adopted {
+            required
+                .entry(name.clone())
+                .or_insert_with(|| requirement.clone());
+        }
         for (name, requirement) in required {
             let lock_path = child_lock_path(lock_prefix, &name);
             self.plan_one(&name, &requirement, node_modules, &lock_path, group)?;
@@ -750,7 +816,13 @@ impl<'a> Replayer<'a> {
             return Ok(());
         }
 
-        let outcome = self.expand_locked(package.clone(), lock_path, &children_root, group);
+        let outcome = self.expand_locked(
+            package.clone(),
+            lock_path,
+            node_modules,
+            &children_root,
+            group,
+        );
         self.state.active.remove(&identity);
         outcome?;
         self.state.finish_order.push(index);
@@ -761,6 +833,7 @@ impl<'a> Replayer<'a> {
         &mut self,
         package: LockedPackage,
         lock_path: &str,
+        node_modules: &Path,
         children_root: &Path,
         group: Option<u32>,
     ) -> Result<(), PackageError> {
@@ -781,14 +854,24 @@ impl<'a> Replayer<'a> {
                 )));
             }
         }
-        // A peer the resolving install had to provide is recorded as an entry
-        // under the package that needed it, not in its `dependencies`. Without
-        // this the replay would leave it out, decide the tree no longer matched
-        // the lockfile, and rewrite the lockfile to say so.
+        // A peer the resolving install provided is an entry somewhere the
+        // package can see it, and never in its own `dependencies`. Both
+        // placements the planner uses have to be followed here or the replay
+        // rebuilds a tree missing the peer -- which then fails validation,
+        // having said nothing about why.
+        //
+        // Beside the package is the usual one, since that is where a peer goes
+        // when the name was free; inside it is the fallback for a name a
+        // sibling had already claimed at a version that did not satisfy.
         for dependency in package.peer_dependencies.keys() {
-            let child_path = format!("{lock_path}/node_modules/{dependency}");
-            if self.lockfile.packages.contains_key(&child_path) {
-                self.plan_one(&child_path, children_root, group)?;
+            let nested = format!("{lock_path}/node_modules/{dependency}");
+            if self.lockfile.packages.contains_key(&nested) {
+                self.plan_one(&nested, children_root, group)?;
+                continue;
+            }
+            let beside = sibling_lock_path(lock_path, dependency);
+            if self.lockfile.packages.contains_key(&beside) {
+                self.plan_one(&beside, node_modules, group)?;
             }
         }
         for dependency in package.optional_dependencies.keys() {
@@ -861,6 +944,20 @@ fn child_lock_path(prefix: &str, name: &str) -> String {
         format!("node_modules/{name}")
     } else {
         format!("{prefix}/node_modules/{name}")
+    }
+}
+
+/// The path a sibling of `lock_path` would have.
+///
+/// Everything up to and including the last `node_modules/` is the directory
+/// the package sits in; swapping the final name gives the position beside it.
+/// A scope is part of a name rather than a directory level, so no special case
+/// is needed for one.
+fn sibling_lock_path(lock_path: &str, name: &str) -> String {
+    const SEGMENT: &str = "node_modules/";
+    match lock_path.rfind(SEGMENT) {
+        Some(index) => format!("{}{name}", &lock_path[..index + SEGMENT.len()]),
+        None => format!("{SEGMENT}{name}"),
     }
 }
 
@@ -1268,6 +1365,23 @@ mod tests {
     #[test]
     fn nothing_is_satisfied_by_an_empty_tree() {
         assert!(!satisfied_in_scope(&[], "react", "^18.0.0"));
+    }
+
+    #[test]
+    fn a_sibling_shares_the_directory_and_swaps_the_name() {
+        assert_eq!(
+            sibling_lock_path("node_modules/react-dom", "react"),
+            "node_modules/react"
+        );
+        assert_eq!(
+            sibling_lock_path("node_modules/a/node_modules/react-dom", "react"),
+            "node_modules/a/node_modules/react"
+        );
+        // A scope is part of the name, not another directory level.
+        assert_eq!(
+            sibling_lock_path("node_modules/@testing-library/react", "react"),
+            "node_modules/react"
+        );
     }
 
     #[test]
