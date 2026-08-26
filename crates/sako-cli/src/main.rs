@@ -480,7 +480,7 @@ fn package_manager(options: PackageManagerOptions) -> Result<PackageManager, Str
         env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))?;
     let mut manager =
         PackageManager::new_with_options(root, options).map_err(|error| error.to_string())?;
-    manager.set_reporter(Box::new(progress::Bar::new()));
+    manager.set_reporter(std::sync::Arc::new(progress::Install::new()));
     Ok(manager)
 }
 

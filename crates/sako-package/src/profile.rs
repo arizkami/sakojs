@@ -148,11 +148,18 @@ pub enum Pool {
     Metadata,
     Download,
     Extract,
+    Materialize,
     Link,
 }
 
 impl Pool {
-    const ALL: [Pool; 4] = [Pool::Metadata, Pool::Download, Pool::Extract, Pool::Link];
+    const ALL: [Pool; 5] = [
+        Pool::Metadata,
+        Pool::Download,
+        Pool::Extract,
+        Pool::Materialize,
+        Pool::Link,
+    ];
 
     fn index(self) -> usize {
         self as usize
@@ -163,6 +170,7 @@ impl Pool {
             Pool::Metadata => "peak metadata workers",
             Pool::Download => "peak download workers",
             Pool::Extract => "peak extract workers",
+            Pool::Materialize => "peak materialize workers",
             Pool::Link => "peak link workers",
         }
     }
@@ -186,8 +194,8 @@ pub struct Profile {
     detailed: AtomicBool,
     stages: [AtomicU64; 11],
     counts: [AtomicU64; 17],
-    live: [AtomicU64; 4],
-    peak: [AtomicU64; 4],
+    live: [AtomicU64; 5],
+    peak: [AtomicU64; 5],
     packages: Mutex<BTreeMap<String, PackageTiming>>,
     started: Mutex<Option<Instant>>,
 }
@@ -205,8 +213,8 @@ impl Profile {
             detailed: AtomicBool::new(false),
             stages: [const { AtomicU64::new(0) }; 11],
             counts: [const { AtomicU64::new(0) }; 17],
-            live: [const { AtomicU64::new(0) }; 4],
-            peak: [const { AtomicU64::new(0) }; 4],
+            live: [const { AtomicU64::new(0) }; 5],
+            peak: [const { AtomicU64::new(0) }; 5],
             packages: Mutex::new(BTreeMap::new()),
             started: Mutex::new(None),
         }

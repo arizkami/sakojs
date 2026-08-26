@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod profile;
+mod install;
+mod registry;
+mod resolver;
+mod scheduler;
+mod store;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::read::GzDecoder;
-use profile::{Count, Pool, Profile, Stage};
+use profile::{Count, Profile, Stage};
+use registry::{Credentials, MetadataCache, Registry};
 use sako_process::spawn_native_with_bounded_output_in;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -480,39 +486,55 @@ impl From<serde_json::Error> for PackageError {
 ///
 /// Modelled as events rather than a shared counter so the package manager
 /// never learns whether anything is being drawn: it reports, and whoever
-/// installed a reporter decides between a progress bar, a log line, or
+/// installed a reporter decides between a progress tree, a log line, or
 /// nothing at all.
+///
+/// The events come from a pool of worker threads, several at once, which is
+/// why a reporter has to be `Sync` and why every one of these is cheap. A
+/// reporter that draws something on each of them would make the terminal the
+/// slowest part of an install; the one Sako ships keeps counters and redraws
+/// on a timer instead.
 pub enum ProgressEvent<'a> {
-    /// The lockfile named the whole graph up front. Not sent when the graph is
-    /// being resolved from the registry instead, where the total is only known
-    /// once the walk has finished.
+    /// The tree is decided: this many positions will be filled.
     Planned { total: usize },
-    /// Asking the registry which versions of `name` exist. This is the phase
-    /// with nothing on disk to show for it, so it is worth surfacing.
-    Resolving { name: &'a str },
-    /// `name@version` is unpacked under node_modules. `downloaded` separates a
-    /// tarball fetched from the registry from one the local store already had.
-    Installed {
-        name: &'a str,
-        version: &'a str,
-        downloaded: bool,
-    },
+    /// Asking a registry which versions of `name` exist -- or joining a
+    /// request for it that another worker already started.
+    ResolveStarted { name: &'a str },
+    ResolveFinished { name: &'a str },
+    /// This many distinct packages have to be brought in, before counting
+    /// which of them the store already has.
+    FetchPlanned { total: usize },
+    DownloadStarted { name: &'a str },
+    /// `cached` separates a package the local store already held from one
+    /// fetched from the registry.
+    DownloadFinished { name: &'a str, cached: bool },
+    ExtractStarted { name: &'a str },
+    ExtractFinished { name: &'a str },
+    /// This many tree positions have to be filled from the store.
+    StorePlanned { total: usize },
+    Materialized { name: &'a str },
+    /// This many directories need a `.bin`.
+    LinkPlanned { total: usize },
+    Linked,
     /// A problem that did not stop the install, usually an optional dependency
     /// that would not build. Routed through the reporter so it can be printed
-    /// without tearing a half-drawn progress line.
+    /// without tearing a half-drawn progress view.
     Warning { message: &'a str },
     /// Everything is on disk.
     Finished { installed: usize },
 }
 
-pub trait ProgressReporter {
+pub trait ProgressReporter: Send + Sync {
     fn report(&self, event: ProgressEvent<'_>);
 }
 
 /// Holds the optional reporter. Exists only so `PackageManager` can keep its
-/// derived `Debug`, which a bare `Box<dyn ProgressReporter>` would deny it.
-#[derive(Default)]
-struct Reporter(Option<Box<dyn ProgressReporter>>);
+/// derived `Debug`, which a bare trait object would deny it.
+///
+/// An `Arc` rather than a `Box` because the resolver hands the reporter to
+/// every worker in the pool.
+#[derive(Clone, Default)]
+pub(crate) struct Reporter(pub(crate) Option<Arc<dyn ProgressReporter>>);
 
 impl fmt::Debug for Reporter {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -526,17 +548,15 @@ impl fmt::Debug for Reporter {
 #[derive(Debug)]
 pub struct PackageManager {
     root: PathBuf,
-    registry: String,
-    scoped_registries: BTreeMap<String, String>,
-    auth_tokens: BTreeMap<String, String>,
-    basic_auth: BTreeMap<String, String>,
-    agent: ureq::Agent,
-    cache_root: PathBuf,
-    metadata: HashMap<String, Metadata>,
+    /// Everything that talks to a registry, behind an `Arc` because the
+    /// resolver hands it to a pool of workers.
+    registry: Arc<Registry>,
+    /// One packument per name however many edges ask for it, and one request
+    /// however many workers ask at once.
+    metadata: Arc<MetadataCache>,
     workspaces: BTreeMap<String, WorkspacePackage>,
     ignore_scripts: bool,
     installed: BTreeMap<String, LockedPackage>,
-    active: HashSet<String>,
     reporter: Reporter,
     profile: Arc<Profile>,
 }
@@ -637,7 +657,7 @@ impl PackageManager {
         if let Some(token) = registry_config.default_auth_token.take() {
             registry_config.auth_tokens.insert(default_auth_key, token);
         }
-        let cache_root = cache_directory()?.join("Sako").join("Store").join("sha512");
+        let store = cache_directory()?.join("Sako").join("Store");
         let mut agent = ureq::AgentBuilder::new();
         if let Some(proxy) = registry_config.proxy {
             agent = agent.proxy(
@@ -645,34 +665,63 @@ impl PackageManager {
                     .map_err(|error| PackageError(format!("invalid npm proxy: {error}")))?,
             );
         }
+        let profile = Profile::new();
+        if options.perf || options.verbose {
+            profile.enable(options.verbose);
+        }
+        let profile = Arc::new(profile);
         Ok(Self {
             root,
-            registry: registry_config.registry.trim_end_matches('/').into(),
-            scoped_registries: registry_config.scoped_registries,
-            auth_tokens: registry_config.auth_tokens,
-            basic_auth: registry_config.basic_auth,
-            agent: agent.build(),
-            cache_root,
-            metadata: HashMap::new(),
+            registry: Arc::new(Registry::new(
+                agent.build(),
+                registry_config.registry.trim_end_matches('/').into(),
+                registry_config.scoped_registries,
+                Credentials {
+                    auth_tokens: registry_config.auth_tokens,
+                    basic_auth: registry_config.basic_auth,
+                },
+                store.join("sha512"),
+                store.join("metadata"),
+                Arc::clone(&profile),
+            )),
+            metadata: Arc::new(MetadataCache::new()),
             workspaces: BTreeMap::new(),
             ignore_scripts: options.ignore_scripts,
             installed: BTreeMap::new(),
-            active: HashSet::new(),
             reporter: Reporter::default(),
-            profile: {
-                let profile = Profile::new();
-                if options.perf || options.verbose {
-                    profile.enable(options.verbose);
-                }
-                Arc::new(profile)
-            },
+            profile,
         })
+    }
+
+    /// A manager pointed at a store the caller seeded and a registry that does
+    /// not answer, so a test can prove an install needs neither.
+    #[cfg(test)]
+    fn for_test(root: PathBuf, store_root: PathBuf) -> Self {
+        let profile = Arc::new(Profile::new());
+        Self {
+            registry: Arc::new(Registry::new(
+                ureq::AgentBuilder::new().build(),
+                "https://invalid.example".into(),
+                BTreeMap::new(),
+                Credentials::default(),
+                store_root.clone(),
+                store_root.with_file_name("metadata"),
+                Arc::clone(&profile),
+            )),
+            root,
+            metadata: Arc::new(MetadataCache::new()),
+            workspaces: BTreeMap::new(),
+            ignore_scripts: true,
+            installed: BTreeMap::new(),
+            reporter: Reporter::default(),
+            profile,
+        }
     }
 
     /// Attaches a progress reporter. Installs are otherwise silent until they
     /// either finish or fail, which on a cold cache is a long time to look
     /// like nothing is happening.
-    pub fn set_reporter(&mut self, reporter: Box<dyn ProgressReporter>) {
+    pub fn set_reporter(&mut self, reporter: Arc<dyn ProgressReporter>) {
         self.reporter = Reporter(Some(reporter));
     }
 
@@ -705,7 +754,6 @@ impl PackageManager {
 
     pub fn install(&mut self) -> Result<(), PackageError> {
         self.installed.clear();
-        self.active.clear();
         let manifest = self.read_manifest()?;
         let root_engines = manifest_engines(&manifest)?;
         validate_sako_engine("root package", &root_engines)?;
@@ -722,43 +770,13 @@ impl PackageManager {
         let optional_dependencies = manifest_dependencies(&manifest, "optionalDependencies")?;
 
         if self.install_from_lock(&dependencies, &optional_dependencies)? {
-            let node_modules = self.root.join("node_modules");
-            self.profile.time(Stage::Link, || link_binaries(&node_modules))?;
-            self.profile
-                .count(Count::TreePositions, self.installed.len() as u64);
             self.report(ProgressEvent::Finished {
                 installed: self.installed.len(),
             });
             return Ok(());
         }
 
-        let node_modules = self.root.join("node_modules");
-        fs::create_dir_all(&node_modules)?;
-        for (name, requirement) in dependencies {
-            self.install_dependency(
-                &name,
-                &requirement,
-                &node_modules,
-                &format!("node_modules/{name}"),
-            )?;
-        }
-        for (name, requirement) in optional_dependencies {
-            if self.built_for_another_platform(&name, &requirement) {
-                continue;
-            }
-            if let Err(error) = self.install_dependency(
-                &name,
-                &requirement,
-                &node_modules,
-                &format!("node_modules/{name}"),
-            ) {
-                self.warn(&format!("skipping optional dependency {name}: {error}"));
-            }
-        }
-        validate_peer_dependencies(&self.installed)?;
-        self.profile.time(Stage::Link, || link_binaries(&node_modules))?;
-        self.profile
-            .count(Count::TreePositions, self.installed.len() as u64);
+        install::install(self, &dependencies, &optional_dependencies)?;
         self.write_lockfile()?;
         self.report(ProgressEvent::Finished {
             installed: self.installed.len(),
@@ -838,225 +856,6 @@ impl PackageManager {
         self.install()
     }
 
-    fn install_dependency(
-        &mut self,
-        name: &str,
-        requirement: &str,
-        parent_node_modules: &Path,
-        lock_path: &str,
-    ) -> Result<(), PackageError> {
-        if self.installed.len() >= MAXIMUM_PACKAGES {
-            return Err(PackageError("package graph capacity exceeded".into()));
-        }
-        validate_package_name(name)?;
-        if let Some(workspace) = self.workspaces.get(name).cloned() {
-            if workspace_requirement_matches(&workspace.version, requirement) {
-                return self.install_workspace(workspace, parent_node_modules, lock_path);
-            }
-            if requirement.starts_with("workspace:") {
-                return Err(PackageError(format!(
-                    "workspace {name}@{} does not satisfy {requirement}",
-                    workspace.version
-                )));
-            }
-        } else if requirement.starts_with("workspace:") {
-            return Err(PackageError(format!(
-                "workspace package {name} was not found"
-            )));
-        }
-        let package = self.resolve(name, requirement)?;
-        if !package.supports_host() {
-            return Err(PackageError(format!(
-                "{}@{} is not built for {HOST_OS}-{HOST_CPU}",
-                package.name, package.version
-            )));
-        }
-        validate_sako_engine(
-            &format!("{}@{}", package.name, package.version),
-            &package.engines,
-        )?;
-        let identity = format!("{}@{}", package.name, package.version);
-        if !self.active.insert(identity.clone()) {
-            return Ok(());
-        }
-
-        let destination = package_install_path(parent_node_modules, name)?;
-        let outcome = self.unpack_dependency(&package, &destination, lock_path);
-        // Whatever happened, this position is finished with the identity. It
-        // used to stay in `active` on the way out through `?`, and since a
-        // failed optional dependency is only warned about, the next position
-        // that needed the same package took the "already active" path and was
-        // left with no directory at all.
-        self.active.remove(&identity);
-        outcome?;
-
-        let child_node_modules = destination.join("node_modules");
-        for (dependency, child_requirement) in package.dependencies.clone() {
-            let child_lock_path = format!("{lock_path}/node_modules/{dependency}");
-            self.install_dependency(
-                &dependency,
-                &child_requirement,
-                &child_node_modules,
-                &child_lock_path,
-            )?;
-        }
-        for (dependency, child_requirement) in package.optional_dependencies.clone() {
-            if self.built_for_another_platform(&dependency, &child_requirement) {
-                continue;
-            }
-            let child_lock_path = format!("{lock_path}/node_modules/{dependency}");
-            if let Err(error) = self.install_dependency(
-                &dependency,
-                &child_requirement,
-                &child_node_modules,
-                &child_lock_path,
-            ) {
-                self.warn(&format!(
-                    "skipping optional dependency {dependency}: {error}"
-                ));
-            }
-        }
-        if !self.ignore_scripts {
-            // A postinstall routinely calls a tool the package itself depends
-            // on, so this package's own node_modules/.bin has to exist before
-            // the script runs. Linking used to happen once, at the project
-            // root, after every script had already been and gone.
-            self.profile
-                .time(Stage::Link, || link_binaries(&child_node_modules))?;
-            let scripts = self
-                .installed
-                .get(lock_path)
-                .map(|installed| installed.scripts.clone())
-                .unwrap_or_default();
-            self.profile.time(Stage::Lifecycle, || {
-                run_lifecycle_scripts(&destination, &scripts, &self.root)
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Fetches, unpacks, and records one package.
-    ///
-    /// Split out so the caller can release the in-progress marker on the way
-    /// out whether this succeeded or not, and so a failure leaves nothing
-    /// half-written: an optional dependency that fails is only warned about,
-    /// and the debris it left behind used to stay in node_modules looking like
-    /// a working install.
-    fn unpack_dependency(
-        &mut self,
-        package: &PackageVersion,
-        destination: &Path,
-        lock_path: &str,
-    ) -> Result<(), PackageError> {
-        let checksum = package.dist.checksum().map_err(|error| {
-            PackageError(format!("{}@{}: {error}", package.name, package.version))
-        })?;
-        let (archive, downloaded) = self.fetch_archive(&package.dist.tarball, &checksum)?;
-        self.profile.bump(Count::Extractions);
-        let extracted = {
-            let _occupancy = self.profile.occupy(Pool::Extract);
-            self.profile
-                .time(Stage::Extract, || extract_archive(&archive, destination))
-        };
-        if let Err(error) = extracted {
-            let _ = fs::remove_dir_all(destination);
-            return Err(error);
-        }
-        self.report(ProgressEvent::Installed {
-            name: &package.name,
-            version: &package.version,
-            downloaded,
-        });
-
-        self.installed.insert(
-            lock_path.into(),
-            LockedPackage {
-                name: package.name.clone(),
-                version: package.version.clone(),
-                resolved: package.dist.tarball.clone(),
-                integrity: checksum.to_integrity(),
-                dependencies: package.dependencies.clone(),
-                optional_dependencies: package.optional_dependencies.clone(),
-                peer_dependencies: package.peer_dependencies.clone(),
-                optional_peers: package
-                    .peer_dependencies_meta
-                    .iter()
-                    .filter(|(_, metadata)| metadata.optional)
-                    .map(|(name, _)| name.clone())
-                    .collect(),
-                scripts: installed_scripts(package, destination),
-                engines: package.engines.clone(),
-            },
-        );
-        Ok(())
-    }
-
-    fn install_workspace(
-        &mut self,
-        workspace: WorkspacePackage,
-        parent_node_modules: &Path,
-        lock_path: &str,
-    ) -> Result<(), PackageError> {
-        if self.installed.len() >= MAXIMUM_PACKAGES {
-            return Err(PackageError("package graph capacity exceeded".into()));
-        }
-        let identity = format!("{}@{}", workspace.name, workspace.version);
-        if !self.active.insert(identity.clone()) {
-            return Ok(());
-        }
-        let destination = package_install_path(parent_node_modules, &workspace.name)?;
-        copy_workspace(&workspace.path, &destination)?;
-        self.report(ProgressEvent::Installed {
-            name: &workspace.name,
-            version: &workspace.version,
-            downloaded: false,
-        });
-        self.installed.insert(
-            lock_path.into(),
-            LockedPackage {
-                name: workspace.name.clone(),
-                version: workspace.version.clone(),
-                resolved: format!("workspace:{}", workspace.relative_path),
-                integrity: "workspace".into(),
-                dependencies: workspace.dependencies.clone(),
-                optional_dependencies: workspace.optional_dependencies.clone(),
-                peer_dependencies: workspace.peer_dependencies.clone(),
-                optional_peers: workspace.optional_peers.clone(),
-                scripts: workspace.scripts.clone(),
-                engines: workspace.engines.clone(),
-            },
-        );
-        let child_node_modules = destination.join("node_modules");
-        for (dependency, requirement) in workspace.dependencies.clone() {
-            self.install_dependency(
-                &dependency,
-                &requirement,
-                &child_node_modules,
-                &format!("{lock_path}/node_modules/{dependency}"),
-            )?;
-        }
-        for (dependency, requirement) in workspace.optional_dependencies.clone() {
-            if self.built_for_another_platform(&dependency, &requirement) {
-                continue;
-            }
-            if let Err(error) = self.install_dependency(
-                &dependency,
-                &requirement,
-                &child_node_modules,
-                &format!("{lock_path}/node_modules/{dependency}"),
-            ) {
-                self.warn(&format!(
-                    "skipping optional dependency {dependency}: {error}"
-                ));
-            }
-        }
-        if !self.ignore_scripts {
-            run_lifecycle_scripts(&destination, &workspace.scripts, &self.root)?;
-        }
-        self.active.remove(&identity);
-        Ok(())
-    }
-
     fn install_from_lock(
         &mut self,
         root_dependencies: &BTreeMap<String, String>,
@@ -1084,34 +883,17 @@ impl PackageManager {
             return Ok(false);
         }
 
-        self.report(ProgressEvent::Planned {
-            total: lockfile.packages.len(),
-        });
-        // Filled by the walk below rather than copied wholesale, so it ends up
+        // Filled by the plan rather than copied wholesale, so it ends up
         // describing what is on disk. Copying meant a package the manifest no
         // longer asks for -- one just removed -- stayed in the lockfile and in
         // the count reported at the end, describing a tree that was not there.
         self.installed.clear();
-        self.active.clear();
-        let node_modules = self.root.join("node_modules");
-        fs::create_dir_all(&node_modules)?;
-        for name in root_dependencies.keys() {
-            self.install_locked_dependency(
-                &lockfile,
-                &format!("node_modules/{name}"),
-                &node_modules,
-            )?;
-        }
-        for name in root_optional_dependencies.keys() {
-            let lock_path = format!("node_modules/{name}");
-            if lockfile.packages.contains_key(&lock_path)
-                && let Err(error) =
-                    self.install_locked_dependency(&lockfile, &lock_path, &node_modules)
-            {
-                self.warn(&format!("skipping optional dependency {name}: {error}"));
-            }
-        }
-        validate_peer_dependencies(&self.installed)?;
+        install::replay(
+            self,
+            &lockfile,
+            root_dependencies,
+            root_optional_dependencies,
+        )?;
         // Keys, because LockedPackage carries no equality and the question is
         // only which packages the tree actually holds. Both maps are ordered,
         // so this compares the sets.
@@ -1121,260 +903,20 @@ impl PackageManager {
         Ok(true)
     }
 
-    fn install_locked_dependency(
-        &mut self,
-        lockfile: &Lockfile,
-        lock_path: &str,
-        parent_node_modules: &Path,
-    ) -> Result<(), PackageError> {
-        let package = lockfile.packages.get(lock_path).cloned().ok_or_else(|| {
-            PackageError(format!("lockfile is missing dependency entry {lock_path}"))
-        })?;
-        validate_sako_engine(
-            &format!("{}@{}", package.name, package.version),
-            &package.engines,
-        )?;
-        // Recorded before the cycle guard below, so a position the guard skips
-        // still keeps its lockfile entry: dropping it would make the next
-        // install report a missing transitive dependency.
-        self.installed.insert(lock_path.into(), package.clone());
-        let identity = format!("{}@{}", package.name, package.version);
-        if !self.active.insert(identity.clone()) {
-            return Ok(());
-        }
-
-        let destination = package_install_path(parent_node_modules, &package.name)?;
-        if package.resolved.starts_with("workspace:") {
-            let workspace = self.workspaces.get(&package.name).ok_or_else(|| {
-                PackageError(format!("locked workspace {} was not found", package.name))
-            })?;
-            if workspace.version != package.version {
-                return Err(PackageError(format!(
-                    "locked workspace {}@{} does not match local version {}",
-                    package.name, package.version, workspace.version
-                )));
-            }
-            copy_workspace(&workspace.path, &destination)?;
-            self.report(ProgressEvent::Installed {
-                name: &package.name,
-                version: &package.version,
-                downloaded: false,
-            });
-        } else {
-            let checksum = Checksum::parse(&package.integrity).map_err(|error| {
-                PackageError(format!("{}@{}: {error}", package.name, package.version))
-            })?;
-            let (archive, downloaded) = self.fetch_archive(&package.resolved, &checksum)?;
-            extract_archive(&archive, &destination)?;
-            self.report(ProgressEvent::Installed {
-                name: &package.name,
-                version: &package.version,
-                downloaded,
-            });
-        }
-        let child_node_modules = destination.join("node_modules");
-        for (dependency, requirement) in &package.dependencies {
-            let child_path = format!("{lock_path}/node_modules/{dependency}");
-            if lockfile.packages.contains_key(&child_path) {
-                self.install_locked_dependency(lockfile, &child_path, &child_node_modules)?;
-            } else if !lock_has_ancestor_dependency(lockfile, lock_path, dependency, requirement) {
-                return Err(PackageError(format!(
-                    "lockfile is missing transitive dependency {dependency} for {lock_path}"
-                )));
-            }
-        }
-        for dependency in package.optional_dependencies.keys() {
-            let child_path = format!("{lock_path}/node_modules/{dependency}");
-            if lockfile.packages.contains_key(&child_path)
-                && let Err(error) =
-                    self.install_locked_dependency(lockfile, &child_path, &child_node_modules)
-            {
-                self.warn(&format!(
-                    "skipping optional dependency {dependency}: {error}"
-                ));
-            }
-        }
-        if !self.ignore_scripts {
-            // The locked entry carries the scripts read off disk at
-            // resolution time, so a replay runs exactly what the first
-            // install did.
-            self.profile
-                .time(Stage::Link, || link_binaries(&child_node_modules))?;
-            self.profile.time(Stage::Lifecycle, || {
-                run_lifecycle_scripts(&destination, &package.scripts, &self.root)
-            })?;
-        }
-        self.active.remove(&identity);
-        Ok(())
-    }
-
-    /// Whether an optional dependency is one of the other platforms' builds.
+    /// Resolves one requirement, going to the registry only if no worker has
+    /// already brought the packument back.
     ///
-    /// Not a failure and not worth a warning: shipping one narrowly-targeted
-    /// optional dependency per platform is exactly how esbuild, rollup, and
-    /// rolldown deliver native binaries, and every one of them but ours is
-    /// meant to be passed over in silence.
-    fn built_for_another_platform(&mut self, name: &str, requirement: &str) -> bool {
-        let skipped = self
-            .resolve(name, requirement)
-            .is_ok_and(|package| !package.supports_host());
-        if skipped {
-            self.profile.bump(Count::PlatformSkipped);
-        }
-        skipped
-    }
-
-    fn resolve(&mut self, name: &str, requirement: &str) -> Result<PackageVersion, PackageError> {
+    /// Kept for the paths that resolve a single package outside the graph
+    /// walk -- `sako add react@latest` pinning a range, and the platform check
+    /// an optional dependency needs. The graph itself no longer comes through
+    /// here; it goes through the resolver's pool.
+    fn resolve(&self, name: &str, requirement: &str) -> Result<Arc<PackageVersion>, PackageError> {
         self.profile.bump(Count::DependencyEdges);
-        let mut timing = profile::PackageTiming::default();
-        if self.metadata.contains_key(name) {
-            self.profile.bump(Count::MetadataCacheHits);
-            timing.cache_hit = true;
-        } else {
-            self.profile.bump(Count::MetadataCacheMisses);
-            self.profile.bump(Count::UniqueNames);
-            if self.metadata.len() >= MAXIMUM_METADATA_ENTRIES {
-                return Err(PackageError(
-                    "registry metadata cache capacity exceeded".into(),
-                ));
-            }
-            self.report(ProgressEvent::Resolving { name });
-            let encoded = name.replace('/', "%2f");
-            let registry = self.registry_for(name);
-            let url = format!("{}/{encoded}", registry.trim_end_matches('/'));
-            let started = Instant::now();
-            let occupancy = self.profile.occupy(Pool::Metadata);
-            self.profile.bump(Count::RegistryRequests);
-            let response = self
-                .request(&url)
-                .set("Accept", "application/vnd.npm.install-v1+json")
-                .call()
-                .map_err(|error| {
-                    PackageError(format!("registry request failed for {name}: {error}"))
-                })?;
-            let mut bytes = Vec::new();
-            response
-                .into_reader()
-                .take(MAXIMUM_METADATA_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            drop(occupancy);
-            timing.metadata = started.elapsed();
-            self.profile.add(Stage::MetadataNetwork, timing.metadata);
-            if bytes.len() as u64 > MAXIMUM_METADATA_BYTES {
-                return Err(PackageError(format!(
-                    "registry metadata for {name} exceeds byte limit"
-                )));
-            }
-            let metadata = self.profile.time(Stage::MetadataParse, || {
-                serde_json::from_slice::<RawMetadata>(&bytes)
-                    .map(Metadata::from)
-                    .map_err(|error| {
-                        PackageError(format!("invalid registry metadata for {name}: {error}"))
-                    })
-            })?;
-            self.metadata.insert(name.into(), metadata);
-        }
-        let started = Instant::now();
-        let selected = select_version(self.metadata.get(name).unwrap(), requirement);
-        timing.semver = started.elapsed();
-        self.profile.add(Stage::Semver, timing.semver);
-        if let Ok(package) = &selected {
-            timing.version = package.version.clone();
-        }
-        self.profile.record_package(name, timing);
-        selected
-    }
-
-    /// Returns the tarball bytes and whether they came off the network, which
-    /// is the difference between a warm and a cold store as far as anything
-    /// watching the install is concerned.
-    fn fetch_archive(
-        &self,
-        tarball: &str,
-        expected: &Checksum,
-    ) -> Result<(Vec<u8>, bool), PackageError> {
-        let key = expected.cache_key();
-        let cache_path = self.cache_root.join(&key[..2]).join(format!("{key}.tgz"));
-        if cache_path.is_file() {
-            let bytes = fs::read(&cache_path)?;
-            // A cache entry that no longer matches its own name is corrupt
-            // rather than hostile, so it is replaced from the network instead
-            // of failing the install.
-            if self
-                .profile
-                .time(Stage::Integrity, || expected.verify(&bytes))
-                .is_ok()
-            {
-                self.profile.bump(Count::StoreHits);
-                return Ok((bytes, false));
-            }
-            let _ = fs::remove_file(&cache_path);
-        }
-
-        let started = Instant::now();
-        let occupancy = self.profile.occupy(Pool::Download);
-        self.profile.bump(Count::TarballRequests);
-        let response = self
-            .request(tarball)
-            .call()
-            .map_err(|error| PackageError(format!("tarball download failed: {error}")))?;
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .take(MAXIMUM_TARBALL_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        drop(occupancy);
-        self.profile.add(Stage::Download, started.elapsed());
-        self.profile.count(Count::BytesDownloaded, bytes.len() as u64);
-        if bytes.len() as u64 > MAXIMUM_TARBALL_BYTES {
-            return Err(PackageError("package tarball exceeds byte limit".into()));
-        }
+        let metadata = self
+            .metadata
+            .get(&self.registry, name, MAXIMUM_METADATA_ENTRIES)?;
         self.profile
-            .time(Stage::Integrity, || expected.verify(&bytes))?;
-        if let Some(parent) = cache_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = cache_path.with_extension("tmp");
-        fs::write(&temporary, &bytes)?;
-        fs::rename(temporary, cache_path)?;
-        prune_store(&self.cache_root)?;
-        Ok((bytes, true))
-    }
-
-    fn registry_for(&self, name: &str) -> &str {
-        if let Some(scope) = name
-            .strip_prefix('@')
-            .and_then(|name| name.split('/').next())
-        {
-            let scope = format!("@{scope}");
-            if let Some(registry) = self.scoped_registries.get(&scope) {
-                return registry;
-            }
-        }
-        &self.registry
-    }
-
-    fn request(&self, url: &str) -> ureq::Request {
-        let mut request = self.agent.get(url);
-        let key = registry_auth_key(url);
-        let bearer = self
-            .auth_tokens
-            .iter()
-            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len());
-        let basic = self
-            .basic_auth
-            .iter()
-            .filter(|(prefix, _)| key.starts_with(prefix.as_str()))
-            .max_by_key(|(prefix, _)| prefix.len());
-        if let Some((_, token)) = bearer.filter(|(prefix, _)| {
-            basic.is_none_or(|(basic_prefix, _)| prefix.len() >= basic_prefix.len())
-        }) {
-            request = request.set("Authorization", &format!("Bearer {token}"));
-        } else if let Some((_, credentials)) = basic {
-            request = request.set("Authorization", &format!("Basic {credentials}"));
-        }
-        request
+            .time(Stage::Semver, || select_version(&metadata, requirement))
     }
 
     fn read_manifest(&self) -> Result<serde_json::Value, PackageError> {
@@ -1635,10 +1177,25 @@ struct RawMetadata {
     versions: BTreeMap<String, serde_json::Value>,
 }
 
+/// A packument, normalized once and then shared.
+///
+/// The shape here is what makes a packument cheap to query rather than cheap
+/// to build. Twenty dependency edges asking `^6` of the same package used to
+/// re-parse every one of its several hundred version strings, twenty times
+/// over, and clone the whole selected entry at the end of it. Parsing and
+/// ordering the versions once at construction turns each of those queries into
+/// a scan that stops at the first match, and holding the entries behind an
+/// `Arc` turns the clone into a refcount bump.
 #[derive(Clone, Debug, Default)]
 struct Metadata {
     dist_tags: BTreeMap<String, String>,
-    versions: BTreeMap<String, PackageVersion>,
+    /// Every readable entry, by its published version string. Needed as
+    /// written because a dist-tag names an exact string, including one that is
+    /// not valid semver.
+    versions: BTreeMap<String, Arc<PackageVersion>>,
+    /// The semver-parseable entries, highest first. Selection walks this and
+    /// takes the first match, which is the highest match.
+    ordered: Vec<(Version, Arc<PackageVersion>)>,
     /// Versions this resolver could not read, and why. Kept rather than
     /// discarded so a requirement that matches only unusable entries can say
     /// what was wrong with them instead of claiming the version does not
@@ -1649,10 +1206,15 @@ struct Metadata {
 impl From<RawMetadata> for Metadata {
     fn from(raw: RawMetadata) -> Self {
         let mut versions = BTreeMap::new();
+        let mut ordered = Vec::new();
         let mut unusable = BTreeMap::new();
         for (version, entry) in raw.versions {
             match serde_json::from_value::<PackageVersion>(entry) {
                 Ok(package) => {
+                    let package = Arc::new(package);
+                    if let Ok(parsed) = Version::parse(&version) {
+                        ordered.push((parsed, Arc::clone(&package)));
+                    }
                     versions.insert(version, package);
                 }
                 Err(error) => {
@@ -1660,9 +1222,13 @@ impl From<RawMetadata> for Metadata {
                 }
             }
         }
+        // Descending, so the first match a requirement finds is the highest
+        // one and the scan can stop there.
+        ordered.sort_by(|(left, _), (right, _)| right.cmp(left));
         Self {
             dist_tags: raw.dist_tags,
             versions,
+            ordered,
             unusable,
         }
     }
@@ -2075,10 +1641,13 @@ fn lock_has_ancestor_dependency(
         })
 }
 
-fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersion, PackageError> {
+fn select_version(
+    metadata: &Metadata,
+    requirement: &str,
+) -> Result<Arc<PackageVersion>, PackageError> {
     if let Some(version) = metadata.dist_tags.get(requirement) {
         if let Some(package) = metadata.versions.get(version) {
-            return Ok(package.clone());
+            return Ok(Arc::clone(package));
         }
         // "missing" is the wrong word when the version is right there in the
         // packument and was only dropped because this resolver could not read
@@ -2099,20 +1668,14 @@ fn select_version(metadata: &Metadata, requirement: &str) -> Result<PackageVersi
     };
     let parsed = npm_version_requirements(requirement)?;
     metadata
-        .versions
+        .ordered
         .iter()
-        .filter_map(|(version, package)| {
-            Version::parse(version)
-                .ok()
-                .map(|version| (version, package))
-        })
-        .filter(|(version, _)| {
+        .find(|(version, _)| {
             parsed
                 .iter()
                 .any(|requirement| requirement.matches(version))
         })
-        .max_by(|(left, _), (right, _)| left.cmp(right))
-        .map(|(_, package)| package.clone())
+        .map(|(_, package)| Arc::clone(package))
         .ok_or_else(|| unsatisfied_requirement(metadata, requirement))
 }
 
@@ -2916,21 +2479,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut manager = PackageManager {
-            root: root.clone(),
-            registry: "https://invalid.example".into(),
-            scoped_registries: BTreeMap::new(),
-            auth_tokens: BTreeMap::new(),
-            basic_auth: BTreeMap::new(),
-            agent: ureq::AgentBuilder::new().build(),
-            cache_root,
-            metadata: HashMap::new(),
-            workspaces: BTreeMap::new(),
-            ignore_scripts: true,
-            installed: BTreeMap::new(),
-            active: HashSet::new(),
-            reporter: Reporter::default(),
-        };
+        let mut manager = PackageManager::for_test(root.clone(), cache_root);
         manager.install().unwrap();
         assert_eq!(
             fs::read_to_string(root.join("node_modules/fixture/index.js")).unwrap(),
