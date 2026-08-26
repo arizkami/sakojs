@@ -128,10 +128,22 @@ provides them, which is npm's behaviour from npm 7 onward and the difference
 between `sako install react-dom` working and failing. Whether a peer is already
 provided is decided the way Node itself resolves a name: by looking at each
 enclosing `node_modules` directory in turn, nearest first, and taking the first
-one that holds the name. So a project that depends on `react` and `react-dom`
-gets one copy of React, shared; a project that pins `react@17` beside a
-`react-dom@18` that cannot use it gets `react@18` installed privately under
-`react-dom`, where only `react-dom` will find it. A peer marked optional in
+one that holds the name at all -- match or not, because a nearer copy shadows a
+further one.
+
+A peer that nothing provides is placed beside the package that needs it, in the
+same directory, so every sibling that wants it shares one copy. That placement
+is chosen while the directory's contents are being worked out rather than as
+each package is planned, because a package's peer is often a sibling that sorts
+after it and would otherwise look absent. Only when the name is already taken
+there, by a version that does not satisfy, does the peer go inside the package
+that needs it, where nothing else will find it.
+
+So a project depending on `react` and `react-dom` gets one React, shared; a
+project depending on `react-dom` and `zustand` and naming React nowhere still
+gets one React, shared by both; and a project pinning `react@17` beside a
+`react-dom@18` that cannot use it keeps `react@17` at the top and gives
+`react-dom` a private `react@18`. A peer marked optional in
 `peerDependenciesMeta` is not installed -- npm does not choose those for you,
 and nearly every React package marks `@types/react` optional. `--legacy-peer-deps`
 turns the installation off and returns to validating peers without satisfying
