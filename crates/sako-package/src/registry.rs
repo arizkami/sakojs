@@ -149,7 +149,7 @@ impl Registry {
     /// at all. It is the registry's `max-age` that decides, not a number
     /// invented here: caching a packument for longer than npm says to is how
     /// an installer starts resolving to versions that were replaced.
-    pub fn packument(&self, name: &str) -> Result<Metadata, PackageError> {
+    pub fn packument(&self, name: &str) -> Result<(Metadata, Origin), PackageError> {
         let registry = self.registry_for(name);
         let cached = self.read_cached_metadata(registry, name);
 
@@ -160,7 +160,7 @@ impl Registry {
             let started = Instant::now();
             let metadata = self.parse_metadata(name, &entry.body)?;
             self.profile.add(Stage::MetadataDisk, started.elapsed());
-            return Ok(metadata);
+            return Ok((metadata, Origin::Disk));
         }
 
         let encoded = name.replace('/', "%2f");
@@ -213,7 +213,7 @@ impl Registry {
             let parse_started = Instant::now();
             let metadata = self.parse_metadata(name, &entry.body)?;
             self.profile.add(Stage::MetadataDisk, parse_started.elapsed());
-            return Ok(metadata);
+            return Ok((metadata, Origin::Revalidated));
         }
 
         let etag = response.header("ETag").map(str::to_owned);
@@ -245,7 +245,7 @@ impl Registry {
                 max_age: max_age.unwrap_or(0),
             },
         );
-        Ok(metadata)
+        Ok((metadata, Origin::Network))
     }
 
     fn parse_metadata(&self, name: &str, bytes: &[u8]) -> Result<Metadata, PackageError> {
@@ -414,6 +414,35 @@ impl Registry {
     }
 }
 
+/// Where a packument came from, for the per-package report `--verbose` prints.
+///
+/// Worth distinguishing all four: "cached" covers three very different costs,
+/// and an install that looks slow is usually one where they are not the ones
+/// expected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Another edge in this same install already had it, or was fetching it.
+    Memory,
+    /// On disk and still inside the registry's freshness window: no request.
+    Disk,
+    /// On disk but past its freshness window; the registry confirmed it with a
+    /// 304 rather than sending it again.
+    Revalidated,
+    /// Fetched in full.
+    Network,
+}
+
+impl Origin {
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::Memory => "hit",
+            Origin::Disk => "disk",
+            Origin::Revalidated => "304",
+            Origin::Network => "miss",
+        }
+    }
+}
+
 /// What the disk cache remembers about one packument besides its bytes.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CacheHead {
@@ -535,7 +564,7 @@ impl MetadataCache {
         registry: &Registry,
         name: &str,
         capacity: usize,
-    ) -> Result<Arc<Metadata>, PackageError> {
+    ) -> Result<(Arc<Metadata>, Origin), PackageError> {
         let key = (registry.registry_for(name).to_owned(), name.to_owned());
         let mut entries = self
             .entries
@@ -545,7 +574,7 @@ impl MetadataCache {
             match entries.get(&key) {
                 Some(SlotState(Slot::Ready(metadata))) => {
                     registry.profile.bump(Count::MetadataCacheHits);
-                    return Ok(Arc::clone(metadata));
+                    return Ok((Arc::clone(metadata), Origin::Memory));
                 }
                 Some(SlotState(Slot::Failed(reason))) => {
                     registry.profile.bump(Count::MetadataCacheHits);
@@ -582,10 +611,10 @@ impl MetadataCache {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let outcome = match fetched {
-            Ok(metadata) => {
+            Ok((metadata, origin)) => {
                 let metadata = Arc::new(metadata);
                 entries.insert(key, SlotState(Slot::Ready(Arc::clone(&metadata))));
-                Ok(metadata)
+                Ok((metadata, origin))
             }
             Err(error) => {
                 let reason: Arc<str> = Arc::from(error.to_string());
@@ -597,5 +626,186 @@ impl MetadataCache {
         // wake only the ones that wanted this key.
         self.ready.notify_all();
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A registry that serves one packument and counts what it was asked for.
+    ///
+    /// Real HTTP rather than a stubbed fetch, because the thing under test is
+    /// precisely how many requests reach a socket.
+    fn serve(packument: &'static str, requests: Arc<AtomicUsize>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("http://{}", listener.local_addr().expect("addr"));
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                if !read_request(&mut stream) {
+                    continue;
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                // Slow enough that every other worker is certainly parked on
+                // the slot rather than merely having lost a fair race.
+                std::thread::sleep(Duration::from_millis(120));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{packument}",
+                    packument.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (address, handle)
+    }
+
+    /// The blank line that ends a request's headers, spelled numerically so
+    /// nothing that rewrites line endings in this file can change what the
+    /// test is looking for.
+    const HEADER_END: [u8; 4] = [13, 10, 13, 10];
+
+    /// Reads one request's headers, reporting whether there was a request at
+    /// all. A client that opens a connection and does not use it has not asked
+    /// for anything, and counting it would measure connection pooling rather
+    /// than caching.
+    fn read_request(stream: &mut std::net::TcpStream) -> bool {
+        use std::io::Read as _;
+        let mut buffer = [0_u8; 2048];
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match stream.read(&mut buffer[filled..]) {
+                Ok(0) => return false,
+                Ok(read) => {
+                    filled += read;
+                    if buffer[..filled].windows(4).any(|window| window == HEADER_END) {
+                        return true;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        filled > 0
+    }
+
+    fn registry_at(address: String, root: PathBuf) -> Registry {
+        Registry::new(
+            ureq::AgentBuilder::new().build(),
+            address,
+            BTreeMap::new(),
+            Credentials::default(),
+            root.join("sha512"),
+            root.join("metadata"),
+            Arc::new(Profile::new()),
+        )
+    }
+
+    fn temporary_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sako-registry-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    const PACKUMENT: &str = r#"{"dist-tags":{"latest":"1.2.3"},"versions":{"1.2.3":{"name":"thing","version":"1.2.3","dist":{"tarball":"http://example.invalid/thing.tgz","shasum":"0000000000000000000000000000000000000000"}}}}"#;
+
+    #[test]
+    fn many_callers_asking_at_once_make_one_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (address, _server) = serve(PACKUMENT, Arc::clone(&requests));
+        let root = temporary_root("join");
+        let registry = registry_at(address, root.clone());
+        let cache = MetadataCache::new();
+
+        // Twenty workers want the same package at the same moment, which is
+        // what a graph with twenty edges on one popular package looks like.
+        std::thread::scope(|scope| {
+            for _ in 0..20 {
+                scope.spawn(|| {
+                    let (metadata, _) = cache.get(&registry, "thing", 1_024).expect("resolve");
+                    assert!(metadata.versions.contains_key("1.2.3"));
+                });
+            }
+        });
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failure_is_remembered_rather_than_retried_per_edge() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        // A listener that accepts and hangs up: every attempt is a transport
+        // failure, so this also exercises the retry ceiling.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("http://{}", listener.local_addr().expect("addr"));
+        let counter = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let root = temporary_root("failure");
+        let registry = registry_at(address, root.clone());
+        let cache = MetadataCache::new();
+
+        for _ in 0..5 {
+            assert!(cache.get(&registry, "thing", 1_024).is_err());
+        }
+        // Five edges, one package: one attempt sequence, not five. The retry
+        // ceiling bounds that sequence, so this stays small either way.
+        assert!(
+            requests.load(Ordering::SeqCst) <= MAXIMUM_ATTEMPTS as usize,
+            "a dead registry cost one attempt sequence per name, not per edge"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cached_packument_inside_its_freshness_window_needs_no_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = format!("http://{}", listener.local_addr().expect("addr"));
+        let counter = Arc::clone(&requests);
+        let packument = PACKUMENT;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                if !read_request(&mut stream) {
+                    continue;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: public, max-age=300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{packument}",
+                    packument.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let root = temporary_root("fresh");
+        let registry = registry_at(address, root.clone());
+
+        // A separate cache each time, so only the disk is carrying anything
+        // between the two -- which is the point.
+        let (_, first) = MetadataCache::new()
+            .get(&registry, "thing", 1_024)
+            .expect("first");
+        let (_, second) = MetadataCache::new()
+            .get(&registry, "thing", 1_024)
+            .expect("second");
+
+        assert_eq!(first, Origin::Network);
+        assert_eq!(second, Origin::Disk);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 }

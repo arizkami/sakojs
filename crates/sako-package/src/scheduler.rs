@@ -191,6 +191,63 @@ where
     }
 }
 
+/// A counting semaphore, for bounding a stage that runs *inside* another
+/// stage's workers rather than on a pool of its own.
+///
+/// Downloading and unpacking a package happen in the same worker on purpose:
+/// the worker already holds the archive, and handing it to a separate pool
+/// would mean every downloaded tarball waiting in memory for an unpacker.
+/// They still want different limits, though -- one is a connection count and
+/// the other is a core count -- so the inner one is a permit rather than a
+/// thread.
+#[derive(Debug)]
+pub struct Semaphore {
+    permits: Mutex<usize>,
+    released: Condvar,
+}
+
+impl Semaphore {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits.max(1)),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Waits for a permit, returning a guard that gives it back.
+    pub fn acquire(&self) -> Permit<'_> {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while *permits == 0 {
+            permits = self
+                .released
+                .wait(permits)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *permits -= 1;
+        Permit { semaphore: self }
+    }
+}
+
+/// Returns its permit however the holder leaves, including through an error.
+pub struct Permit<'a> {
+    semaphore: &'a Semaphore,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut permits = self
+            .semaphore
+            .permits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *permits += 1;
+        self.semaphore.released.notify_one();
+    }
+}
+
 /// How many threads to give a stage.
 ///
 /// The three kinds of stage want different numbers, and giving them all the
@@ -299,6 +356,24 @@ mod tests {
         });
         assert!(outcome.is_ok());
         assert_eq!(seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_semaphore_never_lets_more_than_its_permits_through() {
+        let semaphore = Semaphore::new(3);
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let cancel = Cancel::new();
+        let outcome: Result<(), ()> = run(12, 0..200, &cancel, |_, _| {
+            let _permit = semaphore.acquire();
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::yield_now();
+            live.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        });
+        assert!(outcome.is_ok());
+        assert!(peak.load(Ordering::SeqCst) <= 3);
     }
 
     #[test]

@@ -912,7 +912,7 @@ impl PackageManager {
     /// here; it goes through the resolver's pool.
     fn resolve(&self, name: &str, requirement: &str) -> Result<Arc<PackageVersion>, PackageError> {
         self.profile.bump(Count::DependencyEdges);
-        let metadata = self
+        let (metadata, _) = self
             .metadata
             .get(&self.registry, name, MAXIMUM_METADATA_ENTRIES)?;
         self.profile

@@ -210,6 +210,8 @@ pub const PACKAGE_OPTIONS: &[(&str, &str)] = &[
     ("--token=<token>", "Registry auth token"),
     ("--proxy=<url>", "HTTP proxy for registry requests"),
     ("--ignore-scripts", "Skip lifecycle scripts"),
+    ("--perf", "Print a per-stage timing breakdown"),
+    ("--verbose", "Add per-package resolver detail to --perf"),
 ];
 
 pub fn find(name: &str) -> Option<&'static Command> {

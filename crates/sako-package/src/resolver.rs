@@ -22,7 +22,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use crate::profile::PackageTiming;
 use crate::registry::{MetadataCache, Registry};
 use crate::scheduler::{self, Cancel};
 use crate::{
@@ -137,13 +139,24 @@ pub fn resolve_graph(
         if let Some(reporter) = reporter {
             reporter.report(ProgressEvent::ResolveStarted { name: &name });
         }
-        let resolved = metadata
-            .get(registry, &name, MAXIMUM_METADATA_ENTRIES)
-            .and_then(|metadata| {
-                registry
-                    .profile
-                    .time(Stage::Semver, || select_version(&metadata, &requirement))
-            });
+        let started = Instant::now();
+        let fetched = metadata.get(registry, &name, MAXIMUM_METADATA_ENTRIES);
+        let mut timing = PackageTiming {
+            metadata: started.elapsed(),
+            ..PackageTiming::default()
+        };
+        let resolved = fetched.and_then(|(metadata, origin)| {
+            timing.origin = origin.label();
+            let started = Instant::now();
+            let selected = select_version(&metadata, &requirement);
+            timing.semver = started.elapsed();
+            registry.profile.add(Stage::Semver, timing.semver);
+            selected
+        });
+        if let Ok(package) = &resolved {
+            timing.version = package.version.clone();
+        }
+        registry.profile.record_package(&name, timing);
         if let Some(reporter) = reporter {
             reporter.report(ProgressEvent::ResolveFinished { name: &name });
         }

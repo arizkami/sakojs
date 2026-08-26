@@ -27,7 +27,12 @@ pub const DIM: &str = "\x1b[2m";
 pub const RED: &str = "\x1b[31m";
 pub const GREEN: &str = "\x1b[32m";
 pub const YELLOW: &str = "\x1b[33m";
+// The palette is the eight SGR colours, whether or not the CLI currently says
+// anything in each of them. Keeping it whole is what makes it a palette rather
+// than a list of the colours in use this week.
+#[allow(dead_code)]
 pub const BLUE: &str = "\x1b[34m";
+#[allow(dead_code)]
 pub const MAGENTA: &str = "\x1b[35m";
 pub const CYAN: &str = "\x1b[36m";
 
@@ -83,10 +88,12 @@ impl Painter {
         self.paint(YELLOW, text)
     }
 
+    #[allow(dead_code)]
     pub fn blue(self, text: &str) -> String {
         self.paint(BLUE, text)
     }
 
+    #[allow(dead_code)]
     pub fn magenta(self, text: &str) -> String {
         self.paint(MAGENTA, text)
     }

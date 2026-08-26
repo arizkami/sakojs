@@ -181,8 +181,8 @@ impl Pool {
 pub struct PackageTiming {
     pub metadata: Duration,
     pub semver: Duration,
-    pub cache_hit: bool,
-    pub disk_hit: bool,
+    /// Where the packument came from, already worded for the report.
+    pub origin: &'static str,
     pub version: String,
 }
 
@@ -336,7 +336,7 @@ impl Profile {
                 out.push('\n');
                 group = section;
             }
-            out.push_str(&format!("  {label:<22}{:>10}\n", milliseconds(elapsed)));
+            out.push_str(&format!("  {label:<24}{:>10}\n", milliseconds(elapsed)));
         }
         if !out.is_empty() {
             out.push('\n');
@@ -348,15 +348,15 @@ impl Profile {
                 continue;
             }
             if count == Count::BytesDownloaded {
-                out.push_str(&format!("  {:<22}{:>10}\n", count.label(), bytes(value)));
+                out.push_str(&format!("  {:<24}{:>10}\n", count.label(), bytes(value)));
             } else {
-                out.push_str(&format!("  {:<22}{value:>10}\n", count.label()));
+                out.push_str(&format!("  {:<24}{value:>10}\n", count.label()));
             }
         }
         for pool in Pool::ALL {
             let peak = self.peak_of(pool);
             if peak != 0 {
-                out.push_str(&format!("  {:<22}{peak:>10}\n", pool.label()));
+                out.push_str(&format!("  {:<24}{peak:>10}\n", pool.label()));
             }
         }
         out
@@ -371,16 +371,7 @@ impl Profile {
         for (name, timing) in packages.iter() {
             out.push_str(&format!("{name}@{}\n", timing.version));
             out.push_str(&format!("  metadata      {:>10}\n", precise(timing.metadata)));
-            out.push_str(&format!(
-                "  cache         {:>10}\n",
-                if timing.cache_hit {
-                    "hit"
-                } else if timing.disk_hit {
-                    "disk"
-                } else {
-                    "miss"
-                }
-            ));
+            out.push_str(&format!("  cache         {:>10}\n", timing.origin));
             out.push_str(&format!("  semver        {:>10}\n", precise(timing.semver)));
         }
         out

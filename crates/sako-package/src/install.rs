@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::profile::{Count, Pool, Stage};
 use crate::resolver::{self, Graph};
-use crate::scheduler::{self, Cancel, Limits};
+use crate::scheduler::{self, Cancel, Limits, Semaphore};
 use crate::store::ContentStore;
 use crate::{
     Checksum, HOST_CPU, HOST_OS, LockedPackage, Lockfile, MAXIMUM_PACKAGES, PackageError,
@@ -688,7 +688,6 @@ fn required_only<'a>(
     dependencies
         .iter()
         .filter(move |(name, _)| !optional.contains_key(name.as_str()))
-        .map(|(name, requirement)| (name, requirement))
 }
 
 fn child_lock_path(prefix: &str, name: &str) -> String {
@@ -784,6 +783,11 @@ fn populate_store(
 
     let cancel = Cancel::new();
     let failures: Mutex<Vec<(usize, PackageError)>> = Mutex::new(Vec::new());
+    // Unpacking happens in the download worker, so the archive is never held
+    // waiting for a second pool to pick it up. This is what keeps the two
+    // stages independently bounded anyway: a connection limit for the
+    // download, a core limit for the gzip.
+    let unpackers = Semaphore::new(limits.extract);
     scheduler::run(limits.download, unique, &cancel, |index, _| {
         let node = &plan.nodes[index];
         let (Some(key), Some(tarball)) = (node.content_key(), node.tarball()) else {
@@ -809,6 +813,7 @@ fn populate_store(
                 cached: !downloaded,
             });
             manager.report(ProgressEvent::ExtractStarted { name: node.name() });
+            let _permit = unpackers.acquire();
             manager.profile.bump(Count::Extractions);
             let _occupancy = manager.profile.occupy(Pool::Extract);
             manager
@@ -1007,4 +1012,58 @@ fn run_scripts(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, requirement)| ((*name).to_owned(), (*requirement).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn an_optional_dependency_is_not_also_planned_as_a_required_one() {
+        // Exactly what npm's abbreviated packument says about jsonfile: the
+        // optional dependency is repeated inside `dependencies`.
+        let dependencies = map(&[("graceful-fs", "^4.1.6"), ("universalify", "^2.0.0")]);
+        let optional = map(&[("graceful-fs", "^4.1.6")]);
+        let required: Vec<&str> = required_only(&dependencies, &optional)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(required, ["universalify"]);
+    }
+
+    #[test]
+    fn a_package_with_no_optional_dependencies_keeps_all_of_them() {
+        let dependencies = map(&[("a", "^1"), ("b", "^2")]);
+        let required: Vec<&str> = required_only(&dependencies, &BTreeMap::new())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(required, ["a", "b"]);
+    }
+
+    #[test]
+    fn depth_counts_nesting_and_not_scope_separators() {
+        assert_eq!(depth_of("node_modules/vite"), 0);
+        // A scope is part of one package's name, not another level of tree.
+        assert_eq!(depth_of("node_modules/@changesets/cli"), 0);
+        assert_eq!(depth_of("node_modules/@changesets/cli/node_modules/fs-extra"), 1);
+        assert_eq!(
+            depth_of("node_modules/a/node_modules/b/node_modules/c"),
+            2
+        );
+    }
+
+    #[test]
+    fn a_child_lock_path_nests_under_its_parent() {
+        assert_eq!(child_lock_path("node_modules", "vite"), "node_modules/vite");
+        assert_eq!(
+            child_lock_path("node_modules/vite", "rollup"),
+            "node_modules/vite/node_modules/rollup"
+        );
+    }
 }

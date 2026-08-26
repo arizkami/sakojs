@@ -187,3 +187,84 @@ filesystem activity, and V8 initialization before micro-optimizing first-party
 Rust code. Raw ETL, CPU/module, CPU/disk, and disk-I/O reports remain in the
 ignored local `benchmark-results` directory; the checked-in harness reproduces
 both capture and analysis.
+
+## 2026-08-26 parallel dependency resolution
+
+`sako install` was rebuilt around a bounded graph scheduler. The measurements
+below come from `--perf` on one Windows 11 host with 12 logical processors,
+against the public npm registry. "Before" is commit `62cd576`, the recursive
+installer with the same instrumentation compiled in.
+
+### Where the time went
+
+The reference graph is `vite@^5.4.0` + `@changesets/cli@^2.27.0` +
+`typescript@^5.5.0`: 1,815 tree positions built from 154 distinct package names
+and 111 distinct archives. Stage totals are wall time summed across workers, so
+they measure work done rather than time elapsed.
+
+| Stage | Before | After | Note |
+| --- | ---: | ---: | --- |
+| metadata network | 58,749 ms | 32,902 ms | 154 requests; serial before, 16-way after |
+| metadata parse | 154 ms | 173 ms | once per name either way |
+| semver | 37 ms | 2 ms | versions parsed once per packument, not once per edge |
+| tarball network | 17,909 ms | 19,421 ms | 111 archives; serial before, 12-way after |
+| extraction | 29,266 ms | 7,915 ms | 1,879 unpacks before, 111 after |
+| materialize | -- | 86,525 ms | new stage: fill 1,815 positions from the store |
+| link | 1,553 ms | 5,931 ms | now covers every `.bin` directory, in parallel |
+| **elapsed** | **109.8 s** | **15.8 s** | |
+
+The dominant cost before was not any one stage but repetition: 1,840 of 1,994
+resolve requests were for a packument already in hand, and 1,768 of 1,879
+extractions decompressed an archive that had already been decompressed.
+
+### Install times
+
+Cold means an empty content store and no cached metadata; warm means both
+present. Best of three, `SAKO_PROGRESS=0`.
+
+| Graph | Positions | Scenario | Before | After |
+| --- | ---: | --- | ---: | ---: |
+| `is-odd` | 2 | cold resolve | 979 ms | 134 ms |
+| | | warm resolve | 74 ms | 22 ms |
+| 5 flat deps | 13 | cold resolve | 847 ms | 560 ms |
+| | | warm resolve | 778 ms | 87 ms |
+| | | warm install | 243 ms | 85 ms |
+| `esbuild` + `rollup` | 6 | cold resolve | 32,321 ms | 10,143 ms |
+| | | warm resolve | 14,132 ms | 661 ms |
+| `@changesets/cli` | 1,803 | cold resolve | 66,610 ms | 13,447 ms |
+| | | warm install | 32,037 ms | 8,675 ms |
+| vite + changesets + ts | 1,815 | cold resolve | 109,800 ms | 15,800 ms |
+| | | warm install | 33,320 ms | 9,041 ms |
+| | | warm resolve | 58,388 ms | 9,390 ms |
+
+Peak working set on the 1,815-position graph rose from 71.9 MiB to 93.3 MiB.
+The increase is the bound rather than the graph: sixteen packuments in flight,
+twelve tarball buffers, and the parsed packuments held for the run.
+
+### Concurrency
+
+Defaults, all overridable, measured on this host:
+
+| Pool | Default | Why |
+| --- | ---: | --- |
+| `SAKO_METADATA_CONCURRENCY` | 16 | connections a registry should serve at once |
+| `SAKO_DOWNLOAD_CONCURRENCY` | 12 | as above, for archives |
+| `SAKO_EXTRACT_CONCURRENCY` | cores/2 | gzip is the one CPU-bound stage |
+| `SAKO_MATERIALIZE_CONCURRENCY` | cores | measured: 4 -> 12.0 s, 6 -> 10.4 s, 12 -> 9.6 s, 20 -> 11.1 s |
+| `SAKO_LINK_CONCURRENCY` | cores | filesystem, same shape as materialize |
+
+### What is slow now
+
+Filling tree positions is 76% of a warm install: 1,815 directories and 33,436
+files, at roughly 5 ms per position. Two measurements bound what to do about it.
+
+Replacing the file copy with a hard link was tried and measured at 7.5-9.0 s
+against 9.0-9.6 s for copying -- around 10%, not the several-fold win the
+technique is usually worth. The cost is the number of filesystem operations,
+not the bytes moved, so linking cannot fix it and would trade the tree's
+ownership of its own files for very little.
+
+What would fix it is having fewer positions. The 1,815 positions hold 111
+distinct packages, because the tree nests every dependency under its dependent
+rather than hoisting shared ones to the top. Hoisting would cut filesystem work
+by roughly the same 16x ratio.
