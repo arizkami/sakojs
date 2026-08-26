@@ -8,11 +8,15 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+pub mod profile;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use flate2::read::GzDecoder;
+use profile::{Count, Pool, Profile, Stage};
 use sako_process::spawn_native_with_bounded_output_in;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -534,11 +538,16 @@ pub struct PackageManager {
     installed: BTreeMap<String, LockedPackage>,
     active: HashSet<String>,
     reporter: Reporter,
+    profile: Arc<Profile>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct PackageManagerOptions {
     pub ignore_scripts: bool,
+    /// Print the stage breakdown when the install finishes.
+    pub perf: bool,
+    /// Add the per-package detail above that breakdown.
+    pub verbose: bool,
     pub registry: Option<String>,
     pub auth_token: Option<String>,
     pub proxy: Option<String>,
@@ -650,6 +659,13 @@ impl PackageManager {
             installed: BTreeMap::new(),
             active: HashSet::new(),
             reporter: Reporter::default(),
+            profile: {
+                let profile = Profile::new();
+                if options.perf || options.verbose {
+                    profile.enable(options.verbose);
+                }
+                Arc::new(profile)
+            },
         })
     }
 
@@ -658,6 +674,17 @@ impl PackageManager {
     /// like nothing is happening.
     pub fn set_reporter(&mut self, reporter: Box<dyn ProgressReporter>) {
         self.reporter = Reporter(Some(reporter));
+    }
+
+    /// The measurement report, empty unless `perf` or `verbose` was asked for.
+    ///
+    /// Returned rather than printed so the caller keeps the decision about
+    /// where install diagnostics go, the same way progress events do.
+    pub fn performance_report(&self) -> String {
+        if !self.profile.enabled() {
+            return String::new();
+        }
+        format!("{}{}", self.profile.detail(), self.profile.report())
     }
 
     fn report(&self, event: ProgressEvent<'_>) {
@@ -695,7 +722,10 @@ impl PackageManager {
         let optional_dependencies = manifest_dependencies(&manifest, "optionalDependencies")?;
 
         if self.install_from_lock(&dependencies, &optional_dependencies)? {
-            link_binaries(&self.root.join("node_modules"))?;
+            let node_modules = self.root.join("node_modules");
+            self.profile.time(Stage::Link, || link_binaries(&node_modules))?;
+            self.profile
+                .count(Count::TreePositions, self.installed.len() as u64);
             self.report(ProgressEvent::Finished {
                 installed: self.installed.len(),
             });
@@ -726,7 +756,9 @@ impl PackageManager {
             }
         }
         validate_peer_dependencies(&self.installed)?;
-        link_binaries(&node_modules)?;
+        self.profile.time(Stage::Link, || link_binaries(&node_modules))?;
+        self.profile
+            .count(Count::TreePositions, self.installed.len() as u64);
         self.write_lockfile()?;
         self.report(ProgressEvent::Finished {
             installed: self.installed.len(),
@@ -889,13 +921,16 @@ impl PackageManager {
             // on, so this package's own node_modules/.bin has to exist before
             // the script runs. Linking used to happen once, at the project
             // root, after every script had already been and gone.
-            link_binaries(&child_node_modules)?;
+            self.profile
+                .time(Stage::Link, || link_binaries(&child_node_modules))?;
             let scripts = self
                 .installed
                 .get(lock_path)
                 .map(|installed| installed.scripts.clone())
                 .unwrap_or_default();
-            run_lifecycle_scripts(&destination, &scripts, &self.root)?;
+            self.profile.time(Stage::Lifecycle, || {
+                run_lifecycle_scripts(&destination, &scripts, &self.root)
+            })?;
         }
         Ok(())
     }
@@ -917,7 +952,13 @@ impl PackageManager {
             PackageError(format!("{}@{}: {error}", package.name, package.version))
         })?;
         let (archive, downloaded) = self.fetch_archive(&package.dist.tarball, &checksum)?;
-        if let Err(error) = extract_archive(&archive, destination) {
+        self.profile.bump(Count::Extractions);
+        let extracted = {
+            let _occupancy = self.profile.occupy(Pool::Extract);
+            self.profile
+                .time(Stage::Extract, || extract_archive(&archive, destination))
+        };
+        if let Err(error) = extracted {
             let _ = fs::remove_dir_all(destination);
             return Err(error);
         }
@@ -1157,8 +1198,11 @@ impl PackageManager {
             // The locked entry carries the scripts read off disk at
             // resolution time, so a replay runs exactly what the first
             // install did.
-            link_binaries(&child_node_modules)?;
-            run_lifecycle_scripts(&destination, &package.scripts, &self.root)?;
+            self.profile
+                .time(Stage::Link, || link_binaries(&child_node_modules))?;
+            self.profile.time(Stage::Lifecycle, || {
+                run_lifecycle_scripts(&destination, &package.scripts, &self.root)
+            })?;
         }
         self.active.remove(&identity);
         Ok(())
@@ -1171,12 +1215,24 @@ impl PackageManager {
     /// rolldown deliver native binaries, and every one of them but ours is
     /// meant to be passed over in silence.
     fn built_for_another_platform(&mut self, name: &str, requirement: &str) -> bool {
-        self.resolve(name, requirement)
-            .is_ok_and(|package| !package.supports_host())
+        let skipped = self
+            .resolve(name, requirement)
+            .is_ok_and(|package| !package.supports_host());
+        if skipped {
+            self.profile.bump(Count::PlatformSkipped);
+        }
+        skipped
     }
 
     fn resolve(&mut self, name: &str, requirement: &str) -> Result<PackageVersion, PackageError> {
-        if !self.metadata.contains_key(name) {
+        self.profile.bump(Count::DependencyEdges);
+        let mut timing = profile::PackageTiming::default();
+        if self.metadata.contains_key(name) {
+            self.profile.bump(Count::MetadataCacheHits);
+            timing.cache_hit = true;
+        } else {
+            self.profile.bump(Count::MetadataCacheMisses);
+            self.profile.bump(Count::UniqueNames);
             if self.metadata.len() >= MAXIMUM_METADATA_ENTRIES {
                 return Err(PackageError(
                     "registry metadata cache capacity exceeded".into(),
@@ -1186,6 +1242,9 @@ impl PackageManager {
             let encoded = name.replace('/', "%2f");
             let registry = self.registry_for(name);
             let url = format!("{}/{encoded}", registry.trim_end_matches('/'));
+            let started = Instant::now();
+            let occupancy = self.profile.occupy(Pool::Metadata);
+            self.profile.bump(Count::RegistryRequests);
             let response = self
                 .request(&url)
                 .set("Accept", "application/vnd.npm.install-v1+json")
@@ -1198,17 +1257,32 @@ impl PackageManager {
                 .into_reader()
                 .take(MAXIMUM_METADATA_BYTES + 1)
                 .read_to_end(&mut bytes)?;
+            drop(occupancy);
+            timing.metadata = started.elapsed();
+            self.profile.add(Stage::MetadataNetwork, timing.metadata);
             if bytes.len() as u64 > MAXIMUM_METADATA_BYTES {
                 return Err(PackageError(format!(
                     "registry metadata for {name} exceeds byte limit"
                 )));
             }
-            let raw: RawMetadata = serde_json::from_slice(&bytes).map_err(|error| {
-                PackageError(format!("invalid registry metadata for {name}: {error}"))
+            let metadata = self.profile.time(Stage::MetadataParse, || {
+                serde_json::from_slice::<RawMetadata>(&bytes)
+                    .map(Metadata::from)
+                    .map_err(|error| {
+                        PackageError(format!("invalid registry metadata for {name}: {error}"))
+                    })
             })?;
-            self.metadata.insert(name.into(), raw.into());
+            self.metadata.insert(name.into(), metadata);
         }
-        select_version(self.metadata.get(name).unwrap(), requirement)
+        let started = Instant::now();
+        let selected = select_version(self.metadata.get(name).unwrap(), requirement);
+        timing.semver = started.elapsed();
+        self.profile.add(Stage::Semver, timing.semver);
+        if let Ok(package) = &selected {
+            timing.version = package.version.clone();
+        }
+        self.profile.record_package(name, timing);
+        selected
     }
 
     /// Returns the tarball bytes and whether they came off the network, which
@@ -1226,12 +1300,20 @@ impl PackageManager {
             // A cache entry that no longer matches its own name is corrupt
             // rather than hostile, so it is replaced from the network instead
             // of failing the install.
-            if expected.verify(&bytes).is_ok() {
+            if self
+                .profile
+                .time(Stage::Integrity, || expected.verify(&bytes))
+                .is_ok()
+            {
+                self.profile.bump(Count::StoreHits);
                 return Ok((bytes, false));
             }
             let _ = fs::remove_file(&cache_path);
         }
 
+        let started = Instant::now();
+        let occupancy = self.profile.occupy(Pool::Download);
+        self.profile.bump(Count::TarballRequests);
         let response = self
             .request(tarball)
             .call()
@@ -1241,10 +1323,14 @@ impl PackageManager {
             .into_reader()
             .take(MAXIMUM_TARBALL_BYTES + 1)
             .read_to_end(&mut bytes)?;
+        drop(occupancy);
+        self.profile.add(Stage::Download, started.elapsed());
+        self.profile.count(Count::BytesDownloaded, bytes.len() as u64);
         if bytes.len() as u64 > MAXIMUM_TARBALL_BYTES {
             return Err(PackageError("package tarball exceeds byte limit".into()));
         }
-        expected.verify(&bytes)?;
+        self.profile
+            .time(Stage::Integrity, || expected.verify(&bytes))?;
         if let Some(parent) = cache_path.parent() {
             fs::create_dir_all(parent)?;
         }

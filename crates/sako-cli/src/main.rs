@@ -375,9 +375,22 @@ fn package_install(mut arguments: Vec<OsString>) -> Result<(), String> {
     if development {
         return Err("--dev applies to packages being added; install takes none".into());
     }
-    package_manager(options)?
-        .install()
-        .map_err(|error| error.to_string())
+    let mut manager = package_manager(options)?;
+    let outcome = manager.install().map_err(|error| error.to_string());
+    report_performance(&manager);
+    outcome
+}
+
+/// Prints the measurement report, if one was asked for.
+///
+/// On stderr beside the progress bar rather than stdout, so `sako install
+/// --perf` can still be piped somewhere that only wants the install's own
+/// output.
+fn report_performance(manager: &PackageManager) {
+    let report = manager.performance_report();
+    if !report.is_empty() {
+        eprint!("\n{report}");
+    }
 }
 
 /// Rejects a leftover flag rather than treating it as a package name.
@@ -424,9 +437,12 @@ fn add_all(
         .map(|specifier| specifier.to_string_lossy().into_owned())
         .collect();
     let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
-    package_manager(options)?
+    let mut manager = package_manager(options)?;
+    let outcome = manager
         .add_all(&borrowed, development)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    report_performance(&manager);
+    outcome
 }
 
 fn package_remove(arguments: Vec<OsString>) -> Result<(), String> {
@@ -469,8 +485,14 @@ fn package_manager(options: PackageManagerOptions) -> Result<PackageManager, Str
 }
 
 fn take_package_options(arguments: &mut Vec<OsString>) -> Result<PackageManagerOptions, String> {
+    // `--verbose` implies `--perf`: the per-package detail is the breakdown
+    // with more of it, and asking for the detail and getting no totals under
+    // it reads as the flag having done nothing.
+    let verbose = take_flag(arguments, "--verbose");
     Ok(PackageManagerOptions {
         ignore_scripts: take_flag(arguments, "--ignore-scripts"),
+        perf: take_flag(arguments, "--perf") || verbose,
+        verbose,
         registry: take_option(arguments, "--registry")?,
         auth_token: take_option(arguments, "--token")?,
         proxy: take_option(arguments, "--proxy")?,
