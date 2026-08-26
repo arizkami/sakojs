@@ -47,6 +47,7 @@ extern char** environ;
 #include "sako_napi.h"
 #include "bootstrap.generated.h"
 #include "bootstrap_cache.generated.h"
+#include "libraries.generated.h"
 #if !defined(SAKO_SNAPSHOT_GENERATOR)
 // Produced by this same file compiled as the snapshot generator; see
 // the SAKO_SNAPSHOT_GENERATOR section at the bottom.
@@ -293,6 +294,17 @@ using SakoNativeHttpHandler = int (*)(
 
 constexpr int kNativeHttpDeferred = 2;
 
+// The event kinds sako_child_drain reports. Keep in sync with the constants
+// in crates/sako-v8/src/lib.rs and with the dispatcher in bootstrap.js.
+constexpr int kSakoChildStdout = 0;
+constexpr int kSakoChildStderr = 1;
+constexpr int kSakoChildStdoutEnd = 2;
+constexpr int kSakoChildStderrEnd = 3;
+constexpr int kSakoChildExited = 4;
+constexpr int kSakoChildFailed = 5;
+constexpr int kSakoChildStdinFailed = 6;
+constexpr int kSakoChildStdinDrained = 7;
+
 void* sako_http_server_new(uint16_t port, uint16_t* output_port, char* error,
                            size_t error_capacity);
 void* sako_https_server_new(uint16_t port, SakoNativeBytes certificate,
@@ -320,6 +332,43 @@ int sako_process_output_status(const void* output);
 SakoNativeBytes sako_process_output_stdout(const void* output);
 SakoNativeBytes sako_process_output_stderr(const void* output);
 void sako_process_output_delete(void* output);
+// What a live child says, one event at a time. `kind` is one of the
+// kSakoChild* values below; `bytes` carries output or an error message and
+// `status` an exit code, whichever the kind implies.
+using SakoNativeChildEvent = void (*)(void*, int, SakoNativeBytes, int);
+void* sako_child_spawn(SakoNativeBytes executable,
+                       const SakoNativeBytes* arguments, size_t argument_count,
+                       SakoNativeBytes cwd, int verbatim_arguments,
+                       const SakoNativeBytes* environment,
+                       size_t environment_count, int replace_environment,
+                       int piped_stdin, char* error, size_t error_capacity);
+uint32_t sako_child_pid(const void* child);
+int sako_child_drain(const void* child, SakoNativeChildEvent callback,
+                     void* user);
+int sako_child_write(const void* child, SakoNativeBytes bytes, char* error,
+                     size_t error_capacity);
+int sako_child_close_stdin(const void* child);
+int sako_child_kill(const void* child, int force);
+void sako_child_delete(void* child);
+uint64_t sako_child_activity_tick();
+uint64_t sako_child_wait_activity(uint64_t since, uint32_t timeout_milliseconds);
+void* sako_postgres_connect(SakoNativeBytes url, char* error, size_t error_capacity);
+void* sako_postgres_query(void* connection, SakoNativeBytes sql,
+                          const SakoNativeBytes* parameters, const uint8_t* nulls,
+                          size_t parameter_count, char* error,
+                          size_t error_capacity);
+void sako_postgres_close(void* connection);
+void sako_postgres_delete(void* connection);
+SakoNativeBytes sako_postgres_parameter(const void* connection, SakoNativeBytes name);
+size_t sako_postgres_result_column_count(const void* result);
+SakoNativeBytes sako_postgres_result_column_name(const void* result, size_t index);
+uint32_t sako_postgres_result_column_type(const void* result, size_t index);
+size_t sako_postgres_result_row_count(const void* result);
+SakoNativeBytes sako_postgres_result_value(const void* result, size_t row,
+                                           size_t column, int* is_null);
+SakoNativeBytes sako_postgres_result_command(const void* result);
+uint64_t sako_postgres_result_affected(const void* result);
+void sako_postgres_result_delete(void* result);
 void* sako_fetch_sync(SakoNativeBytes url, SakoNativeBytes method,
                       const SakoNativeHeader* headers, size_t header_count,
                       SakoNativeBytes body, char* error, size_t error_capacity);
@@ -2724,6 +2773,13 @@ class Runtime {
       if (file.handle != kInvalidFile) CloseNativeFile(file.handle);
     }
     file_descriptors_.clear();
+    // Each one says goodbye to its server rather than leaving a session for
+    // the far end to discover through a reset socket.
+    for (auto& [id, connection] : databases_) {
+      (void)id;
+      sako_postgres_delete(connection);
+    }
+    databases_.clear();
     if (isolate_ != nullptr) {
       {
         v8::Isolate::Scope isolate_scope(isolate_);
@@ -2767,8 +2823,15 @@ class Runtime {
           binding->server = nullptr;
         }
         http_servers_.clear();
+        // Every persistent handle has to be released while the isolate is
+        // still alive: a v8::Global destroyed after Dispose reaches into freed
+        // isolate state, and the failure is an access violation at teardown
+        // rather than anything that names the handle responsible.
         http_dispatcher_.Reset();
         http_finalizer_.Reset();
+        raw_http_dispatcher_.Reset();
+        raw_http_finalizer_.Reset();
+        child_dispatcher_.Reset();
         empty_bytes_.Reset();
         empty_ranges_.Reset();
         context_.Reset();
@@ -2965,10 +3028,11 @@ class Runtime {
     *http_buffer_bytes = 0;
     *module_cache_entries =
         modules_.size() + commonjs_modules_.size() + synthetic_commonjs_.size();
-    *queued_operations = closing_http_servers_.size();
+    *queued_operations = closing_http_servers_.size() + children_.size();
     *native_memory_bytes = module_source_bytes_ +
                            timers_.size() * sizeof(Timer) +
-                           http_servers_.size() * sizeof(HttpBinding);
+                           http_servers_.size() * sizeof(HttpBinding) +
+                           children_.size() * sizeof(ChildBinding);
     for (const auto& [id, binding] : http_servers_) {
       (void)id;
       uint64_t connections = 0;
@@ -2996,6 +3060,15 @@ class Runtime {
   static constexpr size_t kMaximumModuleBytes = 64 * 1024 * 1024;
   static constexpr size_t kMaximumHttpServers = 64;
   static constexpr size_t kMaximumFileDescriptors = 1'024;
+  // Live children one execution may own at once. A build tool starting one
+  // worker per core is ordinary; hundreds at once is a runaway loop.
+  static constexpr size_t kMaximumChildren = 256;
+  // Connections are blocking and one statement at a time, so a program that
+  // wants hundreds is describing a pool this runtime cannot honour yet.
+  static constexpr size_t kMaximumDatabaseConnections = 64;
+  static constexpr uint32_t kMaximumDatabaseParameters = 4'096;
+  static constexpr size_t kMaximumChildArguments = 256;
+  static constexpr size_t kMaximumChildEnvironmentVariables = 512;
   // Longest the loop blocks with an idle HTTP server before looping back to
   // check timers and other runtime work.
   static constexpr uint32_t kIdleHttpWaitMilliseconds = 50;
@@ -3041,6 +3114,41 @@ class Runtime {
     std::vector<SakoNativeHeader> response_headers;
     bool closing = false;
     bool secure = false;
+    /// Dispatch straight to a Request/Response handler instead of building the
+    /// node-shaped request and response objects. `sako:http` sets it.
+    bool raw = false;
+  };
+
+  /// One live child, from the moment it starts until JavaScript has seen it
+  /// exit and both of its output streams end.
+  struct ChildBinding {
+    void* child = nullptr;
+    /// Whether this child still holds the event loop open. `unref()` clears
+    /// it, which is how a caller says the process may leave without it.
+    bool referenced = true;
+    bool saw_exit = false;
+    bool saw_stdout_end = false;
+    bool saw_stderr_end = false;
+
+    /// Nothing more will ever arrive, so the handle can go.
+    bool finished() const {
+      return saw_exit && saw_stdout_end && saw_stderr_end;
+    }
+
+    ~ChildBinding() {
+      if (child != nullptr) sako_child_delete(child);
+    }
+  };
+
+  /// Carries one drain's destination through the C callback back into
+  /// JavaScript.
+  struct ChildPump {
+    Runtime* runtime = nullptr;
+    v8::Local<v8::Context> context;
+    uint64_t id = 0;
+    ChildBinding* binding = nullptr;
+    std::string* error = nullptr;
+    bool failed = false;
   };
 
   Runtime() = default;
@@ -3107,6 +3215,15 @@ class Runtime {
         {"__sakoStdinSetRawMode", StdinSetRawMode},
         {"__sakoResolveHost", ResolveHost},
         {"__sakoSpawnSync", SpawnSync},
+        {"__sakoChildSpawn", ChildSpawn},
+        {"__sakoChildWrite", ChildWrite},
+        {"__sakoChildEndStdin", ChildEndStdin},
+        {"__sakoChildKill", ChildKill},
+        {"__sakoChildRef", ChildRef},
+        {"__sakoPostgresConnect", PostgresConnect},
+        {"__sakoPostgresQuery", PostgresQuery},
+        {"__sakoPostgresParameter", PostgresParameter},
+        {"__sakoPostgresClose", PostgresClose},
         {"__sakoFetchSync", FetchSync},
         {"__sakoHash", Hash},
         {"__sakoHttpListen", HttpListen},
@@ -3332,7 +3449,9 @@ class Runtime {
                                          &builtin_error)) {
       return builtin;
     }
-    if (request.starts_with("node:")) {
+    // A built-in specifier that did not resolve is an error in itself: there
+    // is no file on disk for "node:fs" or "sako:http" to fall back to.
+    if (request.starts_with("node:") || request.starts_with("sako:")) {
       if (!isolate->HasPendingException()) {
         isolate->ThrowException(v8::Exception::Error(
             v8::String::NewFromUtf8(isolate, builtin_error.data(),
@@ -3396,7 +3515,7 @@ class Runtime {
     v8::Local<v8::Module> module;
     bool loaded = false;
     loaded = runtime->CompileSyntheticBuiltin(context, request, &module, &error);
-    if (!loaded && !request.starts_with("node:")) {
+    if (!loaded && !request.starts_with("node:") && !request.starts_with("sako:")) {
       std::filesystem::path resolved;
       if (runtime->ResolvePath(context, request, referrer, &resolved, &error)) {
         loaded = runtime->IsCommonJsPath(context, resolved)
@@ -3674,6 +3793,10 @@ class Runtime {
                    std::filesystem::path* output, std::string* error) {
     if (request.starts_with("node:")) {
       *error = "unsupported built-in module: " + request;
+      return false;
+    }
+    if (request.starts_with("sako:")) {
+      *error = "unknown Sako library: " + request;
       return false;
     }
     if (request.starts_with("file:")) {
@@ -4437,9 +4560,115 @@ class Runtime {
     isolate->ThrowException(v8::Exception::Error(message));
   }
 
+  /// Compiles and evaluates one embedded Sako library, and hands back its
+  /// namespace.
+  ///
+  /// The TypeScript is embedded as written and transpiled here, on the first
+  /// import in a run, so a library nobody uses costs nothing but its bytes in
+  /// the executable. The compiled module is cached under its specifier like
+  /// any other, so the second import is a map lookup.
+  bool LoadSakoLibrary(v8::Local<v8::Context> context,
+                       const std::string& request,
+                       v8::Local<v8::Value>* output, std::string* error) {
+    auto cached = modules_.find(request);
+    if (cached == modules_.end()) {
+      const SakoLibrarySource* found = nullptr;
+      for (const SakoLibrarySource& library : kSakoLibraries) {
+        if (library.specifier != nullptr && request == library.specifier) {
+          found = &library;
+          break;
+        }
+      }
+      if (found == nullptr) {
+        *error = "unknown Sako library: " + request;
+        return false;
+      }
+      if (modules_.size() >= kMaximumModules) {
+        *error = "module cache capacity exceeded";
+        return false;
+      }
+      // The path is only ever a name in a diagnostic -- nothing reads it off
+      // disk -- but it has to end in .ts for the transpiler to recognize the
+      // language, and be absolute for it to form a module URL at all.
+      const std::string origin = request.substr(request.find(':') + 1);
+      std::error_code absolute_error;
+      std::filesystem::path source_path = std::filesystem::absolute(
+          std::filesystem::path(Utf8ToPathString("libs/" + origin +
+                                                 "/src/index.ts")),
+          absolute_error);
+      if (absolute_error) source_path = Utf8ToPathString(request);
+      std::string source_text(reinterpret_cast<const char*>(found->source),
+                              found->length);
+      if (!TranspileTypeScript(source_path, false, &source_text, error)) {
+        return false;
+      }
+      v8::Local<v8::String> source;
+      v8::Local<v8::String> resource_name;
+      if (!v8::String::NewFromUtf8(isolate_, source_text.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(source_text.size()))
+               .ToLocal(&source) ||
+          !v8::String::NewFromUtf8(isolate_, request.data(),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(request.size()))
+               .ToLocal(&resource_name)) {
+        *error = "library source exceeds V8 string limits";
+        return false;
+      }
+      v8::ScriptOrigin origin_info(resource_name, 0, 0, false, -1,
+                                   v8::Local<v8::Value>(), false, false, true);
+      v8::ScriptCompiler::Source compiler_source(source, origin_info);
+      v8::Local<v8::Module> module;
+      if (!v8::ScriptCompiler::CompileModule(isolate_, &compiler_source)
+               .ToLocal(&module)) {
+        *error = "failed to compile the library: " + request;
+        return false;
+      }
+      module_paths_[module->GetIdentityHash()] = request;
+      modules_.emplace(request, v8::Global<v8::Module>(isolate_, module));
+      module_source_bytes_ += source_text.size();
+      cached = modules_.find(request);
+    }
+
+    v8::Local<v8::Module> module = cached->second.Get(isolate_);
+    if (module->GetStatus() == v8::Module::kUninstantiated &&
+        !module->InstantiateModule(context, ResolveModule).FromMaybe(false)) {
+      *error = "failed to instantiate the library: " + request;
+      return false;
+    }
+    if (module->GetStatus() == v8::Module::kInstantiated) {
+      v8::Local<v8::Value> evaluation;
+      if (!module->Evaluate(context).ToLocal(&evaluation)) {
+        *error = "failed to evaluate the library: " + request;
+        return false;
+      }
+      isolate_->PerformMicrotaskCheckpoint();
+    }
+    if (module->GetStatus() == v8::Module::kErrored) {
+      isolate_->ThrowException(module->GetException());
+      return false;
+    }
+    *output = module->GetModuleNamespace();
+    return true;
+  }
+
   bool LoadBuiltin(v8::Local<v8::Context> context,
                    const std::string& request,
                    v8::Local<v8::Value>* output) {
+    // Sako's own libraries keep their scheme: "sako:http" is the whole name,
+    // not a bare specifier to be canonicalized into the node: namespace.
+    if (request.starts_with("sako:")) {
+      std::string error;
+      if (LoadSakoLibrary(context, request, output, &error)) return true;
+      if (!isolate_->HasPendingException()) {
+        isolate_->ThrowException(v8::Exception::Error(
+            v8::String::NewFromUtf8(isolate_, error.data(),
+                                    v8::NewStringType::kNormal,
+                                    static_cast<int>(error.size()))
+                .ToLocalChecked()));
+      }
+      return false;
+    }
     const std::string canonical_request =
         request.starts_with("node:") ? request : "node:" + request;
     v8::Local<v8::Value> builtins;
@@ -4510,6 +4739,10 @@ class Runtime {
                        std::filesystem::path* output, std::string* error) {
     if (request.starts_with("node:")) {
       *error = "unsupported built-in module: " + request;
+      return false;
+    }
+    if (request.starts_with("sako:")) {
+      *error = "unknown Sako library: " + request;
       return false;
     }
     if (request.starts_with('#')) {
@@ -5224,6 +5457,7 @@ class Runtime {
       return;
     }
     binding->handler.Reset(isolate, info[0].As<v8::Function>());
+    binding->raw = info.Length() > 2 && info[2]->BooleanValue(isolate);
     uint64_t id = runtime->next_http_server_id_++;
     if (id == 0) id = runtime->next_http_server_id_++;
     binding->id = id;
@@ -5280,6 +5514,7 @@ class Runtime {
       return;
     }
     binding->handler.Reset(isolate, info[0].As<v8::Function>());
+    binding->raw = info.Length() > 4 && info[4]->BooleanValue(isolate);
     uint64_t id = runtime->next_http_server_id_++;
     if (id == 0) id = runtime->next_http_server_id_++;
     binding->id = id;
@@ -5411,6 +5646,549 @@ class Runtime {
     info.GetReturnValue().Set(result);
   }
 
+  /// Starts a child that keeps running, and returns `[id, pid]`.
+  ///
+  /// `spawnSync` answers one question -- what did this command print before
+  /// it ended -- and answers it by waiting. This answers nothing at once:
+  /// output arrives through the event loop as the child produces it, and the
+  /// caller can write to the child's stdin while it runs. That is the only
+  /// shape a long-lived child can be used in. esbuild's JavaScript API starts
+  /// its binary once and then exchanges packets with it over those pipes for
+  /// the life of the build; run through a `spawn` that waits, it deadlocks on
+  /// the first request it sends.
+  static void ChildSpawn(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    if (runtime == nullptr || info.Length() < 2 || !info[0]->IsString() ||
+        !info[1]->IsArray()) {
+      ThrowTypeError(isolate, "spawn needs an executable and argument array");
+      return;
+    }
+    if (runtime->children_.size() >= kMaximumChildren) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate,
+                                         "child process capacity exceeded")));
+      return;
+    }
+    const std::string executable = ToUtf8(isolate, info[0]);
+    v8::Local<v8::Array> values = info[1].As<v8::Array>();
+    if (values->Length() > kMaximumChildArguments) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(isolate,
+                                         "child argument limit exceeded")));
+      return;
+    }
+    std::vector<std::string> argument_storage;
+    argument_storage.reserve(values->Length());
+    for (uint32_t index = 0; index < values->Length(); ++index) {
+      v8::Local<v8::Value> value;
+      if (!values->Get(context, index).ToLocal(&value)) return;
+      argument_storage.push_back(ToUtf8(isolate, value));
+    }
+    std::vector<SakoNativeBytes> arguments;
+    arguments.reserve(argument_storage.size());
+    for (const std::string& argument : argument_storage) {
+      arguments.push_back({reinterpret_cast<const uint8_t*>(argument.data()),
+                           argument.size()});
+    }
+
+    const std::string cwd =
+        info.Length() > 2 && info[2]->IsString() ? ToUtf8(isolate, info[2])
+                                                 : std::string();
+    // The caller has already built the command line the way the child expects.
+    const int verbatim =
+        info.Length() > 3 && info[3]->BooleanValue(isolate) ? 1 : 0;
+
+    // A flat [name, value, ...] array, which is what an environment is once
+    // the caller has decided what to keep from its own.
+    // An `env` option replaces the child's environment rather than adding to
+    // this process's, which is what Node means by it.
+    const int replace_environment =
+        info.Length() > 4 && info[4]->IsArray() ? 1 : 0;
+    std::vector<std::string> environment_storage;
+    if (info.Length() > 4 && info[4]->IsArray()) {
+      v8::Local<v8::Array> pairs = info[4].As<v8::Array>();
+      if (pairs->Length() % 2 != 0 ||
+          pairs->Length() / 2 > kMaximumChildEnvironmentVariables) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(
+                isolate, "child environment limit exceeded")));
+        return;
+      }
+      environment_storage.reserve(pairs->Length());
+      for (uint32_t index = 0; index < pairs->Length(); ++index) {
+        v8::Local<v8::Value> value;
+        if (!pairs->Get(context, index).ToLocal(&value)) return;
+        environment_storage.push_back(ToUtf8(isolate, value));
+      }
+    }
+    std::vector<SakoNativeBytes> environment;
+    environment.reserve(environment_storage.size());
+    for (const std::string& value : environment_storage) {
+      environment.push_back(
+          {reinterpret_cast<const uint8_t*>(value.data()), value.size()});
+    }
+    const int piped_stdin =
+        info.Length() > 5 && info[5]->BooleanValue(isolate) ? 1 : 0;
+
+    char error[1024] = {};
+    void* child = sako_child_spawn(
+        {reinterpret_cast<const uint8_t*>(executable.data()),
+         executable.size()},
+        arguments.data(), arguments.size(),
+        {reinterpret_cast<const uint8_t*>(cwd.data()), cwd.size()}, verbatim,
+        environment.data(), environment.size(), replace_environment,
+        piped_stdin, error, sizeof(error));
+    if (child == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+      return;
+    }
+    auto binding = std::make_unique<ChildBinding>();
+    binding->child = child;
+    const uint32_t pid = sako_child_pid(child);
+    uint64_t id = runtime->next_child_id_++;
+    if (id == 0) id = runtime->next_child_id_++;
+    runtime->children_.emplace(id, std::move(binding));
+
+    v8::Local<v8::Array> result = v8::Array::New(isolate, 2);
+    if (!result->Set(context, 0, v8::Number::New(isolate,
+                                                 static_cast<double>(id)))
+             .FromMaybe(false) ||
+        !result->Set(context, 1,
+                     v8::Number::New(isolate, static_cast<double>(pid)))
+             .FromMaybe(false)) {
+      return;
+    }
+    info.GetReturnValue().Set(result);
+  }
+
+  /// Looks up a live child, or null when it has already been reaped. A caller
+  /// holding on to a finished child is ordinary -- JavaScript learns it ended
+  /// one turn after the runtime did.
+  ChildBinding* FindChild(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+    if (info.Length() == 0) return nullptr;
+    const uint64_t id = static_cast<uint64_t>(
+        info[0]->IntegerValue(context).FromMaybe(0));
+    auto found = children_.find(id);
+    return found == children_.end() ? nullptr : found->second.get();
+  }
+
+  /// Queues bytes for the child's stdin. Reports false when the queue is full
+  /// enough that the caller should wait, which is what a writable stream's
+  /// `write()` means by the same answer.
+  static void ChildWrite(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    const uint8_t* bytes = nullptr;
+    size_t length = 0;
+    if (runtime == nullptr || info.Length() < 2 ||
+        !ReadBytes(info[1], &bytes, &length)) {
+      ThrowTypeError(isolate, "child write needs an id and a byte array");
+      return;
+    }
+    ChildBinding* binding = runtime->FindChild(info);
+    if (binding == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(isolate, "child is not running")));
+      return;
+    }
+    char error[1024] = {};
+    const int accepted = sako_child_write(binding->child, {bytes, length},
+                                          error, sizeof(error));
+    if (accepted < 0) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+      return;
+    }
+    info.GetReturnValue().Set(accepted != 0);
+  }
+
+  /// Closes the child's stdin once everything queued has reached it. A child
+  /// that reads to end of input -- which is most of them -- only finishes
+  /// when this happens.
+  static void ChildEndStdin(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    if (runtime == nullptr) return;
+    ChildBinding* binding = runtime->FindChild(info);
+    if (binding != nullptr) sako_child_close_stdin(binding->child);
+  }
+
+  static void ChildKill(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    if (runtime == nullptr) return;
+    ChildBinding* binding = runtime->FindChild(info);
+    if (binding == nullptr) {
+      info.GetReturnValue().Set(false);
+      return;
+    }
+    const bool force =
+        info.Length() > 1 && info[1]->BooleanValue(info.GetIsolate());
+    info.GetReturnValue().Set(sako_child_kill(binding->child, force ? 1 : 0) ==
+                              0);
+  }
+
+  /// Whether this child still holds the event loop open.
+  static void ChildRef(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    if (runtime == nullptr) return;
+    ChildBinding* binding = runtime->FindChild(info);
+    if (binding == nullptr) return;
+    binding->referenced =
+        info.Length() < 2 || info[1]->BooleanValue(info.GetIsolate());
+  }
+
+  /// Hands one event from a child to the bootstrap's dispatcher.
+  ///
+  /// Called from inside `sako_child_drain`, once per queued event, with the
+  /// bytes borrowed for the duration of the call -- so anything kept has to
+  /// be copied into the heap here.
+  static void DeliverChildEvent(void* user, int kind, SakoNativeBytes bytes,
+                                int status) {
+    auto* pump = static_cast<ChildPump*>(user);
+    if (pump == nullptr || pump->failed) return;
+    Runtime* runtime = pump->runtime;
+    v8::Isolate* isolate = runtime->isolate_;
+    v8::HandleScope scope(isolate);
+    v8::Local<v8::Context> context = pump->context;
+
+    switch (kind) {
+      case kSakoChildStdoutEnd:
+        pump->binding->saw_stdout_end = true;
+        break;
+      case kSakoChildStderrEnd:
+        pump->binding->saw_stderr_end = true;
+        break;
+      case kSakoChildExited:
+        pump->binding->saw_exit = true;
+        break;
+      default:
+        break;
+    }
+
+    if (runtime->child_dispatcher_.IsEmpty()) return;
+    v8::Local<v8::Function> dispatcher = runtime->child_dispatcher_.Get(isolate);
+
+    v8::Local<v8::Value> payload = v8::Undefined(isolate);
+    if (kind == kSakoChildStdout || kind == kSakoChildStderr) {
+      std::unique_ptr<v8::BackingStore> backing =
+          v8::ArrayBuffer::NewBackingStore(isolate, bytes.length);
+      if (bytes.length != 0) {
+        std::memcpy(backing->Data(), bytes.data, bytes.length);
+      }
+      v8::Local<v8::ArrayBuffer> buffer =
+          v8::ArrayBuffer::New(isolate, std::move(backing));
+      payload = v8::Uint8Array::New(buffer, 0, bytes.length);
+    } else if (kind == kSakoChildExited) {
+      payload = v8::Integer::New(isolate, status);
+    } else if (kind == kSakoChildFailed || kind == kSakoChildStdinFailed) {
+      v8::Local<v8::String> message;
+      if (v8::String::NewFromUtf8(isolate,
+                                  reinterpret_cast<const char*>(bytes.data),
+                                  v8::NewStringType::kNormal,
+                                  static_cast<int>(bytes.length))
+              .ToLocal(&message)) {
+        payload = message;
+      }
+    }
+
+    v8::TryCatch try_catch(isolate);
+    v8::Local<v8::Value> arguments[] = {
+        v8::Number::New(isolate, static_cast<double>(pump->id)),
+        v8::Integer::New(isolate, kind),
+        payload,
+    };
+    v8::Local<v8::Value> result;
+    if (!dispatcher
+             ->Call(context, v8::Undefined(isolate),
+                    static_cast<int>(std::size(arguments)), arguments)
+             .ToLocal(&result)) {
+      // The rest of this child's queue is abandoned deliberately: the
+      // execution is over, and running more of its handlers would report
+      // events against a failure already being unwound.
+      *pump->error = FormatException(isolate, context, try_catch);
+      pump->failed = true;
+      return;
+    }
+    isolate->PerformMicrotaskCheckpoint();
+  }
+
+  /// Delivers everything every live child has said since the last turn, and
+  /// reaps the ones that have nothing left to say.
+  bool TickChildren(v8::Local<v8::Context> context, bool* handled,
+                    std::string* error) {
+    if (children_.empty()) return true;
+    if (child_dispatcher_.IsEmpty() && !ResolveChildDispatcher(context)) {
+      *error = "the child process dispatcher is unavailable";
+      return false;
+    }
+    // A handler may spawn or kill children, so the set is snapshotted by id
+    // and every entry re-looked-up before it is touched.
+    std::vector<uint64_t> ids;
+    ids.reserve(children_.size());
+    for (const auto& [id, binding] : children_) {
+      (void)binding;
+      ids.push_back(id);
+    }
+    std::vector<uint64_t> finished;
+    for (uint64_t id : ids) {
+      auto found = children_.find(id);
+      if (found == children_.end()) continue;
+      ChildPump pump;
+      pump.runtime = this;
+      pump.context = context;
+      pump.id = id;
+      pump.binding = found->second.get();
+      pump.error = error;
+      const int delivered =
+          sako_child_drain(found->second->child, DeliverChildEvent, &pump);
+      if (pump.failed) return false;
+      if (delivered > 0) *handled = true;
+      // The lookup is repeated because a handler may have removed this child
+      // while its own events were being delivered.
+      found = children_.find(id);
+      if (found != children_.end() && found->second->finished()) {
+        finished.push_back(id);
+      }
+    }
+    for (uint64_t id : finished) children_.erase(id);
+    return true;
+  }
+
+  /// Looks up the bootstrap's child dispatcher once per runtime.
+  bool ResolveChildDispatcher(v8::Local<v8::Context> context) {
+    v8::Local<v8::Value> dispatcher;
+    if (!context->Global()
+             ->Get(context, v8::String::NewFromUtf8Literal(
+                                isolate_, "__sakoDispatchChildEvent"))
+             .ToLocal(&dispatcher) ||
+        !dispatcher->IsFunction()) {
+      return false;
+    }
+    child_dispatcher_.Reset(isolate_, dispatcher.As<v8::Function>());
+    return true;
+  }
+
+  /// Opens one PostgreSQL connection and returns the id JavaScript knows it
+  /// by. Blocks until the server has authenticated the session.
+  static void PostgresConnect(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    if (runtime == nullptr || info.Length() == 0 || !info[0]->IsString()) {
+      ThrowTypeError(isolate, "connect needs a postgres:// URL");
+      return;
+    }
+    if (runtime->databases_.size() >= kMaximumDatabaseConnections) {
+      isolate->ThrowException(v8::Exception::RangeError(
+          v8::String::NewFromUtf8Literal(
+              isolate, "database connection capacity exceeded")));
+      return;
+    }
+    const std::string url = ToUtf8(isolate, info[0]);
+    char error[4096] = {};
+    void* connection = sako_postgres_connect(
+        {reinterpret_cast<const uint8_t*>(url.data()), url.size()}, error,
+        sizeof(error));
+    if (connection == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+      return;
+    }
+    uint64_t id = runtime->next_database_id_++;
+    if (id == 0) id = runtime->next_database_id_++;
+    runtime->databases_.emplace(id, connection);
+    info.GetReturnValue().Set(v8::Number::New(isolate, static_cast<double>(id)));
+  }
+
+  /// Runs one statement and materializes the whole result.
+  ///
+  /// Values arrive as the text the server printed and leave as JavaScript
+  /// strings; the column type OIDs go back alongside them so the library can
+  /// decide what each column's text means. Turning a numeric column into a
+  /// number here would mean this layer owning a type table it has no business
+  /// owning.
+  static void PostgresQuery(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    if (runtime == nullptr || info.Length() < 2 || !info[1]->IsString()) {
+      ThrowTypeError(isolate, "query needs a connection and a statement");
+      return;
+    }
+    void* connection = runtime->FindDatabase(info);
+    if (connection == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8Literal(isolate, "the connection is closed")));
+      return;
+    }
+    const std::string sql = ToUtf8(isolate, info[1]);
+
+    std::vector<std::string> parameter_storage;
+    std::vector<SakoNativeBytes> parameters;
+    std::vector<uint8_t> nulls;
+    if (info.Length() > 2 && info[2]->IsArray()) {
+      v8::Local<v8::Array> given = info[2].As<v8::Array>();
+      if (given->Length() > kMaximumDatabaseParameters) {
+        isolate->ThrowException(v8::Exception::RangeError(
+            v8::String::NewFromUtf8Literal(isolate,
+                                           "query parameter limit exceeded")));
+        return;
+      }
+      parameter_storage.reserve(given->Length());
+      nulls.reserve(given->Length());
+      for (uint32_t index = 0; index < given->Length(); ++index) {
+        v8::Local<v8::Value> value;
+        if (!given->Get(context, index).ToLocal(&value)) return;
+        if (value->IsNullOrUndefined()) {
+          parameter_storage.emplace_back();
+          nulls.push_back(1);
+          continue;
+        }
+        parameter_storage.push_back(ToUtf8(isolate, value));
+        nulls.push_back(0);
+      }
+      parameters.reserve(parameter_storage.size());
+      for (const std::string& parameter : parameter_storage) {
+        parameters.push_back(
+            {reinterpret_cast<const uint8_t*>(parameter.data()), parameter.size()});
+      }
+    }
+
+    char error[4096] = {};
+    void* result = sako_postgres_query(
+        connection, {reinterpret_cast<const uint8_t*>(sql.data()), sql.size()},
+        parameters.data(), nulls.data(), parameters.size(), error,
+        sizeof(error));
+    if (result == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, error).ToLocalChecked()));
+      return;
+    }
+    std::unique_ptr<void, void (*)(void*)> owned(result,
+                                                 sako_postgres_result_delete);
+
+    const size_t column_count = sako_postgres_result_column_count(result);
+    const size_t row_count = sako_postgres_result_row_count(result);
+    v8::Local<v8::Array> names = v8::Array::New(isolate, static_cast<int>(column_count));
+    v8::Local<v8::Array> types = v8::Array::New(isolate, static_cast<int>(column_count));
+    for (size_t index = 0; index < column_count; ++index) {
+      v8::Local<v8::String> name;
+      if (!MakeString(isolate, sako_postgres_result_column_name(result, index))
+               .ToLocal(&name) ||
+          !names->Set(context, static_cast<uint32_t>(index), name).FromMaybe(false) ||
+          !types
+               ->Set(context, static_cast<uint32_t>(index),
+                     v8::Integer::NewFromUnsigned(
+                         isolate, sako_postgres_result_column_type(result, index)))
+               .FromMaybe(false)) {
+        return;
+      }
+    }
+
+    v8::Local<v8::Array> rows = v8::Array::New(isolate, static_cast<int>(row_count));
+    for (size_t row = 0; row < row_count; ++row) {
+      v8::Local<v8::Array> values =
+          v8::Array::New(isolate, static_cast<int>(column_count));
+      for (size_t column = 0; column < column_count; ++column) {
+        int is_null = 1;
+        const SakoNativeBytes value =
+            sako_postgres_result_value(result, row, column, &is_null);
+        v8::Local<v8::Value> entry;
+        if (is_null != 0) {
+          entry = v8::Null(isolate);
+        } else {
+          v8::Local<v8::String> text;
+          if (!MakeString(isolate, value).ToLocal(&text)) return;
+          entry = text;
+        }
+        if (!values->Set(context, static_cast<uint32_t>(column), entry)
+                 .FromMaybe(false)) {
+          return;
+        }
+      }
+      if (!rows->Set(context, static_cast<uint32_t>(row), values).FromMaybe(false)) {
+        return;
+      }
+    }
+
+    v8::Local<v8::String> command;
+    if (!MakeString(isolate, sako_postgres_result_command(result)).ToLocal(&command)) {
+      return;
+    }
+    v8::Local<v8::Object> answer = v8::Object::New(isolate);
+    if (!runtime->Set(context, answer, "names", names) ||
+        !runtime->Set(context, answer, "types", types) ||
+        !runtime->Set(context, answer, "rows", rows) ||
+        !runtime->Set(context, answer, "command", command) ||
+        !runtime->Set(context, answer, "affected",
+                      v8::Number::New(
+                          isolate,
+                          static_cast<double>(sako_postgres_result_affected(result))))) {
+      return;
+    }
+    info.GetReturnValue().Set(answer);
+  }
+
+  /// A server parameter such as `server_version`, or null.
+  static void PostgresParameter(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    v8::Isolate* isolate = info.GetIsolate();
+    if (runtime == nullptr || info.Length() < 2 || !info[1]->IsString()) {
+      ThrowTypeError(isolate, "a server parameter is read by name");
+      return;
+    }
+    void* connection = runtime->FindDatabase(info);
+    if (connection == nullptr) {
+      info.GetReturnValue().SetNull();
+      return;
+    }
+    const std::string name = ToUtf8(isolate, info[1]);
+    const SakoNativeBytes value = sako_postgres_parameter(
+        connection, {reinterpret_cast<const uint8_t*>(name.data()), name.size()});
+    if (value.length == 0) {
+      info.GetReturnValue().SetNull();
+      return;
+    }
+    v8::Local<v8::String> text;
+    if (!MakeString(isolate, value).ToLocal(&text)) return;
+    info.GetReturnValue().Set(text);
+  }
+
+  /// Ends the session and releases the handle.
+  static void PostgresClose(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    Runtime* runtime = FromCallback(info);
+    if (runtime == nullptr || info.Length() == 0) return;
+    v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+    const uint64_t id =
+        static_cast<uint64_t>(info[0]->IntegerValue(context).FromMaybe(0));
+    auto found = runtime->databases_.find(id);
+    if (found == runtime->databases_.end()) return;
+    sako_postgres_delete(found->second);
+    runtime->databases_.erase(found);
+  }
+
+  void* FindDatabase(const v8::FunctionCallbackInfo<v8::Value>& info) {
+    v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+    if (info.Length() == 0) return nullptr;
+    const uint64_t id =
+        static_cast<uint64_t>(info[0]->IntegerValue(context).FromMaybe(0));
+    auto found = databases_.find(id);
+    return found == databases_.end() ? nullptr : found->second;
+  }
+
+  static v8::MaybeLocal<v8::String> MakeString(v8::Isolate* isolate,
+                                               SakoNativeBytes bytes) {
+    if (bytes.length > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return {};
+    }
+    return v8::String::NewFromUtf8(isolate,
+                                   reinterpret_cast<const char*>(bytes.data),
+                                   v8::NewStringType::kNormal,
+                                   static_cast<int>(bytes.length));
+  }
+
   static int DispatchHttp(void* context, uint64_t ticket,
                           SakoNativeBytes method,
                           SakoNativeBytes target,
@@ -5433,7 +6211,8 @@ class Runtime {
       return 1;
     }
     v8::Local<v8::Function> dispatcher =
-        runtime->http_dispatcher_.Get(isolate);
+        binding->raw ? runtime->raw_http_dispatcher_.Get(isolate)
+                     : runtime->http_dispatcher_.Get(isolate);
     auto make_string = [isolate](SakoNativeBytes bytes) {
       return v8::String::NewFromUtf8(
           isolate, reinterpret_cast<const char*>(bytes.data),
@@ -5542,6 +6321,12 @@ class Runtime {
         return 1;
       }
     }
+    // A raw dispatch that already has the answer returns it as the wire tuple,
+    // so the ordinary request costs one call into JavaScript rather than two.
+    // Anything else is a handler that answered with a promise, and needs the
+    // second call for the same reason the node-shaped path does: whether it
+    // settled during the checkpoint below is only knowable afterwards.
+    const bool answered_inline = binding->raw && result->IsArray();
     {
       std::optional<sako_perf::Span> microtask_span;
       if (sako_perf::g_enabled) {
@@ -5549,14 +6334,16 @@ class Runtime {
       }
       isolate->PerformMicrotaskCheckpoint();
     }
-    v8::Local<v8::Value> finalized;
-    {
+    v8::Local<v8::Value> finalized = result;
+    if (!answered_inline) {
       std::optional<sako_perf::Span> finalize_span;
       if (sako_perf::g_enabled) {
         finalize_span.emplace(sako_perf::kBucketHttpFinalize);
       }
-      if (!runtime->http_finalizer_.Get(isolate)
-               ->Call(js_context, v8::Undefined(isolate), 1, &result)
+      v8::Local<v8::Function> finalizer =
+          binding->raw ? runtime->raw_http_finalizer_.Get(isolate)
+                       : runtime->http_finalizer_.Get(isolate);
+      if (!finalizer->Call(js_context, v8::Undefined(isolate), 1, &result)
                .ToLocal(&finalized)) {
         runtime->async_error_ = FormatException(isolate, js_context, try_catch);
         return 1;
@@ -5681,22 +6468,34 @@ class Runtime {
   // request path then calls them without a global property lookup each time.
   bool ResolveHttpDispatchers(v8::Local<v8::Context> context) {
     if (!http_dispatcher_.IsEmpty()) return true;
-    v8::Local<v8::Value> dispatcher;
-    v8::Local<v8::Value> finalizer;
-    if (!context->Global()
-             ->Get(context, v8::String::NewFromUtf8Literal(
-                                isolate_, "__sakoDispatchHttpRequest"))
-             .ToLocal(&dispatcher) ||
-        !dispatcher->IsFunction() ||
-        !context->Global()
-             ->Get(context, v8::String::NewFromUtf8Literal(
-                                isolate_, "__sakoFinalizeHttpResponse"))
-             .ToLocal(&finalizer) ||
-        !finalizer->IsFunction()) {
-      return false;
+    struct Pair {
+      const char* name;
+      v8::Global<v8::Function>* slot;
+    };
+    v8::Global<v8::Function> dispatcher;
+    v8::Global<v8::Function> finalizer;
+    v8::Global<v8::Function> raw_dispatcher;
+    v8::Global<v8::Function> raw_finalizer;
+    const Pair pairs[] = {
+        {"__sakoDispatchHttpRequest", &dispatcher},
+        {"__sakoFinalizeHttpResponse", &finalizer},
+        {"__sakoDispatchRawHttpRequest", &raw_dispatcher},
+        {"__sakoFinalizeRawHttpResponse", &raw_finalizer},
+    };
+    for (const Pair& pair : pairs) {
+      v8::Local<v8::Value> value;
+      v8::Local<v8::String> name;
+      if (!v8::String::NewFromUtf8(isolate_, pair.name).ToLocal(&name) ||
+          !context->Global()->Get(context, name).ToLocal(&value) ||
+          !value->IsFunction()) {
+        return false;
+      }
+      pair.slot->Reset(isolate_, value.As<v8::Function>());
     }
-    http_dispatcher_.Reset(isolate_, dispatcher.As<v8::Function>());
-    http_finalizer_.Reset(isolate_, finalizer.As<v8::Function>());
+    http_dispatcher_ = std::move(dispatcher);
+    http_finalizer_ = std::move(finalizer);
+    raw_http_dispatcher_ = std::move(raw_dispatcher);
+    raw_http_finalizer_ = std::move(raw_finalizer);
     return true;
   }
 
@@ -5805,9 +6604,15 @@ class Runtime {
 
   bool DrainEventLoop(v8::Local<v8::Context> context, std::string* error) {
     while (true) {
+      // Read before draining, so activity that lands while this turn runs
+      // still counts as new when the loop decides how long to block.
+      const uint64_t child_tick = sako_child_activity_tick();
       while (v8::platform::PumpMessageLoop(platform_, isolate_)) {
         isolate_->PerformMicrotaskCheckpoint();
       }
+
+      bool handled_child = false;
+      if (!TickChildren(context, &handled_child, error)) return false;
 
       // Finalizers the last collection released, completions from async work,
       // and threadsafe calls posted by an addon's own threads.
@@ -5877,15 +6682,24 @@ class Runtime {
           std::any_of(timers_.begin(), timers_.end(), [](const auto& entry) {
             return entry.second.referenced;
           });
-      if (!referenced_timer && http_servers_.empty() && !napi_active) {
+      const bool referenced_child =
+          std::any_of(children_.begin(), children_.end(),
+                      [](const auto& entry) {
+                        return entry.second->referenced;
+                      });
+      if (!referenced_timer && http_servers_.empty() && !napi_active &&
+          !referenced_child) {
         return ReportPendingRejection(context, error);
       }
       if (timers_.empty()) {
         // Nothing ran this turn, so block rather than spin: a request landing
-        // in the completion port, or an addon posting from a worker thread,
-        // wakes the loop at once instead of waiting out a timer tick.
-        if (!handled_http && !handled_napi) {
-          if (http_servers_.empty()) {
+        // in the completion port, an addon posting from a worker thread, or a
+        // child answering on its pipe wakes the loop at once instead of
+        // waiting out a timer tick.
+        if (!handled_http && !handled_napi && !handled_child) {
+          if (!children_.empty() && http_servers_.empty() && !napi_active) {
+            sako_child_wait_activity(child_tick, kIdleHttpWaitMilliseconds);
+          } else if (http_servers_.empty()) {
             sako_napi::WaitForWork(isolate_, kIdleHttpWaitMilliseconds);
           } else {
             WaitForHttpServers(kIdleHttpWaitMilliseconds);
@@ -5909,6 +6723,14 @@ class Runtime {
           if (napi_active) {
             sako_napi::WaitForWork(isolate_,
                                    static_cast<uint32_t>(wait_milliseconds));
+          } else if (!children_.empty()) {
+            // A timer caps the wait, but a child answering on its pipe still
+            // ends it early: sleeping out the timer would hold a reply the
+            // runtime already has.
+            if (!handled_child) {
+              sako_child_wait_activity(child_tick,
+                                       static_cast<uint32_t>(wait_milliseconds));
+            }
           } else {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(wait_milliseconds));
@@ -5978,16 +6800,24 @@ class Runtime {
   std::unordered_map<std::string, v8::Global<v8::Object>> commonjs_modules_;
   std::unordered_map<int, SyntheticCommonJs> synthetic_commonjs_;
   std::unordered_map<uint64_t, std::unique_ptr<HttpBinding>> http_servers_;
+  std::unordered_map<uint64_t, std::unique_ptr<ChildBinding>> children_;
+  /// Owned PostgreSQL connections, deleted with the runtime.
+  std::unordered_map<uint64_t, void*> databases_;
   std::unordered_map<int, FileDescriptor> file_descriptors_;
   std::vector<uint64_t> closing_http_servers_;
   v8::Global<v8::Function> http_dispatcher_;
   v8::Global<v8::Function> http_finalizer_;
+  v8::Global<v8::Function> raw_http_dispatcher_;
+  v8::Global<v8::Function> raw_http_finalizer_;
+  v8::Global<v8::Function> child_dispatcher_;
   v8::Global<v8::Uint8Array> empty_bytes_;
   v8::Global<v8::Uint32Array> empty_ranges_;
   std::string async_error_;
   size_t module_source_bytes_ = 0;
   uint64_t next_timer_id_ = 1;
   uint64_t next_http_server_id_ = 1;
+  uint64_t next_child_id_ = 1;
+  uint64_t next_database_id_ = 1;
   int next_file_descriptor_ = 100;
 };
 
@@ -6036,6 +6866,15 @@ const intptr_t* Runtime::ExternalReferences() {
       reinterpret_cast<intptr_t>(&FetchSync),
       reinterpret_cast<intptr_t>(&ResolveHost),
       reinterpret_cast<intptr_t>(&SpawnSync),
+      reinterpret_cast<intptr_t>(&Runtime::ChildSpawn),
+      reinterpret_cast<intptr_t>(&Runtime::ChildWrite),
+      reinterpret_cast<intptr_t>(&Runtime::ChildEndStdin),
+      reinterpret_cast<intptr_t>(&Runtime::ChildKill),
+      reinterpret_cast<intptr_t>(&Runtime::ChildRef),
+      reinterpret_cast<intptr_t>(&Runtime::PostgresConnect),
+      reinterpret_cast<intptr_t>(&Runtime::PostgresQuery),
+      reinterpret_cast<intptr_t>(&Runtime::PostgresParameter),
+      reinterpret_cast<intptr_t>(&Runtime::PostgresClose),
       reinterpret_cast<intptr_t>(&Hash),
       // HTTP server bindings.
       reinterpret_cast<intptr_t>(&Runtime::HttpListen),
@@ -6270,6 +7109,65 @@ SakoNativeBytes sako_process_output_stderr(const void*) {
 void sako_process_output_delete(void*) {
   SAKO_SNAPSHOT_STUB(sako_process_output_delete);
 }
+void* sako_child_spawn(SakoNativeBytes, const SakoNativeBytes*, size_t,
+                       SakoNativeBytes, int, const SakoNativeBytes*, size_t,
+                       int, int, char*, size_t) {
+  SAKO_SNAPSHOT_STUB(sako_child_spawn);
+}
+uint32_t sako_child_pid(const void*) { SAKO_SNAPSHOT_STUB(sako_child_pid); }
+int sako_child_drain(const void*, SakoNativeChildEvent, void*) {
+  SAKO_SNAPSHOT_STUB(sako_child_drain);
+}
+int sako_child_write(const void*, SakoNativeBytes, char*, size_t) {
+  SAKO_SNAPSHOT_STUB(sako_child_write);
+}
+int sako_child_close_stdin(const void*) {
+  SAKO_SNAPSHOT_STUB(sako_child_close_stdin);
+}
+int sako_child_kill(const void*, int) { SAKO_SNAPSHOT_STUB(sako_child_kill); }
+void sako_child_delete(void*) { SAKO_SNAPSHOT_STUB(sako_child_delete); }
+uint64_t sako_child_activity_tick() {
+  SAKO_SNAPSHOT_STUB(sako_child_activity_tick);
+}
+uint64_t sako_child_wait_activity(uint64_t, uint32_t) {
+  SAKO_SNAPSHOT_STUB(sako_child_wait_activity);
+}
+void* sako_postgres_connect(SakoNativeBytes, char*, size_t) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_connect);
+}
+void* sako_postgres_query(void*, SakoNativeBytes, const SakoNativeBytes*,
+                          const uint8_t*, size_t, char*, size_t) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_query);
+}
+void sako_postgres_close(void*) { SAKO_SNAPSHOT_STUB(sako_postgres_close); }
+void sako_postgres_delete(void*) { SAKO_SNAPSHOT_STUB(sako_postgres_delete); }
+SakoNativeBytes sako_postgres_parameter(const void*, SakoNativeBytes) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_parameter);
+}
+size_t sako_postgres_result_column_count(const void*) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_column_count);
+}
+SakoNativeBytes sako_postgres_result_column_name(const void*, size_t) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_column_name);
+}
+uint32_t sako_postgres_result_column_type(const void*, size_t) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_column_type);
+}
+size_t sako_postgres_result_row_count(const void*) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_row_count);
+}
+SakoNativeBytes sako_postgres_result_value(const void*, size_t, size_t, int*) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_value);
+}
+SakoNativeBytes sako_postgres_result_command(const void*) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_command);
+}
+uint64_t sako_postgres_result_affected(const void*) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_affected);
+}
+void sako_postgres_result_delete(void*) {
+  SAKO_SNAPSHOT_STUB(sako_postgres_result_delete);
+}
 void* sako_fetch_sync(SakoNativeBytes, SakoNativeBytes, const SakoNativeHeader*,
                       size_t, SakoNativeBytes, char*, size_t) {
   SAKO_SNAPSHOT_STUB(sako_fetch_sync);
@@ -6328,6 +7226,7 @@ constexpr const char* kRequiredGlobals[] = {
     "__sakoBuiltins", "__sakoProcessExtras", "__sakoReadFileSync",
     "__sakoIsTty",   "__sakoWriteStandard", "__sakoCreateRequire",
     "__sakoHttpListen", "__sakoStdinRead",    "__sakoStdinSetRawMode",
+    "__sakoChildSpawn", "__sakoDispatchChildEvent",
 };
 
 // Names the snapshot must not carry. Each describes one execution rather than

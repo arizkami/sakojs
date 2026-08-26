@@ -562,38 +562,116 @@
     [Symbol.iterator]() { return this.entries(); }
   }
 
+  // Zero-length and immutable in practice: nothing can write into it, so every
+  // bodyless request and response can share the one.
+  const emptyBody = Buffer.alloc(0);
+
   const bodyBytes = (body) => {
-    if (body === undefined || body === null) return Buffer.alloc(0);
+    if (body === undefined || body === null) return emptyBody;
     if (typeof body === "string") return Buffer.from(body);
     if (body instanceof ArrayBuffer || ArrayBuffer.isView(body) || Array.isArray(body)) return Buffer.from(body);
     throw new TypeError("request body must be a string or byte array");
   };
 
+  // Whatever a Headers was built from, turned into one on demand. A thunk
+  // stands for work the caller would rather not do yet -- decoding a request's
+  // headers off the wire, when most handlers never look at them.
+  const headersFrom = (source) => {
+    if (source instanceof Headers) return source;
+    return new Headers(typeof source === "function" ? source() : source);
+  };
+
   class Request {
     constructor(input, init = {}) {
       const source = input instanceof Request ? input : null;
-      this.url = String(source ? source.url : input);
+      this._url = String(source ? source.url : input);
       this.method = String(init.method || source?.method || "GET").toUpperCase();
-      this.headers = new Headers(init.headers === undefined ? source?.headers : init.headers);
+      this._headers = undefined;
+      this._headerSource = init.headers === undefined ? source?.headers : init.headers;
       this.signal = init.signal || source?.signal || null;
       this._body = bodyBytes(init.body === undefined ? source?._body : init.body);
+      this.bodyUsed = false;
+      // Set only on a request the HTTP server made, and always present so
+      // every Request has one shape. See servedRequest.
+      this._target = undefined;
+      this._secure = false;
+      this._headerBytes = undefined;
+      this._headerRanges = undefined;
       if ((this.method === "GET" || this.method === "HEAD") && this._body.length !== 0) {
         throw new TypeError(`${this.method} request cannot have a body`);
       }
     }
-    clone() { return new Request(this); }
+    // A URL and a header map are the two things a served request pays for
+    // whether or not its handler asks: building the absolute URL means reading
+    // the Host header, and reading any header means decoding all of them. Both
+    // wait here until something actually reads them.
+    get url() {
+      if (this._url === undefined) this._url = absoluteRequestUrl(this, this._target, this._secure);
+      return this._url;
+    }
+    set url(value) { this._url = String(value); }
+    get headers() {
+      if (this._headers === undefined) {
+        this._headers = this._headerBytes === undefined
+          ? headersFrom(this._headerSource)
+          : new Headers(decodeHeaderPairs(this._headerBytes, this._headerRanges));
+      }
+      return this._headers;
+    }
+    set headers(value) { this._headers = headersFrom(value); }
+    // A server hands its handler a Request and the handler reads the body off
+    // it, so these are not optional the moment anything serves rather than
+    // fetches.
+    async arrayBuffer() {
+      if (this.bodyUsed) throw new TypeError("request body is already used");
+      this.bodyUsed = true;
+      return Uint8Array.from(this._body).buffer;
+    }
+    async bytes() {
+      if (this.bodyUsed) throw new TypeError("request body is already used");
+      this.bodyUsed = true;
+      return Uint8Array.from(this._body);
+    }
+    async text() {
+      if (this.bodyUsed) throw new TypeError("request body is already used");
+      this.bodyUsed = true;
+      return this._body.toString();
+    }
+    async json() { return JSON.parse(await this.text()); }
+    clone() {
+      if (this.bodyUsed) throw new TypeError("request body is already used");
+      return new Request(this);
+    }
   }
 
   class Response {
     constructor(body = null, init = {}) {
       this.status = Number(init.status === undefined ? 200 : init.status);
       this.statusText = String(init.statusText || "");
-      this.headers = new Headers(init.headers);
+      this._headers = undefined;
+      this._headerSource = init.headers;
       this.url = String(init.url || "");
       this.redirected = Boolean(init.redirected);
       this.type = "basic";
       this.bodyUsed = false;
-      this._body = bodyBytes(body);
+      // Kept as handed over. A string body written straight to a socket is
+      // encoded once by the native side; converting it to bytes here and back
+      // again on the way out copies it twice for nothing.
+      this._bodyInit = body;
+      this._bodyBytes = undefined;
+    }
+    get headers() {
+      if (this._headers === undefined) this._headers = headersFrom(this._headerSource);
+      return this._headers;
+    }
+    set headers(value) { this._headers = headersFrom(value); }
+    get _body() {
+      if (this._bodyBytes === undefined) this._bodyBytes = bodyBytes(this._bodyInit);
+      return this._bodyBytes;
+    }
+    set _body(value) {
+      this._bodyBytes = value;
+      this._bodyInit = value;
     }
     get ok() { return this.status >= 200 && this.status <= 299; }
     async arrayBuffer() {
@@ -605,12 +683,13 @@
     async text() {
       if (this.bodyUsed) throw new TypeError("response body is already used");
       this.bodyUsed = true;
+      if (typeof this._bodyInit === "string") return this._bodyInit;
       return this._body.toString();
     }
     async json() { return JSON.parse(await this.text()); }
     clone() {
       if (this.bodyUsed) throw new TypeError("response body is already used");
-      return new Response(this._body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected });
+      return new Response(this._bodyInit, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, redirected: this.redirected });
     }
   }
 
@@ -1947,8 +2026,14 @@
       // it to a Buffer here would copy the body an extra time per response.
       if (typeof chunk === "string" && (encoding === undefined || encoding === "utf8" || encoding === "utf-8")) {
         this._chunks.push(chunk);
+      } else if (Buffer.isBuffer(chunk)) {
+        this._chunks.push(chunk);
+      } else if (ArrayBuffer.isView(chunk) || chunk instanceof ArrayBuffer) {
+        // A plain Uint8Array is what a body built without node:buffer looks
+        // like; stringifying one would write the decimal digits of its bytes.
+        this._chunks.push(Buffer.from(chunk));
       } else {
-        this._chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding));
+        this._chunks.push(Buffer.from(String(chunk), encoding));
       }
       return true;
     }
@@ -2357,6 +2442,117 @@
     request: clientRequest("https:"),
     get: clientGet(clientRequest("https:")),
   };
+  // The event kinds __sakoDispatchChildEvent receives. Keep in sync with
+  // bridge.cc and crates/sako-v8/src/lib.rs.
+  const CHILD_STDOUT = 0;
+  const CHILD_STDERR = 1;
+  const CHILD_STDOUT_END = 2;
+  const CHILD_STDERR_END = 3;
+  const CHILD_EXITED = 4;
+  const CHILD_FAILED = 5;
+  const CHILD_STDIN_FAILED = 6;
+  const CHILD_STDIN_DRAINED = 7;
+
+  // Every live child, by the id the native side knows it as.
+  const liveChildren = new Map();
+
+  // Child output is held until something is listening for it.
+  //
+  // The base Readable emits on push and keeps nothing, which is fine for a
+  // stream whose producer is a microtask away. A child is not: it prints as
+  // soon as it starts, and whatever it said before its caller attached a
+  // handler would simply be gone.
+  class ChildReadable extends Readable {
+    constructor() {
+      super();
+      this._buffered = [];
+      this._flowing = false;
+      this._closed = false;
+    }
+    on(name, listener) {
+      const result = super.on(name, listener);
+      if (name === "data") this.resume();
+      return result;
+    }
+    resume() {
+      this._flowing = true;
+      if (this._buffered.length !== 0) {
+        const pending = this._buffered;
+        this._buffered = [];
+        for (const chunk of pending) this.emit("data", chunk);
+      }
+      if (this._closed) this._finish();
+      return this;
+    }
+    pause() { this._flowing = false; return this; }
+    push(chunk) {
+      if (chunk === null) {
+        this._closed = true;
+        if (this._flowing) this._finish();
+        return false;
+      }
+      if (this._flowing) { this.emit("data", chunk); return true; }
+      this._buffered.push(chunk);
+      return false;
+    }
+    _finish() {
+      if (this.readableEnded) return;
+      this.readable = false;
+      this.readableEnded = true;
+      this.emit("end");
+      this.emit("close");
+    }
+  }
+
+  // The child's stdin. Writes reach the child's pipe from a native thread, so
+  // a large one costs a copy rather than a stalled event loop, and a false
+  // return means what it means on any writable stream: wait for "drain".
+  class ChildStdin extends Writable {
+    constructor(id) { super(); this._childId = id; }
+    write(chunk, encoding, callback) {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (this.writableEnded) {
+        const failure = new Error("write after end");
+        queueMicrotask(() => this.emit("error", failure));
+        return false;
+      }
+      // A plain Uint8Array is what a binary protocol hands a stream --
+      // esbuild's packets arrive that way -- so it goes to the pipe as it is.
+      // Stringifying one would send the decimal digits of its bytes instead.
+      const bytes = ArrayBuffer.isView(chunk)
+        ? chunk
+        : Buffer.from(chunk instanceof ArrayBuffer ? chunk : String(chunk), encoding);
+      let room = true;
+      try {
+        room = __sakoChildWrite(this._childId, bytes);
+      } catch (failure) {
+        // A child that has already exited is the ordinary reason to land
+        // here, and Node reports that on the stream rather than throwing at
+        // whoever wrote.
+        queueMicrotask(() => this.emit("error", failure));
+        return false;
+      }
+      if (typeof callback === "function") queueMicrotask(callback);
+      return room;
+    }
+    end(chunk, encoding, callback) {
+      if (typeof chunk === "function") { callback = chunk; chunk = undefined; }
+      else if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
+      if (!this.writableEnded) {
+        this.writableEnded = true;
+        this.writable = false;
+        // A child that reads to end of input -- a compiler reading a source
+        // on stdin, sort, anything in a pipeline -- only starts working once
+        // this reaches it.
+        __sakoChildEndStdin(this._childId);
+      }
+      if (typeof callback === "function") queueMicrotask(callback);
+      this.emit("finish");
+      return this;
+    }
+  }
+
   class ChildProcess extends EventEmitter {
     constructor() {
       super();
@@ -2365,18 +2561,95 @@
       this.killed = false;
       this.exitCode = null;
       this.signalCode = null;
-      this.stdout = new Readable();
-      this.stderr = new Readable();
-      this.stdin = new Writable();
+      this.spawnfile = "";
+      this.spawnargs = [];
+      this.stdin = null;
+      this.stdout = null;
+      this.stderr = null;
+      this.stdio = [null, null, null];
+      this._id = 0;
+      this._killSignal = null;
+      this._exited = false;
+      this._openStreams = 0;
+      this._closeEmitted = false;
     }
-    kill() {
-      if (this.exitCode !== null || this.killed) return false;
-      this.killed = true;
-      return true;
+    kill(signal = "SIGTERM") {
+      if (this._id === 0 || this._exited) return false;
+      // Windows has no signal to deliver to a process that is not waiting for
+      // one, so the distinction only reaches a POSIX child: SIGKILL cannot be
+      // caught, anything else gives the child a chance to shut down.
+      const force = signal === "SIGKILL" || signal === 9;
+      const killed = __sakoChildKill(this._id, force);
+      if (killed) {
+        this.killed = true;
+        this._killSignal = typeof signal === "number" ? "SIGKILL" : String(signal);
+      }
+      return killed;
     }
-    ref() { return this; }
-    unref() { return this; }
+    ref() { if (this._id !== 0) __sakoChildRef(this._id, true); return this; }
+    unref() { if (this._id !== 0) __sakoChildRef(this._id, false); return this; }
+    // Sako has no IPC channel, so a child is never connected and there is
+    // nothing to disconnect from. Both exist so a caller that tidies up after
+    // itself does not crash.
+    disconnect() { this.connected = false; return this; }
+    send() { return false; }
+    _maybeClose() {
+      if (this._closeEmitted || !this._exited || this._openStreams !== 0) return;
+      this._closeEmitted = true;
+      liveChildren.delete(this._id);
+      this.emit("close", this.exitCode, this.signalCode);
+    }
   }
+
+  // Where one event from a live child lands. The native side calls this from
+  // the event loop, never from inside a JavaScript frame, so a handler
+  // installed right after spawn() is always in place first.
+  Object.defineProperty(globalThis, "__sakoDispatchChildEvent", {
+    value(id, kind, payload) {
+      const child = liveChildren.get(id);
+      if (child === undefined) return;
+      switch (kind) {
+        case CHILD_STDOUT:
+          if (child._inheritStdout) process.stdout.write(Buffer.from(payload));
+          else if (child.stdout !== null) child.stdout.push(Buffer.from(payload));
+          return;
+        case CHILD_STDERR:
+          if (child._inheritStderr) process.stderr.write(Buffer.from(payload));
+          else if (child.stderr !== null) child.stderr.push(Buffer.from(payload));
+          return;
+        case CHILD_STDOUT_END:
+          if (child.stdout !== null) child.stdout.push(null);
+          child._openStreams -= 1;
+          child._maybeClose();
+          return;
+        case CHILD_STDERR_END:
+          if (child.stderr !== null) child.stderr.push(null);
+          child._openStreams -= 1;
+          child._maybeClose();
+          return;
+        case CHILD_EXITED:
+          child._exited = true;
+          // A child that was killed reports the signal that ended it and no
+          // code, which is how Node tells the two apart.
+          child.exitCode = child._killSignal === null ? payload : null;
+          child.signalCode = child._killSignal;
+          child.emit("exit", child.exitCode, child.signalCode);
+          child._maybeClose();
+          return;
+        case CHILD_FAILED:
+          child.emit("error", new Error(String(payload)));
+          return;
+        case CHILD_STDIN_FAILED:
+          if (child.stdin !== null) child.stdin.emit("error", new Error(String(payload)));
+          return;
+        case CHILD_STDIN_DRAINED:
+          if (child.stdin !== null) child.stdin.emit("drain");
+          return;
+        default:
+          return;
+      }
+    },
+  });
   const childProcess = {
     ChildProcess,
     fork: unavailable("child_process.fork"),
@@ -2435,42 +2708,121 @@
     const interpreter = typeof shell === "string" ? shell : "/bin/sh";
     return { file: interpreter, args: ["-c", commandLine], verbatim };
   };
+  /// What each of the three standard streams should be, as one of "pipe",
+  /// "inherit", or "ignore". Anything else Node accepts there -- a file
+  /// descriptor, a stream, "overlapped" -- is treated as a pipe, which is the
+  /// only one of them Sako can actually provide.
+  const normalizeStdio = (options) => {
+    const requested = options && options.stdio;
+    const entry = (value) => (value === "inherit" || value === "ignore" ? value : "pipe");
+    if (Array.isArray(requested)) {
+      return [entry(requested[0]), entry(requested[1]), entry(requested[2])];
+    }
+    const shared = entry(requested);
+    return [shared, shared, shared];
+  };
+
+  /// The child's environment as the flat [name, value, ...] array the native
+  /// side reads, or undefined to inherit this process's unchanged. Node
+  /// replaces the whole environment when `env` is given rather than adding to
+  /// it, and a caller handing a script a deliberately bare one relies on that.
+  const childEnvironment = (options) => {
+    const env = options && options.env;
+    if (env === undefined || env === null) return undefined;
+    const pairs = [];
+    for (const name of Object.keys(env)) {
+      const value = env[name];
+      if (value !== undefined && value !== null) pairs.push(String(name), String(value));
+    }
+    return pairs;
+  };
+
+  // Starts a child and returns while it runs.
+  //
+  // Output arrives on child.stdout and child.stderr as the child produces it,
+  // and child.stdin reaches the child immediately -- which is what a build
+  // service, a compiler daemon, or anything else spoken to over a pipe needs.
+  // esbuild's JavaScript API starts its binary once and exchanges packets
+  // with it for the life of the build; against a spawn that waits for the
+  // child to exit first, its very first request deadlocks.
   childProcess.spawn = (file, args = [], options = {}) => {
     if (!Array.isArray(args)) { options = args || {}; args = []; }
+    options = options || {};
+    const plan = shellInvocationFor(String(file), args.map(String), options);
+    const stdio = normalizeStdio(options);
     const child = new ChildProcess();
-    queueMicrotask(() => {
-      if (child.killed) {
-        child.exitCode = 1;
-        child.emit("exit", 1, null);
-        child.emit("close", 1, null);
-        return;
-      }
-      try {
-        const result = childProcess.spawnSync(file, args, options);
-        child.exitCode = result.status;
-        if (result.stdout?.length) child.stdout.push(Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout));
-        if (result.stderr?.length) child.stderr.push(Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr));
-        child.stdout.push(null);
-        child.stderr.push(null);
-        child.emit("exit", result.status, null);
-        child.emit("close", result.status, null);
-      } catch (error) {
+    child.spawnfile = plan.file;
+    child.spawnargs = [plan.file, ...plan.args];
+
+    let binding;
+    try {
+      binding = __sakoChildSpawn(
+        plan.file,
+        plan.args,
+        options.cwd === undefined ? undefined : String(options.cwd),
+        plan.verbatim,
+        childEnvironment(options),
+        stdio[0] === "pipe",
+      );
+    } catch (error) {
+      // Node reports a child that could not start on the object it already
+      // returned, one turn later, rather than throwing at the caller.
+      queueMicrotask(() => {
         child.emit("error", error);
         child.emit("close", null, null);
-      }
-    });
+      });
+      return child;
+    }
+
+    child._id = binding[0];
+    child.pid = binding[1];
+    // Both output streams always end, whether or not the caller wanted them,
+    // so "close" waits for exactly two of them either way.
+    child._openStreams = 2;
+    child._inheritStdout = stdio[1] === "inherit";
+    child._inheritStderr = stdio[2] === "inherit";
+    if (stdio[0] === "pipe") child.stdin = new ChildStdin(child._id);
+    if (stdio[1] === "pipe") child.stdout = new ChildReadable();
+    if (stdio[2] === "pipe") child.stderr = new ChildReadable();
+    child.stdio = [child.stdin, child.stdout, child.stderr];
+    liveChildren.set(child._id, child);
+    queueMicrotask(() => child.emit("spawn"));
     return child;
   };
+
   childProcess.execFile = (file, args, options, callback) => {
     if (typeof args === "function") { callback = args; args = []; options = {}; }
     else if (!Array.isArray(args)) { callback = options; options = args || {}; args = []; }
     else if (typeof options === "function") { callback = options; options = {}; }
-    const child = childProcess.spawn(file, args, { ...(options || {}), encoding: "utf8" });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-    if (typeof callback === "function") child.once("close", (code) => callback(code === 0 ? null : new Error(`Command failed with status ${code}: ${file}`), stdout, stderr));
+    options = options || {};
+    const child = childProcess.spawn(file, args, options);
+    const encoding = options.encoding === "buffer" ? "buffer" : (options.encoding || "utf8");
+    const collected = { stdout: [], stderr: [] };
+    child.stdout?.on("data", (chunk) => collected.stdout.push(chunk));
+    child.stderr?.on("data", (chunk) => collected.stderr.push(chunk));
+    const joined = (chunks) => {
+      const bytes = Buffer.concat(chunks);
+      return encoding === "buffer" ? bytes : bytes.toString(encoding);
+    };
+    if (typeof callback === "function") {
+      let settled = false;
+      const settle = (error) => {
+        if (settled) return;
+        settled = true;
+        callback(error, joined(collected.stdout), joined(collected.stderr));
+      };
+      child.once("error", settle);
+      child.once("close", (code, signal) => {
+        if (code === 0) { settle(null); return; }
+        const failure = new Error(
+          signal === null
+            ? `Command failed with status ${code}: ${file}`
+            : `Command was killed with ${signal}: ${file}`,
+        );
+        failure.code = code === null ? signal : code;
+        settle(failure);
+      });
+    }
     return child;
   };
   // cmd.exe's /d /s /c flags have no POSIX sh equivalent (they disable
@@ -2537,6 +2889,141 @@
       return response;
     },
   });
+  // The wire form of a web Response: [status, reason, headers, body].
+  //
+  // The body is handed over as it was given. A string reaches the encoder as a
+  // string and is encoded exactly once; only a caller that built bytes pays
+  // for bytes. Headers are read straight off the object the caller passed when
+  // nothing has forced a Headers map into existence, which for a handler that
+  // writes `{ headers: { "content-type": "text/plain" } }` is every time.
+  const describeWebResponse = (response) => {
+    const pairs = [];
+    if (response._headers === undefined) {
+      const source = response._headerSource;
+      if (source !== undefined && source !== null) {
+        if (source instanceof Headers || typeof source[Symbol.iterator] === "function") {
+          for (const [name, value] of source) pairs.push(name, value);
+        } else {
+          for (const name of Object.keys(source)) pairs.push(name, String(source[name]));
+        }
+      }
+    } else {
+      for (const [name, value] of response._headers) pairs.push(name, value);
+    }
+    const body = response._bodyInit;
+    return [
+      response.status,
+      response.statusText || STATUS_CODES[response.status] || "Unknown",
+      pairs,
+      typeof body === "string" ? body : response._body,
+    ];
+  };
+
+  const plainConnection = { remoteAddress: "127.0.0.1", secure: false };
+  const secureConnection = { remoteAddress: "127.0.0.1", secure: true };
+
+  // The dispatch a `sako:http` server is called through.
+  //
+  // The node-shaped path above builds an IncomingMessage and a ServerResponse,
+  // schedules the body as events, and is asked a second time -- through
+  // __sakoFinalizeHttpResponse -- what the answer was. A handler that takes a
+  // Request and returns a Response needs none of that: this builds one Request
+  // whose URL and headers are both still unread, calls the handler, and hands
+  // the answer back as the dispatch's own return value. A handler that answers
+  // with a promise still parks the connection and replies through the ticket.
+  Object.defineProperty(globalThis, "__sakoDispatchRawHttpRequest", {
+    value(handler, method, target, headerBytes, headerRanges, requestBody, secure = false, serverId = 0, ticket = 0) {
+      const request = servedRequest(method, target, headerBytes, headerRanges, requestBody, secure);
+      const produced = handler(request, secure ? secureConnection : plainConnection);
+      if (produced instanceof Response) return describeWebResponse(produced);
+      return parkAnswer(produced, serverId, ticket);
+    },
+  });
+
+  // A handler that answered with a promise.
+  //
+  // The answer cannot simply be sent when the promise settles: the native side
+  // does not know the connection is waiting until this dispatch has returned
+  // and said so, and a response delivered before then is dropped against a
+  // ticket nobody is holding. So an answer that arrives first is kept here, and
+  // __sakoFinalizeRawHttpResponse -- which the native side calls after the
+  // microtask checkpoint -- either takes it or parks the connection properly.
+  const parkAnswer = (produced, serverId, ticket) => {
+    const pending = { answer: null, parked: false };
+    Promise.resolve(produced).then(
+      (response) => deliver(pending, response, serverId, ticket),
+      // The handler is wrapped by whoever registered it and should not reject.
+      // If one does anyway, the connection still gets an answer rather than
+      // being held open by an unhandled rejection.
+      () => deliver(pending, internalError, serverId, ticket),
+    );
+    return pending;
+  };
+
+  const internalError = new Response("Internal Server Error", { status: 500 });
+
+  const deliver = (pending, response, serverId, ticket) => {
+    const answer = describeWebResponse(response);
+    if (!pending.parked) {
+      pending.answer = answer;
+      return;
+    }
+    __sakoHttpRespond(serverId, ticket, answer[0], answer[1], answer[2], answer[3]);
+  };
+
+  Object.defineProperty(globalThis, "__sakoFinalizeRawHttpResponse", {
+    value(pending) {
+      if (pending.answer !== null) return pending.answer;
+      pending.parked = true;
+      return null;
+    },
+  });
+
+  // The Request the HTTP server hands a handler.
+  //
+  // Deliberately not built with closures over the request's bytes: a thunk per
+  // deferred field costs a context and a function object on every request, and
+  // measured against this, that was most of what separated a `sako:http`
+  // server from a `node:http` one. The pieces are stored instead, and the
+  // accessors above turn them into a URL or a header map if anything asks.
+  const servedRequest = (method, target, headerBytes, headerRanges, body, secure) => {
+    const request = new Request(EMPTY_URL, {
+      method,
+      body: body.length === 0 ? undefined : body,
+    });
+    request._url = undefined;
+    request._target = target;
+    request._secure = secure;
+    request._headerBytes = headerBytes;
+    request._headerRanges = headerRanges;
+    return request;
+  };
+
+  const EMPTY_URL = "";
+
+  // The header names and values as one flat object, decoded from the bytes the
+  // parser produced. The same shape node:http's `headers` has, built the same
+  // way, but only when a handler asks for it.
+  const decodeHeaderPairs = (bytes, ranges) => {
+    const headers = [];
+    for (let index = 0; index < ranges.length; index += 4) {
+      headers.push([
+        __sakoDecodeUtf8(bytes.subarray(ranges[index], ranges[index] + ranges[index + 1])),
+        __sakoDecodeUtf8(bytes.subarray(ranges[index + 2], ranges[index + 2] + ranges[index + 3])),
+      ]);
+    }
+    return headers;
+  };
+
+  // HTTP/1.1 sends a path and a Host header rather than a URL, and a Request
+  // needs a whole one. The Host header is what the client believes it dialled.
+  const absoluteRequestUrl = (request, target, secure) => {
+    if (target === undefined) return "";
+    if (target.startsWith("http://") || target.startsWith("https://")) return target;
+    const authority = request.headers.get("host") || "127.0.0.1";
+    return `${secure ? "https" : "http"}://${authority}${target.startsWith("/") ? target : `/${target}`}`;
+  };
+
   Object.defineProperty(globalThis, "__sakoFinalizeHttpResponse", {
     value(response) {
       // A handler that has not called end() yet is still working -- awaiting a

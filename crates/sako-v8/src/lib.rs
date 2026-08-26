@@ -12,13 +12,19 @@ use std::time::Duration;
 
 use sako_http::{HttpResponse, HttpServer, HttpServerConfig, RequestHead};
 use sako_net::resolve_host;
-use sako_process::spawn_native_with_bounded_output;
+use sako_postgres::{Connection as PostgresConnection, PostgresConfig, QueryResult};
+use sako_process::{
+    AsyncChild, AsyncSpawn, ChildEvent, activity_tick, spawn_native_with_bounded_output,
+    wait_for_activity,
+};
 use sako_typescript::{OutputModuleKind, transpile};
 
 const ERROR_BUFFER_CAPACITY: usize = 16 * 1024;
 const MAXIMUM_DNS_RESULTS: usize = 16;
 const MAXIMUM_CHILD_ARGUMENTS: usize = 256;
 const MAXIMUM_CHILD_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAXIMUM_CHILD_ENVIRONMENT_VARIABLES: usize = 512;
+const MAXIMUM_POSTGRES_PARAMETERS: usize = 4_096;
 const MAXIMUM_FETCH_HEADERS: usize = 128;
 const MAXIMUM_FETCH_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -529,6 +535,585 @@ pub unsafe extern "C" fn sako_process_output_delete(output: *mut c_void) {
         // SAFETY: ownership is returned exactly once by the native C++ owner.
         drop(unsafe { Box::from_raw(output.cast::<NativeProcessOutput>()) });
     }
+}
+
+/// How the bridge learns what a live child has said. `kind` names the event,
+/// `bytes` carries output or an error message, and `status` carries the exit
+/// code. Everything the callback receives is borrowed for that one call.
+pub type NativeChildEvent = extern "C" fn(*mut c_void, c_int, NativeBytes, c_int);
+
+const CHILD_EVENT_STDOUT: c_int = 0;
+const CHILD_EVENT_STDERR: c_int = 1;
+const CHILD_EVENT_STDOUT_END: c_int = 2;
+const CHILD_EVENT_STDERR_END: c_int = 3;
+const CHILD_EVENT_EXITED: c_int = 4;
+const CHILD_EVENT_FAILED: c_int = 5;
+const CHILD_EVENT_STDIN_FAILED: c_int = 6;
+const CHILD_EVENT_STDIN_DRAINED: c_int = 7;
+
+/// Starts a child that keeps running, with its pipes held open.
+///
+/// This is what `spawn_native_with_bounded_output` is not: nothing here waits
+/// for the child. Output arrives through `sako_child_drain` as the child
+/// produces it, and `sako_child_write` answers on stdin, which is the only
+/// shape a build service or a language server can be spoken to in.
+///
+/// # Safety
+/// All `NativeBytes` inputs must describe readable UTF-8 ranges for this call.
+/// `arguments` must point to `argument_count` initialized entries, and
+/// `environment` to `environment_count` -- names and values alternating, so
+/// the count is even. `error` follows the writable buffer contract. The
+/// returned pointer must be deleted exactly once with `sako_child_delete`.
+///
+/// A non-zero `replace_environment` makes `environment` the child's whole
+/// environment rather than a set of additions to this process's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_spawn(
+    executable: NativeBytes,
+    arguments: *const NativeBytes,
+    argument_count: usize,
+    cwd: NativeBytes,
+    verbatim_arguments: c_int,
+    environment: *const NativeBytes,
+    environment_count: usize,
+    replace_environment: c_int,
+    piped_stdin: c_int,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> *mut c_void {
+    if argument_count > MAXIMUM_CHILD_ARGUMENTS || (argument_count != 0 && arguments.is_null()) {
+        write_native_error(error, error_capacity, "child argument input is invalid");
+        return std::ptr::null_mut();
+    }
+    if !environment_count.is_multiple_of(2)
+        || environment_count > 2 * MAXIMUM_CHILD_ENVIRONMENT_VARIABLES
+        || (environment_count != 0 && environment.is_null())
+    {
+        write_native_error(error, error_capacity, "child environment input is invalid");
+        return std::ptr::null_mut();
+    }
+    let executable = match copy_utf8(executable, "child executable") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => {
+            write_native_error(error, error_capacity, "child executable is empty");
+            return std::ptr::null_mut();
+        }
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return std::ptr::null_mut();
+        }
+    };
+    let native_arguments = if argument_count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the caller promises an initialized array of argument_count entries.
+        unsafe { std::slice::from_raw_parts(arguments, argument_count) }
+    };
+    let mut values = Vec::with_capacity(native_arguments.len());
+    for argument in native_arguments {
+        match copy_utf8(*argument, "child argument") {
+            Ok(value) => values.push(value),
+            Err(cause) => {
+                write_native_error(error, error_capacity, &cause);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    let native_environment = if environment_count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the caller promises an initialized array of environment_count entries.
+        unsafe { std::slice::from_raw_parts(environment, environment_count) }
+    };
+    let mut variables = Vec::with_capacity(native_environment.len() / 2);
+    for pair in native_environment.chunks_exact(2) {
+        let name = copy_utf8(pair[0], "child environment name");
+        let value = copy_utf8(pair[1], "child environment value");
+        match (name, value) {
+            (Ok(name), Ok(value)) => variables.push((name.into(), value.into())),
+            (Err(cause), _) | (_, Err(cause)) => {
+                write_native_error(error, error_capacity, &cause);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    let cwd = match copy_utf8(cwd, "child cwd") {
+        Ok(value) => value,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return std::ptr::null_mut();
+        }
+    };
+    let child = match AsyncChild::spawn(&AsyncSpawn {
+        executable: &executable,
+        arguments: &values,
+        cwd: (!cwd.is_empty()).then(|| std::path::Path::new(&cwd)),
+        environment: &variables,
+        replace_environment: replace_environment != 0,
+        verbatim_arguments: verbatim_arguments != 0,
+        piped_stdin: piped_stdin != 0,
+    }) {
+        Ok(child) => child,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    Box::into_raw(Box::new(child)).cast()
+}
+
+/// The operating system identifier of a live child.
+///
+/// # Safety
+/// `child` must be a live pointer from `sako_child_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_pid(child: *const c_void) -> u32 {
+    // SAFETY: the caller upholds the live child pointer contract.
+    unsafe { child.cast::<AsyncChild>().as_ref() }.map_or(0, AsyncChild::pid)
+}
+
+/// Hands every event the child has queued to `callback`, oldest first, and
+/// reports how many there were.
+///
+/// # Safety
+/// `child` must be a live pointer from `sako_child_spawn`. `callback` must
+/// remain valid for this call and must not re-enter this child.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_drain(
+    child: *const c_void,
+    callback: NativeChildEvent,
+    user: *mut c_void,
+) -> c_int {
+    // SAFETY: the caller upholds the live child pointer contract.
+    let Some(child) = (unsafe { child.cast::<AsyncChild>().as_ref() }) else {
+        return -1;
+    };
+    let mut delivered: c_int = 0;
+    for event in child.drain() {
+        let empty = NativeBytes {
+            data: std::ptr::null(),
+            length: 0,
+        };
+        match &event {
+            ChildEvent::Stdout(chunk) => {
+                callback(user, CHILD_EVENT_STDOUT, native_bytes(chunk), 0);
+            }
+            ChildEvent::Stderr(chunk) => {
+                callback(user, CHILD_EVENT_STDERR, native_bytes(chunk), 0);
+            }
+            ChildEvent::StdoutEnd => callback(user, CHILD_EVENT_STDOUT_END, empty, 0),
+            ChildEvent::StderrEnd => callback(user, CHILD_EVENT_STDERR_END, empty, 0),
+            ChildEvent::Exited(status) => callback(user, CHILD_EVENT_EXITED, empty, *status),
+            ChildEvent::Failed(message) => {
+                callback(
+                    user,
+                    CHILD_EVENT_FAILED,
+                    native_bytes(message.as_bytes()),
+                    0,
+                );
+            }
+            ChildEvent::StdinFailed(message) => {
+                callback(
+                    user,
+                    CHILD_EVENT_STDIN_FAILED,
+                    native_bytes(message.as_bytes()),
+                    0,
+                );
+            }
+            ChildEvent::StdinDrained => callback(user, CHILD_EVENT_STDIN_DRAINED, empty, 0),
+        }
+        delivered = delivered.saturating_add(1);
+    }
+    delivered
+}
+
+/// Queues bytes for the child's stdin. Reports 1 when the caller may keep
+/// writing, 0 when it should wait for the queue to drain, and -1 on failure.
+///
+/// # Safety
+/// `child` must be a live pointer from `sako_child_spawn`, and `bytes` must
+/// describe a readable range for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_write(
+    child: *const c_void,
+    bytes: NativeBytes,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> c_int {
+    // SAFETY: the caller upholds the live child pointer contract.
+    let Some(child) = (unsafe { child.cast::<AsyncChild>().as_ref() }) else {
+        write_native_error(error, error_capacity, "child handle is invalid");
+        return -1;
+    };
+    let chunk = match copy_bytes(bytes, "child stdin chunk") {
+        Ok(chunk) => chunk,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return -1;
+        }
+    };
+    match child.write_stdin(&chunk) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause.to_string());
+            -1
+        }
+    }
+}
+
+/// Closes the child's stdin once everything queued has been written.
+///
+/// # Safety
+/// `child` must be a live pointer from `sako_child_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_close_stdin(child: *const c_void) -> c_int {
+    // SAFETY: the caller upholds the live child pointer contract.
+    let Some(child) = (unsafe { child.cast::<AsyncChild>().as_ref() }) else {
+        return -1;
+    };
+    child.close_stdin();
+    0
+}
+
+/// Ends the child and everything it started.
+///
+/// # Safety
+/// `child` must be a live pointer from `sako_child_spawn`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_kill(child: *const c_void, force: c_int) -> c_int {
+    // SAFETY: the caller upholds the live child pointer contract.
+    let Some(child) = (unsafe { child.cast::<AsyncChild>().as_ref() }) else {
+        return -1;
+    };
+    match child.kill(force != 0) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Deletes one child owner, ending the child if it is still running.
+///
+/// # Safety
+/// `child` must be null or a live uniquely owned pointer from
+/// `sako_child_spawn` and cannot be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_child_delete(child: *mut c_void) {
+    if !child.is_null() {
+        // SAFETY: ownership is returned exactly once by the native bridge.
+        drop(unsafe { Box::from_raw(child.cast::<AsyncChild>()) });
+    }
+}
+
+/// Opens one PostgreSQL connection from a `postgres://` URL.
+///
+/// The connection blocks: a query occupies the calling thread until the server
+/// answers, exactly as `sako_fetch_sync` does. That is a bound worth knowing
+/// about rather than a detail -- a server sharing this thread serves nobody
+/// while a query is in flight.
+///
+/// # Safety
+/// `url` must describe a readable UTF-8 range for this call, and `error`
+/// follows the writable buffer contract. The returned pointer must be deleted
+/// exactly once with `sako_postgres_delete`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_connect(
+    url: NativeBytes,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> *mut c_void {
+    let url = match copy_utf8(url, "PostgreSQL URL") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => {
+            write_native_error(error, error_capacity, "PostgreSQL URL is empty");
+            return std::ptr::null_mut();
+        }
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return std::ptr::null_mut();
+        }
+    };
+    let config = match PostgresConfig::from_url(&url) {
+        Ok(config) => config,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause.to_string());
+            return std::ptr::null_mut();
+        }
+    };
+    match PostgresConnection::connect(&config) {
+        Ok(connection) => Box::into_raw(Box::new(connection)).cast(),
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Runs one statement and reads its whole result.
+///
+/// Parameters are text, and `nulls[index]` being non-zero marks a SQL NULL --
+/// which an empty byte range cannot express on its own, an empty string being
+/// a perfectly good value.
+///
+/// # Safety
+/// `parameters` must point to `parameter_count` initialized entries and
+/// `nulls` to as many bytes. `connection` must be live. The returned pointer
+/// must be deleted exactly once with `sako_postgres_result_delete`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_query(
+    connection: *mut c_void,
+    sql: NativeBytes,
+    parameters: *const NativeBytes,
+    nulls: *const u8,
+    parameter_count: usize,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> *mut c_void {
+    // SAFETY: the caller upholds the live connection pointer contract.
+    let Some(connection) = (unsafe { connection.cast::<PostgresConnection>().as_mut() }) else {
+        write_native_error(error, error_capacity, "the connection handle is invalid");
+        return std::ptr::null_mut();
+    };
+    if parameter_count > MAXIMUM_POSTGRES_PARAMETERS
+        || (parameter_count != 0 && (parameters.is_null() || nulls.is_null()))
+    {
+        write_native_error(error, error_capacity, "query parameter input is invalid");
+        return std::ptr::null_mut();
+    }
+    let sql = match copy_utf8(sql, "SQL statement") {
+        Ok(value) => value,
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause);
+            return std::ptr::null_mut();
+        }
+    };
+    let (native_parameters, native_nulls) = if parameter_count == 0 {
+        (&[][..], &[][..])
+    } else {
+        // SAFETY: the caller promises both arrays hold parameter_count entries.
+        unsafe {
+            (
+                std::slice::from_raw_parts(parameters, parameter_count),
+                std::slice::from_raw_parts(nulls, parameter_count),
+            )
+        }
+    };
+    let mut values = Vec::with_capacity(parameter_count);
+    for (index, parameter) in native_parameters.iter().enumerate() {
+        if native_nulls[index] != 0 {
+            values.push(None);
+            continue;
+        }
+        match copy_bytes(*parameter, "query parameter") {
+            Ok(value) => values.push(Some(value)),
+            Err(cause) => {
+                write_native_error(error, error_capacity, &cause);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+    match connection.query(&sql, &values) {
+        Ok(result) => Box::into_raw(Box::new(result)).cast(),
+        Err(cause) => {
+            write_native_error(error, error_capacity, &cause.to_string());
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Ends the session tidily. The handle stays valid and every later query on it
+/// fails.
+///
+/// # Safety
+/// `connection` must be a live pointer from `sako_postgres_connect`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_close(connection: *mut c_void) {
+    // SAFETY: the caller upholds the live connection pointer contract.
+    if let Some(connection) = unsafe { connection.cast::<PostgresConnection>().as_mut() } {
+        connection.close();
+    }
+}
+
+/// Deletes one connection owner, ending the session if it is still open.
+///
+/// # Safety
+/// `connection` must be null or a live uniquely owned pointer from
+/// `sako_postgres_connect` and cannot be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_delete(connection: *mut c_void) {
+    if !connection.is_null() {
+        // SAFETY: ownership is returned exactly once by the native bridge.
+        drop(unsafe { Box::from_raw(connection.cast::<PostgresConnection>()) });
+    }
+}
+
+/// A server parameter such as `server_version`, or an empty range.
+///
+/// # Safety
+/// `connection` must be live, and `name` must describe a readable UTF-8 range.
+/// The returned range borrows the connection until its next query.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_parameter(
+    connection: *const c_void,
+    name: NativeBytes,
+) -> NativeBytes {
+    let empty = NativeBytes {
+        data: std::ptr::null(),
+        length: 0,
+    };
+    // SAFETY: the caller upholds the live connection pointer contract.
+    let Some(connection) = (unsafe { connection.cast::<PostgresConnection>().as_ref() }) else {
+        return empty;
+    };
+    let Ok(name) = copy_utf8(name, "parameter name") else {
+        return empty;
+    };
+    connection
+        .parameters()
+        .get(&name)
+        .map_or(empty, |value| native_bytes(value.as_bytes()))
+}
+
+/// # Safety
+/// `result` must be a live pointer from `sako_postgres_query`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_column_count(result: *const c_void) -> usize {
+    // SAFETY: the caller upholds the live result pointer contract.
+    unsafe { result.cast::<QueryResult>().as_ref() }.map_or(0, |result| result.columns.len())
+}
+
+/// # Safety
+/// `result` must be live and `index` within its column count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_column_name(
+    result: *const c_void,
+    index: usize,
+) -> NativeBytes {
+    // SAFETY: the caller upholds the live result pointer contract.
+    unsafe { result.cast::<QueryResult>().as_ref() }
+        .and_then(|result| result.columns.get(index))
+        .map_or(
+            NativeBytes {
+                data: std::ptr::null(),
+                length: 0,
+            },
+            |column| native_bytes(column.name.as_bytes()),
+        )
+}
+
+/// The PostgreSQL type OID of one column, so the caller can decide what the
+/// text it is about to read actually means.
+///
+/// # Safety
+/// `result` must be live and `index` within its column count.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_column_type(
+    result: *const c_void,
+    index: usize,
+) -> u32 {
+    // SAFETY: the caller upholds the live result pointer contract.
+    unsafe { result.cast::<QueryResult>().as_ref() }
+        .and_then(|result| result.columns.get(index))
+        .map_or(0, |column| column.type_oid)
+}
+
+/// # Safety
+/// `result` must be a live pointer from `sako_postgres_query`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_row_count(result: *const c_void) -> usize {
+    // SAFETY: the caller upholds the live result pointer contract.
+    unsafe { result.cast::<QueryResult>().as_ref() }.map_or(0, |result| result.rows.len())
+}
+
+/// One value, in the server's own text form. `is_null` reports a SQL NULL,
+/// which an empty range cannot be told apart from an empty string.
+///
+/// # Safety
+/// `result` must be live, the indices within range, and `is_null` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_value(
+    result: *const c_void,
+    row: usize,
+    column: usize,
+    is_null: *mut c_int,
+) -> NativeBytes {
+    let empty = NativeBytes {
+        data: std::ptr::null(),
+        length: 0,
+    };
+    if !is_null.is_null() {
+        // SAFETY: the caller promises a writable flag.
+        unsafe { *is_null = 1 };
+    }
+    // SAFETY: the caller upholds the live result pointer contract.
+    let Some(result) = (unsafe { result.cast::<QueryResult>().as_ref() }) else {
+        return empty;
+    };
+    let Some(value) = result.rows.get(row).and_then(|row| row.get(column)) else {
+        return empty;
+    };
+    match value {
+        Some(bytes) => {
+            if !is_null.is_null() {
+                // SAFETY: the caller promises a writable flag.
+                unsafe { *is_null = 0 };
+            }
+            native_bytes(bytes)
+        }
+        None => empty,
+    }
+}
+
+/// The command tag, such as `SELECT 3` or `INSERT 0 1`.
+///
+/// # Safety
+/// `result` must be a live pointer from `sako_postgres_query`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_command(result: *const c_void) -> NativeBytes {
+    // SAFETY: the caller upholds the live result pointer contract.
+    unsafe { result.cast::<QueryResult>().as_ref() }.map_or(
+        NativeBytes {
+            data: std::ptr::null(),
+            length: 0,
+        },
+        |result| native_bytes(result.command.as_bytes()),
+    )
+}
+
+/// # Safety
+/// `result` must be a live pointer from `sako_postgres_query`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_affected(result: *const c_void) -> u64 {
+    // SAFETY: the caller upholds the live result pointer contract.
+    unsafe { result.cast::<QueryResult>().as_ref() }.map_or(0, |result| result.affected_rows)
+}
+
+/// # Safety
+/// `result` must be null or a live uniquely owned pointer from
+/// `sako_postgres_query` and cannot be used after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sako_postgres_result_delete(result: *mut c_void) {
+    if !result.is_null() {
+        // SAFETY: ownership is returned exactly once by the native bridge.
+        drop(unsafe { Box::from_raw(result.cast::<QueryResult>()) });
+    }
+}
+
+/// The counter every live child bumps when it has something to say. Read it
+/// before draining, hand it back to `sako_child_wait_activity` afterwards.
+#[unsafe(no_mangle)]
+pub extern "C" fn sako_child_activity_tick() -> u64 {
+    activity_tick()
+}
+
+/// Blocks until some child's queue changes past `since`, or the timeout runs
+/// out, and reports the counter it saw.
+#[unsafe(no_mangle)]
+pub extern "C" fn sako_child_wait_activity(since: u64, timeout_milliseconds: u32) -> u64 {
+    wait_for_activity(
+        since,
+        Duration::from_millis(u64::from(timeout_milliseconds)),
+    )
 }
 
 /// Resolves a bounded set of IP addresses for the JavaScript DNS compatibility layer.

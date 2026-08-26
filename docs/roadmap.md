@@ -61,12 +61,30 @@ Phase 1 exit criterion: Sako boots the supplied V8 build on Windows x64, runs th
 
 - [x] Add an owned Windows IOCP reactor with bounded posted completions and drain tests.
 - [x] Integrate overlapped socket/file operations, cancellation, and backpressure with the IOCP reactor. (Owned file operations and completion-driven TCP receive/send retain stable handles, buffers, and `OVERLAPPED` storage; admission and retained completions are bounded, and `CancelIoEx` completions drain before release.)
-- [x] Implement filesystem and process APIs with native Windows semantics and resource ownership. (Bounded Windows path/directory/link APIs, runtime-owned descriptors, polling watchers, direct `CreateProcessW`/`STARTUPINFOEX` launch with an explicit inherited-handle list, named capture pipes, Job Object ownership, deferred ChildProcess event shapes, and lifecycle tests are implemented; native change notifications and nonblocking incremental child streams remain compatibility extensions.)
+- [x] Implement filesystem and process APIs with native Windows semantics and resource ownership. (Bounded Windows path/directory/link APIs, runtime-owned descriptors, polling watchers, direct `CreateProcessW`/`STARTUPINFOEX` launch with an explicit inherited-handle list, named capture pipes, Job Object ownership, and lifecycle tests are implemented. `spawn` now returns while the child runs: bidirectional pipes, output delivered on the turn it arrives, bounded undelivered output, kill, and ref/unref, which is what esbuild's service protocol needs. Native filesystem change notifications remain a compatibility extension.)
 - [x] Implement TCP, DNS, HTTP, HTTPS, and stream compatibility incrementally. (Completion-driven TCP, native DNS, owned HTTP/1, bounded request bodies, keep-alive/graceful close, TLS 1.2/1.3 HTTPS servers, and initial stream shapes are implemented; raw public sockets and HTTP/HTTPS clients remain compatibility extensions.)
 - [x] Build a bounded zero-copy HTTP/1 request-head parser and validated response encoder.
 - [x] Materialize request headers and bodies lazily across the Rust/V8 boundary. (The bridge transfers bounded owned byte buffers/ranges; header strings/maps and body Buffers are created only when consumed.)
 - [x] Run unmodified Express 4.21.2 through compatible Node HTTP APIs.
 - [x] Add overload/backpressure, cancellation, keep-alive, invalid-input, and resource-lifetime tests. (Tests cover retained-completion backpressure, socket receive cancellation/drain, connection overload, fragmented bodies, framing rejection, keep-alive, graceful close, Job Objects, descriptors, and isolate lifetime.)
+
+## Phase 5b: Sako libraries
+
+- [x] Establish `libs/` and the `sako:` module scheme: one TypeScript entry per library, embedded at build time, transpiled and cached on first import, with unknown specifiers reported as such rather than searched for on disk.
+- [x] Ship `sako:http`, a `Request`-in/`Response`-out server over the same native owner `node:http` uses, with `onError`, `onListen`, TLS, and a close that resolves.
+- [x] Answer inline from `sako:http` when a handler returns a `Response` rather than a promise. A raw dispatch path hands the handler a `Request` and takes the `Response` back as its own return value; the node-shaped objects, the second call into JavaScript, and the parked connection are all gone from the ordinary request. Measured against Elysia on Bun, `sako:http` went from 0.60x to about 0.72x of its throughput.
+- [x] Stop building what a handler does not read. A served `Request` defers its URL and its header map, and a `Response` keeps a string body a string all the way to the encoder rather than converting it three times.
+- [ ] Close the rest of the gap to the transport. The dispatch machinery answers about 72,000 requests a second on the benchmark host with no `Request` built at all, and `sako:http` reaches roughly 51,000-63,000 depending on the run: what remains is the `Request` and `Response` objects themselves.
+- [ ] Give `sako:http` streaming request and response bodies, which the whole-body native bridge does not yet carry.
+
+## Phase 5c: Databases
+
+- [x] Implement the PostgreSQL v3 wire protocol in Rust: startup, cleartext/`md5`/SCRAM-SHA-256 authentication with the server signature verified, and the extended query protocol so parameters are always bound.
+- [x] Ship `sako:psql` over it, with a tagged-template API, OID-driven type conversion, transactions, and bounded results.
+- [ ] Give the driver TLS. Without it a managed database -- which is most of them -- cannot be reached at all.
+- [ ] Move the driver onto the IOCP reactor. It blocks the event loop today, which is the same limitation the Fetch client has and the same fix.
+- [ ] Add connection pooling, `LISTEN`/`NOTIFY`, cursors, and prepared statement reuse.
+- [ ] Run the driver against real PostgreSQL versions in CI. The protocol is covered by a fake server today, which cannot catch a real server disagreeing with the specification.
 
 ## Phase 6: Stability, profiling, and measured acceleration
 

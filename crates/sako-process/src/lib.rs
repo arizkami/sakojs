@@ -6,6 +6,13 @@ compile_error!("sako-process currently supports only Windows and Unix-like platf
 use std::io::{self, Read};
 use std::process::ExitStatus;
 
+mod async_child;
+
+pub use async_child::{
+    AsyncChild, AsyncSpawn, ChildEvent, MAXIMUM_CHILD_BUFFERED_BYTES, activity_tick,
+    wait_for_activity,
+};
+
 #[derive(Debug)]
 pub struct BoundedOutput {
     pub status: ExitStatus,
@@ -27,6 +34,7 @@ fn read_bounded(mut stream: impl Read, maximum_bytes: usize) -> io::Result<Vec<u
 
 #[cfg(windows)]
 mod windows_impl {
+    use super::async_child::PlatformChild;
     use super::{BoundedOutput, read_bounded};
     use std::collections::BTreeMap;
     use std::env;
@@ -48,6 +56,7 @@ mod windows_impl {
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+        PIPE_ACCESS_OUTBOUND,
     };
     use windows_sys::Win32::System::Pipes::{
         CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -111,6 +120,7 @@ mod windows_impl {
             information_length: u32,
         ) -> i32;
         fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
     }
 
     pub struct ChildJob {
@@ -211,7 +221,78 @@ mod windows_impl {
         verbatim_arguments: bool,
         environment: &[(OsString, OsString)],
     ) -> io::Result<BoundedOutput> {
-        if executable.is_empty() || executable.contains('\0') || maximum_output_bytes == 0 {
+        if maximum_output_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "native child input is invalid",
+            ));
+        }
+        let launched = launch(
+            executable,
+            arguments,
+            cwd,
+            verbatim_arguments,
+            environment,
+            false,
+            false,
+        )?;
+        let LaunchedProcess {
+            process,
+            job,
+            stdin: _,
+            stdout,
+            stderr,
+        } = launched;
+
+        let stdout_thread =
+            std::thread::spawn(move || read_named_pipe_bounded(stdout, maximum_output_bytes));
+        let stderr_thread =
+            std::thread::spawn(move || read_named_pipe_bounded(stderr, maximum_output_bytes));
+        let exit_code = wait_for_exit_code(&process)?;
+        let stdout = stdout_thread
+            .join()
+            .map_err(|_| io::Error::other("child stdout reader panicked"))??;
+        let stderr = stderr_thread
+            .join()
+            .map_err(|_| io::Error::other("child stderr reader panicked"))??;
+        if stdout.len() > maximum_output_bytes || stderr.len() > maximum_output_bytes {
+            return Err(io::Error::other("child output exceeds byte limit"));
+        }
+        drop(process);
+        drop(job);
+        Ok(BoundedOutput {
+            status: ExitStatus::from_raw(exit_code as u32),
+            stdout,
+            stderr,
+        })
+    }
+
+    /// One live child, with the pipes its owner holds and the two kernel
+    /// objects that own its lifetime.
+    pub(crate) struct LaunchedProcess {
+        process: OwnedHandle,
+        job: OwnedHandle,
+        stdin: Option<std::fs::File>,
+        stdout: std::fs::File,
+        stderr: std::fs::File,
+    }
+
+    /// Starts one child and hands back everything still open on it.
+    ///
+    /// Both callers need identical process creation -- restricted handle
+    /// inheritance, a kill-on-close Job Object, named byte-mode pipes -- and
+    /// differ only in what they do next: wait for the exit, or watch the
+    /// pipes. Getting `CreateProcessW` right once is the point of the split.
+    pub(crate) fn launch(
+        executable: &str,
+        arguments: &[String],
+        cwd: Option<&Path>,
+        verbatim_arguments: bool,
+        environment: &[(OsString, OsString)],
+        replace_environment: bool,
+        piped_stdin: bool,
+    ) -> io::Result<LaunchedProcess> {
+        if executable.is_empty() || executable.contains('\0') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "native child input is invalid",
@@ -224,9 +305,14 @@ mod windows_impl {
             ));
         }
 
-        let (stdout_reader, stdout_writer) = create_named_capture_pipe("stdout")?;
-        let (stderr_reader, stderr_writer) = create_named_capture_pipe("stderr")?;
-        let stdin = open_inheritable_null_input()?;
+        let (stdout_reader, stdout_writer) = create_named_pipe_pair("stdout", true)?;
+        let (stderr_reader, stderr_writer) = create_named_pipe_pair("stderr", true)?;
+        let (stdin_writer, stdin) = if piped_stdin {
+            let (writer, child_end) = create_named_pipe_pair("stdin", false)?;
+            (Some(writer), child_end)
+        } else {
+            (None, open_inheritable_null_input()?)
+        };
         let job = create_kill_job()?;
         let inherited = [
             stdin.as_raw_handle(),
@@ -268,7 +354,7 @@ mod windows_impl {
                 "child working directory contains a null character",
             ));
         }
-        let environment_block = build_environment_block(environment)?;
+        let environment_block = build_environment_block(environment, replace_environment)?;
         let mut process_info = unsafe { std::mem::zeroed::<PROCESS_INFORMATION>() };
         // SAFETY: all pointers refer to initialized storage that remains live for
         // the synchronous call. The handle-list attribute restricts inheritance.
@@ -315,16 +401,24 @@ mod windows_impl {
             return Err(error);
         }
         drop(thread);
+        // The child owns its ends now. Holding a copy here would keep every
+        // pipe open after the child exits, and a reader waiting on a pipe
+        // nothing will ever write to never sees end of output.
         drop(stdin);
         drop(stdout_writer);
         drop(stderr_writer);
 
-        let stdout_thread = std::thread::spawn(move || {
-            read_named_pipe_bounded(stdout_reader, maximum_output_bytes)
-        });
-        let stderr_thread = std::thread::spawn(move || {
-            read_named_pipe_bounded(stderr_reader, maximum_output_bytes)
-        });
+        Ok(LaunchedProcess {
+            process,
+            job,
+            stdin: stdin_writer,
+            stdout: stdout_reader,
+            stderr: stderr_reader,
+        })
+    }
+
+    /// Blocks until `process` exits and reports the code it exited with.
+    fn wait_for_exit_code(process: &OwnedHandle) -> io::Result<i32> {
         // SAFETY: process is a live owned process handle.
         if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
             return Err(io::Error::last_os_error());
@@ -334,33 +428,77 @@ mod windows_impl {
         if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut exit_code) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let stdout = stdout_thread
-            .join()
-            .map_err(|_| io::Error::other("child stdout reader panicked"))??;
-        let stderr = stderr_thread
-            .join()
-            .map_err(|_| io::Error::other("child stderr reader panicked"))??;
-        if stdout.len() > maximum_output_bytes || stderr.len() > maximum_output_bytes {
-            return Err(io::Error::other("child output exceeds byte limit"));
-        }
-        drop(process);
-        drop(job);
-        Ok(BoundedOutput {
-            status: ExitStatus::from_raw(exit_code),
+        Ok(exit_code as i32)
+    }
+
+    /// Starts a child whose pipes stay open, for [`crate::AsyncChild`].
+    ///
+    /// Windows has no signal to send a process that is not listening for one,
+    /// so a polite kill and a forced one are the same call here: the Job
+    /// Object is terminated, which ends the child together with everything it
+    /// started.
+    pub(crate) fn launch_async(request: &crate::AsyncSpawn<'_>) -> io::Result<PlatformChild> {
+        let launched = launch(
+            request.executable,
+            request.arguments,
+            request.cwd,
+            request.verbatim_arguments,
+            request.environment,
+            request.replace_environment,
+            request.piped_stdin,
+        )?;
+        let LaunchedProcess {
+            process,
+            job,
+            stdin,
             stdout,
             stderr,
+        } = launched;
+        let pid = process_id(&process)?;
+        Ok(PlatformChild {
+            pid,
+            stdin: stdin.map(|pipe| Box::new(pipe) as Box<dyn io::Write + Send>),
+            stdout: Box::new(stdout),
+            stderr: Box::new(stderr),
+            wait: Box::new(move || wait_for_exit_code(&process)),
+            kill: Box::new(move |_force| {
+                // SAFETY: job is a live Job Object handle owned by this
+                // closure. Terminating one that has already emptied is a
+                // documented no-op.
+                if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            }),
         })
     }
 
+    fn process_id(process: &OwnedHandle) -> io::Result<u32> {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetProcessId(process: *mut c_void) -> u32;
+        }
+        // SAFETY: process is a live owned process handle.
+        let id = unsafe { GetProcessId(process.as_raw_handle()) };
+        if id == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(id)
+    }
+
     /// Builds the child's environment: everything this process has, with
-    /// `overrides` layered on top.
+    /// `overrides` layered on top, or -- when `replace` is set -- exactly
+    /// `overrides` and nothing else.
     ///
-    /// Returns `None` when there is nothing to override, so the ordinary case
-    /// still inherits directly rather than rebuilding the block. Windows
-    /// matches variable names case-insensitively and wants the block sorted,
-    /// so both are done against an upper-cased key.
-    fn build_environment_block(overrides: &[(OsString, OsString)]) -> io::Result<Option<Vec<u16>>> {
-        if overrides.is_empty() {
+    /// Returns `None` when the child should simply inherit, so the ordinary
+    /// case never rebuilds the block at all. Windows matches variable names
+    /// case-insensitively and wants the block sorted, so both are done
+    /// against an upper-cased key.
+    fn build_environment_block(
+        overrides: &[(OsString, OsString)],
+        replace: bool,
+    ) -> io::Result<Option<Vec<u16>>> {
+        if overrides.is_empty() && !replace {
             return Ok(None);
         }
         fn upper(name: &OsStr) -> Vec<u16> {
@@ -375,8 +513,10 @@ mod windows_impl {
                 .collect()
         }
         let mut variables: BTreeMap<Vec<u16>, (OsString, OsString)> = BTreeMap::new();
-        for (name, value) in env::vars_os() {
-            variables.insert(upper(&name), (name, value));
+        if !replace {
+            for (name, value) in env::vars_os() {
+                variables.insert(upper(&name), (name, value));
+            }
         }
         for (name, value) in overrides {
             variables.insert(upper(name), (name.clone(), value.clone()));
@@ -401,7 +541,14 @@ mod windows_impl {
         Ok(Some(block))
     }
 
-    fn create_named_capture_pipe(label: &str) -> io::Result<(std::fs::File, OwnedHandle)> {
+    /// Creates one uniquely named byte-mode pipe and returns both ends: this
+    /// process keeps the server side, and the inheritable client side goes to
+    /// the child. `child_writes` picks the direction -- the child's stdout and
+    /// stderr flow one way, its stdin the other.
+    fn create_named_pipe_pair(
+        label: &str,
+        child_writes: bool,
+    ) -> io::Result<(std::fs::File, OwnedHandle)> {
         let identifier = NEXT_PIPE_ID.fetch_add(1, Ordering::Relaxed);
         let name = format!(r"\\.\pipe\sako-{}-{identifier}-{label}", std::process::id())
             .encode_utf16()
@@ -411,7 +558,11 @@ mod windows_impl {
         let server = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
-                PIPE_ACCESS_INBOUND,
+                if child_writes {
+                    PIPE_ACCESS_INBOUND
+                } else {
+                    PIPE_ACCESS_OUTBOUND
+                },
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                 1,
                 4096,
@@ -424,18 +575,22 @@ mod windows_impl {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: CreateNamedPipeW returned a unique owned server HANDLE.
-        let reader = unsafe { std::fs::File::from_raw_handle(server) };
+        let ours = unsafe { std::fs::File::from_raw_handle(server) };
         let security = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: ptr::null_mut(),
             bInheritHandle: 1,
         };
         // SAFETY: the server instance and terminated name remain live. Security
-        // attributes make only this client-side writer inheritable.
-        let writer = unsafe {
+        // attributes make only this client-side handle inheritable.
+        let theirs = unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_WRITE,
+                if child_writes {
+                    GENERIC_WRITE
+                } else {
+                    GENERIC_READ
+                },
                 0,
                 &security,
                 OPEN_EXISTING,
@@ -443,11 +598,11 @@ mod windows_impl {
                 ptr::null_mut(),
             )
         };
-        if writer == INVALID_HANDLE_VALUE {
+        if theirs == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: CreateFileW returned a unique owned client HANDLE.
-        Ok((reader, unsafe { OwnedHandle::from_raw_handle(writer) }))
+        Ok((ours, unsafe { OwnedHandle::from_raw_handle(theirs) }))
     }
 
     fn open_inheritable_null_input() -> io::Result<OwnedHandle> {
@@ -732,6 +887,7 @@ mod windows_impl {
 
 #[cfg(unix)]
 mod unix_impl {
+    use super::async_child::PlatformChild;
     use super::{BoundedOutput, read_bounded};
     use std::ffi::OsString;
     use std::io;
@@ -740,6 +896,7 @@ mod unix_impl {
     use std::process::{Child, Command, ExitStatus, Stdio};
 
     const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
 
     // SAFETY contract lives at each call site: `pid` must be a process group
     // id this module created (a child spawned with `process_group(0)`).
@@ -753,10 +910,14 @@ mod unix_impl {
     /// `pid` reuse by an unrelated process between exit and this call, which
     /// Windows avoids via kernel object handles but POSIX process groups can't.
     fn kill_process_group(pid: u32) {
+        signal_process_group(pid, SIGKILL);
+    }
+
+    fn signal_process_group(pid: u32, signal: i32) {
         if let Ok(pid) = i32::try_from(pid) {
             // SAFETY: pid was produced by this module's own `Command::spawn`
             // with `process_group(0)`, so it is a valid process group leader.
-            unsafe { kill(-pid, SIGKILL) };
+            unsafe { kill(-pid, signal) };
         }
     }
 
@@ -815,6 +976,65 @@ mod unix_impl {
             command.current_dir(cwd);
         }
         ChildJob::spawn_with_bounded_output(&mut command, maximum_output_bytes)
+    }
+
+    /// Starts a child whose pipes stay open, for [`crate::AsyncChild`].
+    ///
+    /// The child leads its own process group, so a kill reaches the tools it
+    /// started as well -- a build service that forks workers leaves none of
+    /// them behind.
+    pub(crate) fn launch_async(request: &crate::AsyncSpawn<'_>) -> io::Result<PlatformChild> {
+        let mut command = Command::new(request.executable);
+        command
+            .args(request.arguments)
+            .stdin(if request.piped_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if request.replace_environment {
+            command.env_clear();
+        }
+        for (name, value) in request.environment {
+            command.env(name, value);
+        }
+        if let Some(cwd) = request.cwd {
+            command.current_dir(cwd);
+        }
+        detach_into_own_group(&mut command);
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        let stdin = child.stdin.take();
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("child stdout pipe is unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("child stderr pipe is unavailable"))?;
+        Ok(PlatformChild {
+            pid,
+            stdin: stdin.map(|pipe| Box::new(pipe) as Box<dyn io::Write + Send>),
+            stdout: Box::new(stdout),
+            stderr: Box::new(stderr),
+            wait: Box::new(move || {
+                let status = child.wait()?;
+                // A child killed by a signal has no exit code. Reporting the
+                // shell's 128 + signal convention keeps the number meaningful
+                // rather than inventing a success.
+                Ok(status.code().unwrap_or_else(|| {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    status.signal().map_or(-1, |signal| 128 + signal)
+                }))
+            }),
+            kill: Box::new(move |force| {
+                signal_process_group(pid, if force { SIGKILL } else { SIGTERM });
+                Ok(())
+            }),
+        })
     }
 
     pub struct ChildJob {
@@ -971,10 +1191,14 @@ mod unix_impl {
 }
 
 #[cfg(windows)]
+use windows_impl::launch_async;
+#[cfg(windows)]
 pub use windows_impl::{
     ChildJob, spawn_native_with_bounded_output, spawn_native_with_bounded_output_in,
 };
 
+#[cfg(all(unix, not(windows)))]
+use unix_impl::launch_async;
 #[cfg(all(unix, not(windows)))]
 pub use unix_impl::{
     ChildJob, spawn_native_with_bounded_output, spawn_native_with_bounded_output_in,

@@ -120,8 +120,10 @@ fn build_windows() {
         .join("runtime")
         .join("js")
         .join("bootstrap.js");
+    let libraries_dir = workspace_root.join("libs");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let embedder_library = out_dir.join("v8_embedder.lib");
+    let libraries_header = out_dir.join("libraries.generated.h");
     let bootstrap_header = out_dir.join("bootstrap.generated.h");
     let bootstrap_cache_header = out_dir.join("bootstrap_cache.generated.h");
     let snapshot_header = out_dir.join("snapshot.generated.h");
@@ -130,6 +132,9 @@ fn build_windows() {
 
     create_embedder_library(&v8_monolith, &embedder_library);
     generate_bootstrap_header(&bootstrap, &bootstrap_header);
+    // Before the generators: both they and the bridge library compile
+    // bridge.cc, which includes this header.
+    generate_libraries_header(&libraries_dir, &libraries_header);
     // Order matters: the code cache header is compiled into the snapshot
     // generator, and the snapshot header is compiled into the bridge library.
     build_and_run_generator_windows(
@@ -199,6 +204,7 @@ fn build_windows() {
     println!("cargo:rerun-if-changed={}", napi.display());
     println!("cargo:rerun-if-changed={}", cache_generator.display());
     println!("cargo:rerun-if-changed={}", bootstrap.display());
+    println!("cargo:rerun-if-changed={}", libraries_dir.display());
     println!("cargo:rerun-if-changed={}", v8_monolith.display());
 }
 
@@ -221,13 +227,16 @@ fn build_linux() {
         .join("runtime")
         .join("js")
         .join("bootstrap.js");
+    let libraries_dir = workspace_root.join("libs");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let libraries_header = out_dir.join("libraries.generated.h");
     let bootstrap_header = out_dir.join("bootstrap.generated.h");
     let bootstrap_cache_header = out_dir.join("bootstrap_cache.generated.h");
     let snapshot_header = out_dir.join("snapshot.generated.h");
     let cache_generator_source = manifest_dir.join("src").join("bootstrap_cache.cc");
 
     generate_bootstrap_header(&bootstrap, &bootstrap_header);
+    generate_libraries_header(&libraries_dir, &libraries_header);
     // icu_use_data_file=false in this V8 build means ICU data is compiled in,
     // so there is no icudtl.dat to require; pass it through only if present.
     let icu_data = v8_root.join("bin").join("icudtl.dat");
@@ -302,6 +311,7 @@ fn build_linux() {
         cache_generator_source.display()
     );
     println!("cargo:rerun-if-changed={}", bootstrap.display());
+    println!("cargo:rerun-if-changed={}", libraries_dir.display());
     println!(
         "cargo:rerun-if-changed={}",
         lib_dir.join("libv8_monolith.a").display()
@@ -324,6 +334,88 @@ fn generate_bootstrap_header(source_path: &Path, output_path: &Path) {
     header.push_str("  0,\n};\n");
     fs::write(output_path, header)
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", output_path.display()));
+}
+
+/// Embeds every library under `libs/` in the binary.
+///
+/// A library is one directory with a `src/index.ts` entry, reached from a
+/// program as `sako:<directory>`. The TypeScript is embedded as written and
+/// transpiled the first time something imports it, by the same parser that
+/// runs a `.ts` entry file -- so there is no second copy of that parser to
+/// build here, and a library nobody imports costs nothing at run time.
+/// `library_sources_parse` in the test suite is what keeps a library that
+/// does not parse from reaching a release.
+fn generate_libraries_header(libraries_dir: &Path, output_path: &Path) {
+    let mut names: Vec<String> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+    let mut entries: Vec<PathBuf> = Vec::new();
+    if libraries_dir.is_dir() {
+        let mut directories: Vec<PathBuf> = fs::read_dir(libraries_dir)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", libraries_dir.display()))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|error| {
+                        panic!("cannot read {}: {error}", libraries_dir.display())
+                    })
+                    .path()
+            })
+            .filter(|path| path.is_dir())
+            .collect();
+        // Sorted so the generated table is identical on every machine.
+        directories.sort();
+        for directory in directories {
+            let entry = directory.join("src").join("index.ts");
+            if !entry.is_file() {
+                continue;
+            }
+            let name = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| panic!("library name is not UTF-8: {}", directory.display()))
+                .to_owned();
+            sources.push(
+                fs::read_to_string(&entry)
+                    .unwrap_or_else(|error| panic!("cannot read {}: {error}", entry.display())),
+            );
+            names.push(name);
+            entries.push(entry);
+        }
+    }
+
+    let mut header = String::from(
+        "// Generated from libs/*/src/index.ts.\nstruct SakoLibrarySource {\n  const char* specifier;\n  const unsigned char* source;\n  size_t length;\n};\n",
+    );
+    for (index, source) in sources.iter().enumerate() {
+        header.push_str(&format!(
+            "static constexpr unsigned char kSakoLibrarySource{index}[] = {{\n"
+        ));
+        for chunk in source.as_bytes().chunks(32) {
+            header.push_str("  ");
+            for byte in chunk {
+                header.push_str(&format!("{byte},"));
+            }
+            header.push('\n');
+        }
+        header.push_str("  0,\n};\n");
+    }
+    header.push_str("static constexpr SakoLibrarySource kSakoLibraries[] = {\n");
+    for (index, (name, source)) in names.iter().zip(sources.iter()).enumerate() {
+        header.push_str(&format!(
+            "  {{\"sako:{name}\", kSakoLibrarySource{index}, {}}},\n",
+            source.len()
+        ));
+    }
+    // A zero-length array is not valid C++, so an empty libs/ still needs one
+    // entry for the lookup to skip.
+    if names.is_empty() {
+        header.push_str("  {nullptr, nullptr, 0},\n");
+    }
+    header.push_str("};\n");
+    fs::write(output_path, header)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", output_path.display()));
+    for entry in entries {
+        println!("cargo:rerun-if-changed={}", entry.display());
+    }
 }
 
 /// Compiles one build-time generator against the staged V8 and runs it.

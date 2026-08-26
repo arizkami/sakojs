@@ -1180,3 +1180,245 @@ fn reads_standard_input_and_decodes_keys() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout), "stdin-keys ok\n");
 }
+
+/// A child that answers while it is still running.
+///
+/// `spawn` used to run the child to completion under the covers and hand over
+/// its output at the end, which is fine for `git rev-parse` and useless for
+/// anything that is spoken to: esbuild's JavaScript API starts its binary once
+/// and exchanges packets with it for the life of the build, and deadlocked on
+/// its first request.
+#[test]
+fn streams_output_from_a_running_child() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("child-stream.mjs"))
+        .output()
+        .expect("sako should start");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "child-stream-ok\n");
+}
+
+/// The same exchange esbuild's service protocol performs: one child, several
+/// requests written to its stdin, each answered on its stdout while it keeps
+/// running. The child is Sako itself, so the test needs nothing installed.
+#[test]
+fn talks_to_a_long_lived_child_service() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("child-service.mjs"))
+        .output()
+        .expect("sako should start");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "child-service-ok\n"
+    );
+}
+
+/// The sako:http library: a Request in, a Response out, on the same native
+/// server node:http runs on. Driven from this process because Sako's own HTTP
+/// client blocks the loop a server would need to answer on.
+#[test]
+fn serves_http_through_the_sako_http_library() {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("sako-http.mjs"))
+        .arg(port.to_string())
+        .arg("3")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the sako:http fixture should start");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready, "http-ready\n");
+
+    let request = |bytes: &[u8]| {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(bytes).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    };
+
+    let echoed = request(
+        b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(echoed.starts_with("HTTP/1.1 200 OK\r\n"), "{echoed}");
+    assert!(echoed.contains("x-remote: 127.0.0.1"), "{echoed}");
+    assert!(echoed.ends_with("POST /echo hello"), "{echoed}");
+
+    let created = request(
+        b"POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"name\":\"sako\"}",
+    );
+    assert!(created.starts_with("HTTP/1.1 201 "), "{created}");
+    assert!(created.ends_with("{\"seen\":\"sako\"}"), "{created}");
+
+    // A handler that throws is answered by onError rather than dropping the
+    // connection.
+    let handled = request(b"GET /boom HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    assert!(handled.starts_with("HTTP/1.1 503 "), "{handled}");
+    assert!(handled.ends_with("handled"), "{handled}");
+
+    assert!(child.wait().unwrap().success());
+}
+
+/// A `sako:` specifier nothing provides has to say so, rather than being
+/// looked for on disk as though it were a package.
+#[test]
+fn reports_an_unknown_sako_library() {
+    let root = std::env::temp_dir().join(format!("sako-library-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let entry = root.join("missing.mjs");
+    std::fs::write(&entry, "import \"sako:nothing\";\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(&entry)
+        .output()
+        .expect("sako should start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("unknown Sako library"), "stderr: {stderr}");
+}
+
+/// `sako:psql` end to end, against a server that speaks the protocol back.
+///
+/// There is no PostgreSQL in this test on purpose: what is being checked is
+/// the whole path from a tagged template down to the socket and back --
+/// library, bridge, FFI, driver -- and a fake answering with exactly the bytes
+/// the protocol specifies checks it without a database to install.
+#[test]
+fn queries_postgres_through_the_sako_psql_library() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    fn message(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![tag];
+        bytes.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn column(body: &mut Vec<u8>, name: &str, oid: u32) {
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i32.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+        body.extend_from_slice(&oid.to_be_bytes());
+        body.extend_from_slice(&(-1i16).to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes());
+    }
+
+    fn row(values: &[Option<&str>]) -> Vec<u8> {
+        let mut body = (values.len() as i16).to_be_bytes().to_vec();
+        for value in values {
+            match value {
+                Some(text) => {
+                    body.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                    body.extend_from_slice(text.as_bytes());
+                }
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        message(b'D', &body)
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("the fixture connects");
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).unwrap();
+        let mut startup = vec![0; i32::from_be_bytes(length) as usize - 4];
+        stream.read_exact(&mut startup).unwrap();
+
+        let mut hello = message(b'R', &0i32.to_be_bytes());
+        let mut status = b"server_version\0".to_vec();
+        status.extend_from_slice(b"16.2\0");
+        hello.extend(message(b'S', &status));
+        hello.extend(message(b'Z', b"I"));
+        stream.write_all(&hello).unwrap();
+
+        let mut description = 6i16.to_be_bytes().to_vec();
+        column(&mut description, "id", 23);
+        column(&mut description, "name", 25);
+        column(&mut description, "live", 16);
+        column(&mut description, "score", 701);
+        column(&mut description, "payload", 114);
+        column(&mut description, "absent", 25);
+
+        // Two exchanges: the template query and the `first` call after it.
+        for _ in 0..2 {
+            // Parse, Bind, Describe, Execute, Sync.
+            for _ in 0..5 {
+                let mut header = [0u8; 5];
+                if stream.read_exact(&mut header).is_err() {
+                    return;
+                }
+                let length = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+                let mut body = vec![0; length as usize - 4];
+                stream.read_exact(&mut body).unwrap();
+            }
+            let mut answer = message(b'1', &[]);
+            answer.extend(message(b'2', &[]));
+            answer.extend(message(b'T', &description));
+            answer.extend(row(&[
+                Some("7"),
+                Some("a thing"),
+                Some("t"),
+                Some("1.5"),
+                Some("{\"ok\":true}"),
+                None,
+            ]));
+            answer.extend(row(&[
+                Some("7"),
+                Some(""),
+                Some("f"),
+                Some("1.5"),
+                Some("{\"ok\":true}"),
+                None,
+            ]));
+            answer.extend(message(b'C', b"SELECT 2\0"));
+            answer.extend(message(b'Z', b"I"));
+            stream.write_all(&answer).unwrap();
+        }
+
+        // Terminate.
+        let mut trailing = Vec::new();
+        let _ = stream.read_to_end(&mut trailing);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sako"))
+        .arg(fixture("psql-query.mjs"))
+        .arg(port.to_string())
+        .output()
+        .expect("sako should start");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "psql-ok\n");
+    let _ = server.join();
+}

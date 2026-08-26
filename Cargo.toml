@@ -7,6 +7,7 @@ members = [
     "crates/sako-net",
     "crates/sako-package",
     "crates/sako-platform",
+    "crates/sako-postgres",
     "crates/sako-process",
     "crates/sako-typescript",
     "crates/sako-v8",
