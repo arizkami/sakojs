@@ -489,8 +489,15 @@ fn take_package_options(arguments: &mut Vec<OsString>) -> Result<PackageManagerO
     // with more of it, and asking for the detail and getting no totals under
     // it reads as the flag having done nothing.
     let verbose = take_flag(arguments, "--verbose");
+    // `--production` is what people's muscle memory and older CI scripts still
+    // say; npm renamed it to `--omit=dev` and kept both working.
+    let omit_dev = take_flag(arguments, "--omit=dev")
+        | take_flag(arguments, "--production")
+        | take_flag(arguments, "--omit-dev");
     Ok(PackageManagerOptions {
         ignore_scripts: take_flag(arguments, "--ignore-scripts"),
+        omit_dev,
+        legacy_peer_deps: take_flag(arguments, "--legacy-peer-deps"),
         perf: take_flag(arguments, "--perf") || verbose,
         verbose,
         registry: take_option(arguments, "--registry")?,

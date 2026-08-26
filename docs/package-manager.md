@@ -54,7 +54,7 @@ again. The tarball store evicts its oldest archives after 50,000 files or
 Commands:
 
 ```powershell
-sako install [--ignore-scripts] [--perf] [--verbose]
+sako install [--omit=dev] [--legacy-peer-deps] [--ignore-scripts] [--perf] [--verbose]
 sako add <package[@range]> [--dev] [--ignore-scripts]
 sako remove <package>
 sako update [--ignore-scripts]
@@ -105,9 +105,41 @@ update` intentionally discards the lock and resolves current matching versions.
 
 Package lifecycle scripts run through direct `CreateProcessW`/`STARTUPINFOEX` launch of `cmd.exe` in the extracted package directory and remain untrusted code with the user's permissions. Only named-pipe standard handles are inherited, each output stream is bounded to 16 MiB, and a kill-on-close Job Object owns the process tree. `--ignore-scripts` disables `preinstall`, `install`, and `postinstall`; richer npm environment emulation is not implemented yet.
 
-A dependency named in both `dependencies` and `optionalDependencies` -- which
-is how npm's abbreviated packument describes every optional dependency -- is
-treated as optional, matching npm. Peer ranges are validated, optional
+## Dependency kinds
+
+All five of npm's sections are honoured, and which of them a package is in
+decides both whether it is installed and where it goes.
+
+`dependencies` and `optionalDependencies` behave as npm describes them. A name
+in both -- which is how npm's abbreviated packument describes *every* optional
+dependency -- is treated as optional, matching npm.
+
+`devDependencies` are installed for the root package only, never for a
+dependency: a package's own development dependencies are its business and are
+not published as part of the graph. `sako install --omit=dev` leaves them out,
+with `--production` accepted as the older spelling of the same flag. Omitting
+them also removes any that a previous full install left in the tree, so a
+production install over a development tree produces a production tree rather
+than a mixture. Because such an install describes only part of the graph, it
+never writes `sako.lock`.
+
+`peerDependencies` are installed when nothing around the package already
+provides them, which is npm's behaviour from npm 7 onward and the difference
+between `sako install react-dom` working and failing. Whether a peer is already
+provided is decided the way Node itself resolves a name: by looking at each
+enclosing `node_modules` directory in turn, nearest first, and taking the first
+one that holds the name. So a project that depends on `react` and `react-dom`
+gets one copy of React, shared; a project that pins `react@17` beside a
+`react-dom@18` that cannot use it gets `react@18` installed privately under
+`react-dom`, where only `react-dom` will find it. A peer marked optional in
+`peerDependenciesMeta` is not installed -- npm does not choose those for you,
+and nearly every React package marks `@types/react` optional. `--legacy-peer-deps`
+turns the installation off and returns to validating peers without satisfying
+them. A root package's own `peerDependencies` are installed like any other
+requirement, since nothing sits above the root to provide them.
+
+Peer ranges are still validated after the tree is planned, which is what
+catches a peer that could not be resolved at all. Optional
 dependency failures are tolerated, and global/user/project `.npmrc` files support default or scoped registries plus path-scoped Bearer, encoded Basic, and `username`/base64 `_password` credentials. Supported settings use `global .npmrc < user .npmrc < project .npmrc < npm environment < Sako environment < explicit CLI options`; package commands accept `--registry`, `--token`, and `--proxy`. Workspace arrays and `{ "packages": [...] }` forms support direct paths or one `*` segment; workspace packages are copied with file/byte limits and replayed from the lock graph. Current limitations include recursive `**` workspace globs, live workspace
 links, `NO_PROXY` matching, hoisted (flat) `node_modules` layout, `npm:` package
 aliases, imported third-party lockfiles, non-npm package sources, and full npm

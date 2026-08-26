@@ -556,6 +556,8 @@ pub struct PackageManager {
     metadata: Arc<MetadataCache>,
     workspaces: BTreeMap<String, WorkspacePackage>,
     ignore_scripts: bool,
+    omit_dev: bool,
+    legacy_peer_deps: bool,
     installed: BTreeMap<String, LockedPackage>,
     reporter: Reporter,
     profile: Arc<Profile>,
@@ -564,6 +566,13 @@ pub struct PackageManager {
 #[derive(Clone, Debug, Default)]
 pub struct PackageManagerOptions {
     pub ignore_scripts: bool,
+    /// Leave `devDependencies` out of the tree, the way `npm install
+    /// --omit=dev` does. An install that deliberately holds part of the graph
+    /// back never rewrites the lockfile.
+    pub omit_dev: bool,
+    /// Validate `peerDependencies` without installing the missing ones, which
+    /// is how Sako behaved before it installed them at all.
+    pub legacy_peer_deps: bool,
     /// Print the stage breakdown when the install finishes.
     pub perf: bool,
     /// Add the per-package detail above that breakdown.
@@ -687,6 +696,8 @@ impl PackageManager {
             metadata: Arc::new(MetadataCache::new()),
             workspaces: BTreeMap::new(),
             ignore_scripts: options.ignore_scripts,
+            omit_dev: options.omit_dev,
+            legacy_peer_deps: options.legacy_peer_deps,
             installed: BTreeMap::new(),
             reporter: Reporter::default(),
             profile,
@@ -712,6 +723,8 @@ impl PackageManager {
             metadata: Arc::new(MetadataCache::new()),
             workspaces: BTreeMap::new(),
             ignore_scripts: true,
+            omit_dev: false,
+            legacy_peer_deps: false,
             installed: BTreeMap::new(),
             reporter: Reporter::default(),
             profile,
@@ -759,7 +772,18 @@ impl PackageManager {
         validate_sako_engine("root package", &root_engines)?;
         self.workspaces = discover_workspaces(&self.root, &manifest)?;
         let mut dependencies = manifest_dependencies(&manifest, "dependencies")?;
-        for (name, requirement) in manifest_dependencies(&manifest, "devDependencies")? {
+        // `dependencies` wins a name declared twice, which is npm's rule and
+        // the reason each of these is `or_insert` rather than `insert`.
+        if !self.omit_dev {
+            for (name, requirement) in manifest_dependencies(&manifest, "devDependencies")? {
+                dependencies.entry(name).or_insert(requirement);
+            }
+        }
+        // A root package's own peers are its to satisfy: nothing sits above it
+        // to provide them, so they are installed like any other requirement.
+        // Below the root they are handled by the planner, which can see what
+        // the surrounding directories already provide.
+        for (name, requirement) in manifest_dependencies(&manifest, "peerDependencies")? {
             dependencies.entry(name).or_insert(requirement);
         }
         for name in self.workspaces.keys() {
@@ -768,6 +792,10 @@ impl PackageManager {
                 .or_insert_with(|| "workspace:*".into());
         }
         let optional_dependencies = manifest_dependencies(&manifest, "optionalDependencies")?;
+        // Before installing, not after: whatever is pruned here would otherwise
+        // still be on disk when `.bin` is written, and its shims would be
+        // rewritten for a package that is on its way out.
+        self.prune_omitted(&manifest, &dependencies, &optional_dependencies)?;
 
         if self.install_from_lock(&dependencies, &optional_dependencies)? {
             self.report(ProgressEvent::Finished {
@@ -777,10 +805,54 @@ impl PackageManager {
         }
 
         install::install(self, &dependencies, &optional_dependencies)?;
-        self.write_lockfile()?;
+        // A partial install describes part of the graph, and writing that over
+        // the lockfile would delete every development dependency from it.
+        if !self.omit_dev {
+            self.write_lockfile()?;
+        }
         self.report(ProgressEvent::Finished {
             installed: self.installed.len(),
         });
+        Ok(())
+    }
+
+    /// Removes packages the manifest declares but this install is not going to
+    /// place at the top of the tree.
+    ///
+    /// Which in practice means `--omit=dev`: without this, a production install
+    /// over a tree that a full install had already built would plan the smaller
+    /// graph, materialize it, and leave every development dependency sitting
+    /// exactly where it was -- a "production" `node_modules` with the whole
+    /// toolchain still in it.
+    ///
+    /// Only names the manifest itself mentions are considered. A directory this
+    /// project never declared belongs to whoever put it there.
+    fn prune_omitted(
+        &self,
+        manifest: &serde_json::Value,
+        dependencies: &BTreeMap<String, String>,
+        optional_dependencies: &BTreeMap<String, String>,
+    ) -> Result<(), PackageError> {
+        let node_modules = self.root.join("node_modules");
+        if !node_modules.is_dir() {
+            return Ok(());
+        }
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ] {
+            for name in manifest_dependencies(manifest, section)?.keys() {
+                if dependencies.contains_key(name) || optional_dependencies.contains_key(name) {
+                    continue;
+                }
+                let installed = package_install_path(&node_modules, name)?;
+                if installed.is_dir() {
+                    fs::remove_dir_all(&installed)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -896,8 +968,10 @@ impl PackageManager {
         )?;
         // Keys, because LockedPackage carries no equality and the question is
         // only which packages the tree actually holds. Both maps are ordered,
-        // so this compares the sets.
-        if self.installed.keys().ne(lockfile.packages.keys()) {
+        // so this compares the sets. Skipped when development dependencies
+        // were held back on purpose: the lockfile is meant to describe the
+        // whole graph, and this tree is deliberately not the whole graph.
+        if !self.omit_dev && self.installed.keys().ne(lockfile.packages.keys()) {
             self.write_lockfile()?;
         }
         Ok(true)

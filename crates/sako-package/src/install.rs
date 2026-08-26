@@ -36,8 +36,8 @@ use crate::{
     Checksum, HOST_CPU, HOST_OS, LockedPackage, Lockfile, MAXIMUM_PACKAGES, PackageError,
     PackageManager, PackageVersion, ProgressEvent, WorkspacePackage, copy_workspace,
     installed_scripts, link_binaries, lock_has_ancestor_dependency, package_install_path,
-    run_lifecycle_scripts, validate_package_name, validate_peer_dependencies,
-    validate_sako_engine, workspace_requirement_matches,
+    requirement_matches, run_lifecycle_scripts, validate_package_name,
+    validate_peer_dependencies, validate_sako_engine, workspace_requirement_matches,
 };
 
 /// Where one tree position gets its contents from.
@@ -275,6 +275,10 @@ struct Building {
     /// Identities on the path from the root to here, so a dependency cycle
     /// stops instead of nesting `node_modules` for ever.
     active: HashSet<String>,
+    /// Positions already planned. A tree position is one directory, so
+    /// planning one twice is never meaningful -- and two workers filling one
+    /// directory at once is a race rather than a duplicate.
+    planned: HashSet<String>,
 }
 
 impl Building {
@@ -286,7 +290,13 @@ impl Building {
             bin_directories: BTreeSet::new(),
             warnings: Vec::new(),
             active: HashSet::new(),
+            planned: HashSet::new(),
         }
+    }
+
+    /// Claims a position, reporting whether it was free.
+    fn claim(&mut self, lock_path: &str) -> bool {
+        self.planned.insert(lock_path.to_owned())
     }
 
     fn finish(self, from_lock: bool) -> Plan {
@@ -309,7 +319,13 @@ impl Building {
     }
 
     /// Removes the positions an optional edge planned before it failed.
+    ///
+    /// Their claims go back too, or a later edge reaching the same position
+    /// would find it taken by a node that no longer exists.
     fn rewind(&mut self, to: usize) {
+        for node in &self.nodes[to..] {
+            self.planned.remove(&node.lock_path);
+        }
         self.nodes.truncate(to);
         self.finish_order.retain(|index| *index < to);
     }
@@ -319,6 +335,17 @@ struct Planner<'a> {
     manager: &'a PackageManager,
     graph: &'a Graph,
     state: Building,
+    /// What each open directory will contain, innermost last.
+    ///
+    /// This is how a peer dependency is answered without guessing. Node
+    /// resolves a name by walking `node_modules` directories outward from the
+    /// package doing the requiring, so deciding whether a peer is already
+    /// satisfied means asking the same directories in the same order. Built
+    /// from what a directory *will* hold rather than what has been planned so
+    /// far, because a package's peer is frequently a sibling that sorts after
+    /// it, and a peer answered by "not planned yet" would install a second
+    /// private copy of something already on its way.
+    scopes: Vec<BTreeMap<String, String>>,
 }
 
 impl<'a> Planner<'a> {
@@ -327,6 +354,7 @@ impl<'a> Planner<'a> {
             manager,
             graph,
             state: Building::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -354,6 +382,105 @@ impl<'a> Planner<'a> {
     /// the one that gets a directory, and it decides which failure a user is
     /// shown first.
     fn expand(
+        &mut self,
+        node_modules: &Path,
+        lock_prefix: &str,
+        dependencies: &BTreeMap<String, String>,
+        optional_dependencies: &BTreeMap<String, String>,
+        group: Option<u32>,
+    ) -> Result<(), PackageError> {
+        self.scopes
+            .push(self.scope_of(dependencies, optional_dependencies));
+        let outcome = self.expand_scoped(
+            node_modules,
+            lock_prefix,
+            dependencies,
+            optional_dependencies,
+            group,
+        );
+        self.scopes.pop();
+        outcome
+    }
+
+    /// Everything this directory will hold, by name and resolved version.
+    ///
+    /// Resolution here is a lookup in a map the resolver already filled, not a
+    /// request, so knowing a directory's contents before planning it costs
+    /// nothing.
+    fn scope_of(
+        &self,
+        dependencies: &BTreeMap<String, String>,
+        optional_dependencies: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut scope = BTreeMap::new();
+        let required = required_only(dependencies, optional_dependencies);
+        for (name, requirement) in required.chain(optional_dependencies.iter()) {
+            if let Some(workspace) = self.manager.workspaces.get(name)
+                && workspace_requirement_matches(&workspace.version, requirement)
+            {
+                scope.insert(name.clone(), workspace.version.clone());
+                continue;
+            }
+            // An optional dependency built for another platform is not going to
+            // be here, so it cannot answer anything either.
+            if let Ok(package) = self.graph.select(&self.manager.registry, name, requirement)
+                && package.supports_host()
+            {
+                scope.insert(name.clone(), package.version.clone());
+            }
+        }
+        scope
+    }
+
+    /// A package's required children: what it depends on, plus the peers
+    /// nothing around it provides.
+    ///
+    /// npm stopped making people install peer dependencies by hand in npm 7,
+    /// and a package manager that does not follow suit simply cannot install
+    /// `react-dom`. The copy goes inside the package that needs it, which is
+    /// the first place Node looks and the only placement that cannot disturb a
+    /// sibling that wanted a different version.
+    fn children_of(&self, package: &PackageVersion) -> BTreeMap<String, String> {
+        let mut children = package.dependencies.clone();
+        if self.manager.legacy_peer_deps {
+            return children;
+        }
+        for (peer, requirement) in &package.peer_dependencies {
+            if children.contains_key(peer) || package.optional_dependencies.contains_key(peer) {
+                continue;
+            }
+            if satisfied_in_scope(&self.scopes, peer, requirement) {
+                continue;
+            }
+            // An optional peer is one the package works without, and npm
+            // leaves it out rather than choosing it for you. It matters more
+            // than it sounds: nearly every React library marks `@types/react`
+            // optional, and installing those would add a types package under
+            // half the tree for the benefit of nobody who is not compiling
+            // TypeScript against it.
+            if package
+                .peer_dependencies_meta
+                .get(peer)
+                .is_some_and(|metadata| metadata.optional)
+            {
+                continue;
+            }
+            // A peer that cannot be resolved or cannot run here is left out
+            // rather than forced in: `validate_peer_dependencies` then says
+            // which package wanted what, which is the more useful failure than
+            // one about a version range nobody wrote.
+            let Ok(resolved) = self.graph.select(&self.manager.registry, peer, requirement) else {
+                continue;
+            };
+            if !resolved.supports_host() {
+                continue;
+            }
+            children.insert(peer.clone(), requirement.clone());
+        }
+        children
+    }
+
+    fn expand_scoped(
         &mut self,
         node_modules: &Path,
         lock_prefix: &str,
@@ -400,6 +527,9 @@ impl<'a> Planner<'a> {
             return Err(PackageError("package graph capacity exceeded".into()));
         }
         validate_package_name(name)?;
+        if !self.state.claim(lock_path) {
+            return Ok(());
+        }
 
         if let Some(workspace) = self.manager.workspaces.get(name) {
             if workspace_requirement_matches(&workspace.version, requirement) {
@@ -456,7 +586,7 @@ impl<'a> Planner<'a> {
         let outcome = self.expand(
             &children_root,
             lock_path,
-            &package.dependencies,
+            &self.children_of(&package),
             &package.optional_dependencies,
             group,
         );
@@ -569,6 +699,9 @@ impl<'a> Replayer<'a> {
         node_modules: &Path,
         group: Option<u32>,
     ) -> Result<(), PackageError> {
+        if !self.state.claim(lock_path) {
+            return Ok(());
+        }
         let package = self.lockfile.packages.get(lock_path).ok_or_else(|| {
             PackageError(format!("lockfile is missing dependency entry {lock_path}"))
         })?;
@@ -648,6 +781,16 @@ impl<'a> Replayer<'a> {
                 )));
             }
         }
+        // A peer the resolving install had to provide is recorded as an entry
+        // under the package that needed it, not in its `dependencies`. Without
+        // this the replay would leave it out, decide the tree no longer matched
+        // the lockfile, and rewrite the lockfile to say so.
+        for dependency in package.peer_dependencies.keys() {
+            let child_path = format!("{lock_path}/node_modules/{dependency}");
+            if self.lockfile.packages.contains_key(&child_path) {
+                self.plan_one(&child_path, children_root, group)?;
+            }
+        }
         for dependency in package.optional_dependencies.keys() {
             let child_path = format!("{lock_path}/node_modules/{dependency}");
             if !self.lockfile.packages.contains_key(&child_path) {
@@ -688,6 +831,29 @@ fn required_only<'a>(
     dependencies
         .iter()
         .filter(move |(name, _)| !optional.contains_key(name.as_str()))
+}
+
+/// Whether a package sitting in the innermost open directory would already
+/// resolve `name` to something matching `requirement`.
+///
+/// `scopes` is one entry per open `node_modules` directory, outermost first,
+/// which is the reverse of the order Node searches them -- hence the `rev`.
+///
+/// The first directory holding the name at all decides the answer, match or
+/// not. That is not a shortcut: a nearer copy shadows a further one, so an
+/// ancestor with a satisfying version is irrelevant once something closer has
+/// claimed the name, and reporting it as satisfied would leave the package
+/// resolving to the wrong version at runtime.
+fn satisfied_in_scope(
+    scopes: &[BTreeMap<String, String>],
+    name: &str,
+    requirement: &str,
+) -> bool {
+    scopes
+        .iter()
+        .rev()
+        .find_map(|scope| scope.get(name))
+        .is_some_and(|version| requirement_matches(version, requirement))
 }
 
 fn child_lock_path(prefix: &str, name: &str) -> String {
@@ -1056,6 +1222,52 @@ mod tests {
             depth_of("node_modules/a/node_modules/b/node_modules/c"),
             2
         );
+    }
+
+    fn scope(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, version)| ((*name).to_owned(), (*version).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_peer_the_surrounding_tree_provides_is_not_installed_again() {
+        let scopes = vec![scope(&[("react", "18.3.1"), ("react-dom", "18.3.1")])];
+        assert!(satisfied_in_scope(&scopes, "react", "^18.3.1"));
+    }
+
+    #[test]
+    fn a_peer_nothing_provides_is_not_satisfied() {
+        let scopes = vec![scope(&[("react-dom", "18.3.1")])];
+        assert!(!satisfied_in_scope(&scopes, "react", "^18.3.1"));
+    }
+
+    #[test]
+    fn the_nearest_copy_decides_even_when_a_further_one_would_have_matched() {
+        // Root has a version that matches; the directory in between has one
+        // that does not. Node finds the near one, so the peer is unsatisfied
+        // and needs its own copy -- answering "yes" here is how a package ends
+        // up loading a version it declared it could not use.
+        let scopes = vec![
+            scope(&[("react", "18.3.1")]),
+            scope(&[("react", "17.0.2")]),
+        ];
+        assert!(!satisfied_in_scope(&scopes, "react", "^18.0.0"));
+    }
+
+    #[test]
+    fn an_outer_directory_answers_when_no_nearer_one_claims_the_name() {
+        let scopes = vec![
+            scope(&[("react", "18.3.1")]),
+            scope(&[("scheduler", "0.23.2")]),
+        ];
+        assert!(satisfied_in_scope(&scopes, "react", "^18.0.0"));
+    }
+
+    #[test]
+    fn nothing_is_satisfied_by_an_empty_tree() {
+        assert!(!satisfied_in_scope(&[], "react", "^18.0.0"));
     }
 
     #[test]

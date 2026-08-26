@@ -170,18 +170,27 @@ pub fn resolve_graph(
             // metadata of every Linux and macOS package below every native
             // binary it was never going to use.
             Ok(package) => package.supports_host().then(|| {
-                // Both maps, because a name in `optionalDependencies` still has
-                // to be resolved -- that is how the tree walk finds out whether
-                // it is a build for this platform. Deduplicated, because the
-                // abbreviated packument lists optional dependencies in both and
-                // they are the same question asked twice.
+                // All three maps, deduplicated into one set of questions.
+                //
+                // `optionalDependencies` because resolving one is how the tree
+                // walk finds out whether it is a build for this platform, and
+                // the abbreviated packument repeats each of them inside
+                // `dependencies` anyway. `peerDependencies` because a peer
+                // nothing else provides gets installed, so it needs a version
+                // chosen for it -- and the planner cannot ask for one later
+                // without a network round trip in the middle of a stage that
+                // is supposed to have none.
                 let mut children: BTreeMap<String, String> = package.dependencies.clone();
-                children.extend(
-                    package
-                        .optional_dependencies
-                        .iter()
-                        .map(|(name, requirement)| (name.clone(), requirement.clone())),
-                );
+                for source in [
+                    &package.optional_dependencies,
+                    &package.peer_dependencies,
+                ] {
+                    children.extend(
+                        source
+                            .iter()
+                            .map(|(name, requirement)| (name.clone(), requirement.clone())),
+                    );
+                }
                 children.into_iter().collect::<Vec<_>>()
             }),
             Err(_) => None,
