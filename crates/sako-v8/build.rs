@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+include!("build/linux_link.rs");
+
 const REQUIRED_V8_MAJOR: &str = "15";
 const MALLOC_SHIM_MEMBER: &str = "obj/third_party/partition_alloc/src/partition_alloc/allocator_shim/allocator_shim_win_static.obj";
 
@@ -101,7 +103,8 @@ fn build_linux() {
     let workspace_root = manifest_dir
         .ancestors()
         .nth(2)
-        .expect("sako-v8 must be two levels below the workspace root");
+        .expect("sako-v8 must be two levels below the workspace root")
+        .to_path_buf();
     let v8_root = v8_root();
 
     validate_v8(&v8_root, "libv8_monolith.a", false);
@@ -118,6 +121,35 @@ fn build_linux() {
     let bootstrap_cache_header = out_dir.join("bootstrap_cache.generated.h");
     let cache_generator_source = manifest_dir.join("src").join("bootstrap_cache.cc");
 
+    let libcxx = libcxx_root(&workspace_root);
+    validate_libcxx(&libcxx);
+    let libcxx_include = libcxx.join("include").join("c++").join("v1");
+    let libcxx_lib = libcxx.join("lib");
+
+    // `.deps/v8/lib/libv8_libbase.a` and `libv8_libplatform.a` are thin
+    // archives whose members reference object files that were never staged
+    // (see docs/v8-linkage.md); `libv8_monolith.a` alone already contains
+    // everything they would provide, so only that one is linked.
+    //
+    // `string.cpp.o` is extracted from our libc++.a and force-included as a
+    // plain object alongside the normal `-lc++` archive link: `lld` fails to
+    // resolve four `basic_string<char>` members V8 needs
+    // (`__assign_external`, `__erase_external_with_move`,
+    // `__init_copy_ctor_external`) purely from the archive, even though `nm`
+    // proves the symbols are there — a reproducible `lld` archive-vs-archive
+    // resolution quirk, not an ABI mismatch. See docs/v8-linkage.md.
+    let force_string_o = force_libcxx_string_object(&libcxx_lib, &out_dir);
+
+    // V8 15's Temporal support calls into `temporal_capi` (a Rust crate)
+    // unconditionally from every isolate, but `.deps/v8` doesn't vendor it.
+    // `sako-temporal-bridge` compiles it; the actual machine code has to be
+    // pulled out of that crate's (and its dependencies') `.rlib` object
+    // files here, the same way any other archive member is pulled in by an
+    // unresolved symbol — seeing `sako-temporal-bridge` as a normal Cargo
+    // dependency is not enough on its own. See docs/v8-linkage.md.
+    let mut temporal_objects = temporal_bridge_objects(&out_dir);
+    temporal_objects.extend(sysroot_objects(&out_dir));
+
     generate_bootstrap_header(&bootstrap, &bootstrap_header);
     // icu_use_data_file=false in this V8 build means ICU data is compiled in,
     // so there is no icudtl.dat to require; pass it through only if present.
@@ -126,44 +158,75 @@ fn build_linux() {
     generate_bootstrap_cache_linux(
         &cache_generator_source,
         &include_dir,
+        &libcxx_include,
+        &libcxx_lib,
         &lib_dir,
+        &force_string_o,
+        &temporal_objects,
         &out_dir,
         icu_data,
         &bootstrap_cache_header,
     );
 
     // This V8 build was compiled with Chromium's custom libc++
-    // (use_custom_libcxx=true), which renames std:: types into an internal
-    // `std::__Cr` inline namespace. Any V8 API whose signature carries a
-    // std:: type (e.g. NewDefaultPlatform's `std::unique_ptr<TracingController>`
-    // parameter) exports its symbol under that renamed namespace, so linking
-    // against it from a normal system-libstdc++ build fails with an undefined
-    // reference. Compiling with libc++ and the same `_LIBCPP_ABI_NAMESPACE`
-    // upstream libc++ added specifically for this Chromium interop case makes
-    // our own std:: types mangle identically, without needing Chromium's own
-    // compiled libc++ archive (unique_ptr's operations are header-only).
+    // (use_custom_libcxx=true, ABI namespace `__Cr`, ABI version 2), which
+    // renames and relayouts std:: types relative to upstream libc++. Rather
+    // than fighting the system libc++'s headers into that ABI at compile
+    // time, `libcxx` above points at a libc++ we build once from upstream
+    // LLVM with `-DLIBCXX_ABI_NAMESPACE=__Cr -DLIBCXX_ABI_VERSION=2`, which
+    // is enough to match this V8 build exactly. See docs/v8-linkage.md.
     cc::Build::new()
         .cpp(true)
         .compiler("clang++")
         .std("c++20")
-        .flag("-stdlib=libc++")
-        .define("_LIBCPP_ABI_NAMESPACE", "Cr")
+        .flag("-nostdinc++")
+        .flag(format!("-isystem{}", libcxx_include.display()))
         .include(&include_dir)
         .include(&out_dir)
         .file(&bridge)
         .define("V8_COMPRESS_POINTERS", None)
+        .define("V8_ENABLE_SANDBOX", None)
         .warnings(true)
         .compile("sako_v8_bridge");
 
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    for library in ["v8_monolith", "v8_libbase", "v8_libplatform"] {
-        println!("cargo:rustc-link-lib=static={library}");
+    // `cargo:rustc-link-arg` only applies to targets built *within this
+    // package* — it does not propagate to a downstream binary that merely
+    // depends on sako-v8 (unlike `cargo:rustc-link-lib`/`-search`, this was
+    // confirmed empirically: emitting these here never reached sako-cli's
+    // actual link line, even though Cargo faithfully recorded them). So
+    // these directives are still needed here, for sako-v8's *own*
+    // integration tests/examples (which are "within this package" and do
+    // get them) — but `sako-cli` additionally duplicates this whole
+    // sequence in its own build script (via `build/linux_link.rs`) for the
+    // real, final `sako` binary. See docs/v8-linkage.md. `cargo:root` is
+    // how that build script finds the `sako_v8_bridge` static library this
+    // one produces, per the usual convention for a `links`-owning build
+    // script exposing its `OUT_DIR`.
+    println!("cargo:root={}", out_dir.display());
+    println!("cargo:rustc-link-arg=-fuse-ld=lld");
+    println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
+    println!("cargo:rustc-link-arg=-Wl,--start-group");
+    println!("cargo:rustc-link-arg=-L{}", lib_dir.display());
+    println!("cargo:rustc-link-arg=-lv8_monolith");
+    println!("cargo:rustc-link-arg={}", force_string_o.display());
+    for object in &temporal_objects {
+        println!("cargo:rustc-link-arg={}", object.display());
     }
-    for library in ["c++", "c++abi", "dl", "pthread", "m", "rt"] {
+    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    // Statically link our libc++ so the binary can't pick up the system
+    // libc++.so (a different, incompatible ABI) at load time instead.
+    println!("cargo:rustc-link-arg=-Wl,-Bstatic");
+    println!("cargo:rustc-link-arg=-L{}", libcxx_lib.display());
+    for library in ["-lc++", "-lc++abi", "-lunwind"] {
+        println!("cargo:rustc-link-arg={library}");
+    }
+    println!("cargo:rustc-link-arg=-Wl,-Bdynamic");
+    for library in ["dl", "pthread", "m", "rt"] {
         println!("cargo:rustc-link-lib={library}");
     }
     println!("cargo:rustc-env=SAKO_V8_ROOT={}", v8_root.display());
     println!("cargo:rerun-if-env-changed=SAKO_V8_ROOT");
+    println!("cargo:rerun-if-env-changed=SAKO_LIBCXX_ROOT");
     println!("cargo:rerun-if-changed={}", bridge.display());
     println!("cargo:rerun-if-changed={}", cache_generator_source.display());
     println!("cargo:rerun-if-changed={}", bootstrap.display());
@@ -256,7 +319,11 @@ fn generate_bootstrap_cache_windows(
 fn generate_bootstrap_cache_linux(
     source: &Path,
     include_dir: &Path,
+    libcxx_include: &Path,
+    libcxx_lib: &Path,
     lib_dir: &Path,
+    force_string_o: &Path,
+    temporal_objects: &[PathBuf],
     out_dir: &Path,
     icu_data: Option<&Path>,
     output_header: &Path,
@@ -267,19 +334,27 @@ fn generate_bootstrap_cache_linux(
     command
         .arg("-std=c++20")
         .arg("-O2")
-        .arg("-stdlib=libc++")
-        .arg("-D_LIBCPP_ABI_NAMESPACE=Cr")
+        .arg("-fuse-ld=lld")
+        .arg("-nostdinc++")
+        .arg(format!("-isystem{}", libcxx_include.display()))
         .arg("-DV8_COMPRESS_POINTERS")
+        .arg("-DV8_ENABLE_SANDBOX")
         .arg(format!("-I{}", include_dir.display()))
         .arg(format!("-I{}", out_dir.display()))
         .arg(source)
         .arg("-o")
         .arg(&generator)
+        .arg("-Wl,--start-group")
         .arg(format!("-L{}", lib_dir.display()))
         .arg("-lv8_monolith")
-        .arg("-lv8_libbase")
-        .arg("-lv8_libplatform")
-        .args(["-lc++", "-lc++abi", "-ldl", "-lpthread", "-lm", "-lrt"]);
+        .arg(force_string_o)
+        .args(temporal_objects)
+        .arg("-Wl,--end-group")
+        .arg("-Wl,-Bstatic")
+        .arg(format!("-L{}", libcxx_lib.display()))
+        .args(["-lc++", "-lc++abi", "-lunwind"])
+        .arg("-Wl,-Bdynamic")
+        .args(["-ldl", "-lpthread", "-lm", "-lrt"]);
     let status = command
         .status()
         .unwrap_or_else(|error| panic!("failed to start the C++ compiler: {error}"));

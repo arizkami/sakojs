@@ -8,6 +8,7 @@ members = [
     "crates/sako-package",
     "crates/sako-platform",
     "crates/sako-process",
+    "crates/sako-temporal-bridge",
     "crates/sako-typescript",
     "crates/sako-v8",
 ]

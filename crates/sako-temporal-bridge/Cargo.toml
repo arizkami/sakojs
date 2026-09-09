@@ -1,0 +1,19 @@
+[package]
+name = "sako-temporal-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "sako_temporal_bridge"
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+# This crate has no tests of its own (it exists purely to be pulled apart
+# for its object code — see build.rs), and its default `cargo test` harness
+# binary would need the same non-standard link `sako-v8`/`sako-cli` do to
+# resolve the keepalive list, which it doesn't have.
+test = false
+
+[dependencies]
+temporal_capi = { version = "=0.2.6", features = ["zoneinfo64"] }

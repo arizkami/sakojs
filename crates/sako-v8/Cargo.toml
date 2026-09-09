@@ -15,6 +15,14 @@ sako-typescript = { path = "../sako-typescript" }
 sha1 = "0.10"
 ureq = "2.12"
 
+[target.'cfg(target_os = "linux")'.build-dependencies]
+# A build-dependency, not a normal one: sako-v8's build.rs needs its .rlib
+# (and its own dependencies') fully compiled with real object code before it
+# runs, to pull the temporal_rs_* symbols out of them. Cargo guarantees that
+# ordering for build-dependencies but not for normal ones. See
+# docs/v8-linkage.md.
+sako-temporal-bridge = { path = "../sako-temporal-bridge" }
+
 [build-dependencies]
 cc = "1.2"
 

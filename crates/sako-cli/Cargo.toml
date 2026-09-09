@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "sako"
@@ -15,3 +16,13 @@ sako-package = { path = "../sako-package" }
 sako-process = { path = "../sako-process" }
 sako-v8 = { path = "../sako-v8" }
 serde_json = "1.0"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+# See crates/sako-v8/build.rs and docs/v8-linkage.md: the actual final
+# link of the `sako` binary against V8/libc++/the Temporal bridge has to
+# happen from here, not from sako-v8's build script, because
+# `cargo:rustc-link-arg` doesn't propagate to a downstream binary — only
+# `cargo:rustc-link-lib`/`-search` do. This crate needs
+# sako-temporal-bridge's (and its dependencies') `.rlib`s to already be
+# built when its own build script runs, the same way sako-v8 does.
+sako-temporal-bridge = { path = "../sako-temporal-bridge" }
