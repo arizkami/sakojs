@@ -80,6 +80,7 @@ fixtures! {
   events => (0, ""),
   fetch => (0, ""),
   serve => (0, ""),
+  shell => (0, ""),
   throw => (1, "error: Uncaught Error: boom\n    at inner ("),
   reject => (1, "error: Uncaught TypeError: unhandled"),
   tla => (13, "Top-level await promise never resolved"),

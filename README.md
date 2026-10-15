@@ -55,6 +55,16 @@ Sako.serve({
     touching JS.
   - Request headers are built only when read. String bodies go straight
     from V8 to the socket buffer.
+- **Shell without `/bin/sh`.** `Sako.$` parses scripts in Rust and runs
+  builtins in-process. This covers the `Bun.$` set (`echo`, `cd`, `ls`,
+  `cat`, `rm`, ...) plus `wc`, `head`, `tail`, `grep`, `sort` and `uniq`, so
+  common pipelines never spawn a process.
+  - A script made only of builtins runs synchronously on the JS thread.
+    Anything that spawns a process runs on the thread pool, with direct
+    pipes.
+  - Each call site's template is parsed once and cached.
+  - Text output comes back as a string; `stdout` bytes are built only when
+    read.
 - **mimalloc.** Buffers allocated on one thread and freed on another made
   glibc's malloc arena locks a hotspot, so mimalloc is the global allocator.
 - **HTTP client.** `fetch` uses [ureq](https://github.com/algesten/ureq) with
@@ -128,6 +138,37 @@ How to read this:
   thread), while Bun does socket I/O on its JS thread. Running hyper on the
   JS thread's own event loop would close most of that gap.
 
+### Shell: Sako.$ vs Bun.$
+
+Run `python3 bench/shell/run.py 3`. This is the best of 3 alternating runs
+of `bench/shell/shell.js`, in microseconds per operation. Lower is better.
+
+| operation | Sako.$ | Bun.$ | speedup |
+|---|--:|--:|--:|
+| `echo hello` → `.text()` | **1.0** | 13.2 | 13.8× |
+| `echo ${"a b"} ${["x", "y"]}` | **1.1** | 13.7 | 12.4× |
+| `cd dir && pwd` | **1.7** | 13.6 | 8.1× |
+| `true && echo a \|\| echo b` | **0.7** | 12.7 | 19.1× |
+| `ls` (30 files) | **5.5** | 21.9 | 4.0× |
+| `cat` 108 KB file → `.text()` | **16.5** | 1,270 | 77× |
+| `echo data > out.txt && cat out.txt` | **5.9** | 1,246 | 213× |
+| `cat nums.txt \| wc -l` | **78** | 1,547 | 20× |
+| `grep 7 nums.txt \| head -5` | **192** | 1,373 | 7.1× |
+| `sort -rn nums.txt \| head -3` | **707** | 3,392 | 4.8× |
+| external `/bin/true` | 253 | 263 | 1.0× |
+| external `/bin/echo hi` → `.text()` | 1,134 | 1,114 | 1.0× |
+| `echo hi \| /bin/cat` | 1,140 | 1,207 | 1.1× |
+
+- **Builtins:** every operation that Sako can do with builtins is at least
+  4× faster.
+- **External programs:** these run at parity. Most of the time goes to the
+  kernel starting the process and the program's own startup (`/bin/true`
+  takes about 250µs even from plain Rust), so no shell can make them 4×
+  faster.
+- **Why `cat`, `wc`, `grep`, `sort` win so much:** Sako runs them
+  in-process, while Bun spawns `wc`, `grep` and `sort` as processes. Bun's
+  own `cat` builtin is also slow (about 1.3 ms for 108 KB).
+
 ## Usage
 
 ```
@@ -187,6 +228,33 @@ Entry files are always ES modules, so top-level `await` works.
 - **`process`:** `argv`, `env`, `exit`, `exitCode`, `cwd`, `chdir`,
   `hrtime`, `nextTick`, `memoryUsage`, `stdout.write`, `stderr.write`,
   `platform`, `versions`.
+- **`Sako.$`**, a tagged-template shell modelled on `Bun.$`, which never
+  calls `/bin/sh`:
+  - **Syntax:** `|`, `&&`, `||`, `;`, `$VAR`/`${VAR}`/`$?`, `NAME=value`
+    (shell variable) and `NAME=value cmd` (environment for one command),
+    `$(...)`, `'...'`/`"..."`/`\` quoting, `~`, and globs (`*`, `?`,
+    `[...]`).
+  - **Redirects:** `<`, `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`, `2>&1`, `1>&2`,
+    and `< ${uint8array}`.
+  - **Interpolation:** `${value}` is always one literal word, never parsed
+    as shell syntax. Arrays become several words, and `${{ raw: "..." }}`
+    inserts unescaped syntax.
+  - **Builtins:** `echo cd pwd true false exit export unset cat ls mkdir rm
+    touch mv cp which dirname basename seq wc head tail grep sort uniq`. A
+    builtin given options it doesn't implement (for example `grep -P` or
+    `ls -l`) runs the real program instead. `sort` uses the builtin only in
+    the C locale.
+  - **Methods:** `.text()`, `.json()`, `.lines()` (async iterator),
+    `.bytes()`, `.arrayBuffer()`, `.quiet()`, `.nothrow()`, `.throws(bool)`,
+    `.cwd(dir)` and `.env(obj)`.
+  - **Defaults:** `$.cwd()`, `$.env()`, `$.nothrow()` and `$.throws()`. Also
+    `$.escape(str)` and `$.ShellError`.
+  - **Output:** printed by default, and live for external commands, unless
+    `.quiet()` or a reader such as `.text()` is used. The result has
+    `exitCode`, plus `stdout`/`stderr` bytes whose `toString()` decodes
+    UTF-8.
+  - **Exit codes:** a non-zero exit rejects with `ShellError` (`exitCode`,
+    `stdout`, `stderr`).
 - **`Sako` file functions:** `readTextFile`, `readFile`, `writeTextFile`,
   `writeFile`, `exists`, `readDir`, `mkdir`, `remove`, `stat`. Each returns
   a promise and runs on the thread pool. Each also has a `*Sync` variant.
@@ -208,6 +276,15 @@ the process alive.
   flight is not cancelled. Response bodies, for `fetch` and for the server,
   are buffered in full rather than streamed.
 - `server.stop()` closes keep-alive connections that are still open.
+- `Sako.$` differs from `Bun.$` in a few places:
+  - A command that isn't found exits with 127 (the POSIX code; Bun uses 1).
+  - `2>&1` really merges stderr into stdout.
+  - `.lines()` has no trailing empty line.
+  - `which` ends its output with a newline.
+  - Subshells `( ... )`, background `&` and `<<` heredocs are not
+    supported.
+  - When a builtin's stdout and stderr go to the same place, its stderr is
+    written before its stdout.
 
 ## Not implemented (yet)
 
@@ -234,11 +311,15 @@ itself. To regenerate expectations, run
   fs, fetch, URL, server).
 - `src/pool.rs`: worker thread pool, event channel, op results and their
   conversion to JS.
+- `src/shell/`: `Sako.$` parser (`parse.rs`), executor with expansion,
+  pipes and processes (`exec.rs`), and in-process commands
+  (`builtins.rs`).
 - `src/http.rs`: `Sako.serve` I/O threads (Tokio + hyper, `SO_REUSEPORT`)
   and static routes.
 - `src/bootstrap.js`: JS globals. It must stay ASCII because it is loaded
   as an external one-byte string, and a compile-time check enforces this.
 - `bench/`: runtime benchmarks and `run.py`.
+- `bench/shell/`: `Sako.$` vs `Bun.$` benchmark and `run.py`.
 - `bench/http/`: HTTP server benchmark (Sako, Bun.serve, Elysia) and
   `run.py`.
 - `tests/`: fixture-based integration tests.

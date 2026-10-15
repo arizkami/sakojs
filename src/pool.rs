@@ -19,6 +19,8 @@ pub enum Payload {
   Stat { size: u64, is_file: bool, is_dir: bool, is_link: bool, mtime_ms: f64 },
   Dir(Vec<(String, bool, bool, bool)>),
   Response(Box<FetchResponse>),
+  /// `Sako.$` result: [exitCode, stdout, stderr].
+  Shell(crate::shell::Output),
 }
 
 pub struct FetchResponse {
@@ -228,6 +230,7 @@ pub fn to_v8<'s>(scope: &mut v8::PinScope<'s, '_>, p: Payload) -> v8::Local<'s, 
       }
       v8::Array::new_with_elements(scope, &items).into()
     }
+    Payload::Shell(o) => shell_result(scope, o).into(),
     Payload::Response(r) => {
       let mut headers = Vec::with_capacity(r.headers.len() * 2);
       for (k, v) in &r.headers {
@@ -245,6 +248,26 @@ pub fn to_v8<'s>(scope: &mut v8::PinScope<'s, '_>, p: Payload) -> v8::Local<'s, 
       v8::Array::new_with_elements(scope, &vals).into()
     }
   }
+}
+
+pub fn shell_result<'s>(scope: &mut v8::PinScope<'s, '_>, o: crate::shell::Output) -> v8::Local<'s, v8::Array> {
+  // Empty streams come back as undefined; UTF-8 output as a string (what
+  // .text()/.json()/.lines() want, and cheaper than an external buffer);
+  // anything else as bytes. JS builds `stdout` bytes lazily.
+  let mut bytes = |b: Vec<u8>| -> v8::Local<'s, v8::Value> {
+    if b.is_empty() {
+      v8::undefined(scope).into()
+    } else if std::str::from_utf8(&b).is_ok()
+      && let Some(s) = new_string(scope, &b)
+    {
+      s.into()
+    } else {
+      bytes_to_u8array(scope, b).into()
+    }
+  };
+  let (stdout, stderr) = (bytes(o.stdout), bytes(o.stderr));
+  let vals = [v8::Integer::new(scope, o.code).into(), stdout, stderr];
+  v8::Array::new_with_elements(scope, &vals)
 }
 
 pub fn error_to_v8<'s>(scope: &mut v8::PinScope<'s, '_>, e: OpError) -> v8::Local<'s, v8::Value> {

@@ -13,6 +13,7 @@
 mod http;
 mod ops;
 mod pool;
+mod shell;
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
@@ -60,6 +61,10 @@ pub struct State {
   pub argv: Vec<String>,
   pub script_args: Vec<String>,
   pub pool: pool::Pool,
+  /// Parsed `Sako.$` scripts by id (one per template call site).
+  pub shell_scripts: Vec<shell::Parsed>,
+  /// Cached process working directory (reset by `process.chdir`).
+  pub cwd_cache: Option<PathBuf>,
   pub servers: HashMap<u32, http::ServerHandle>,
   http_pending: HashMap<u32, http::ReplyTo>,
   /// Replies produced during this turn, delivered together by `flush_http`.
@@ -102,6 +107,8 @@ impl State {
       argv,
       script_args,
       pool: pool::Pool::new(),
+      shell_scripts: Vec::new(),
+      cwd_cache: None,
       servers: HashMap::new(),
       http_pending: HashMap::new(),
       http_replies: Vec::new(),

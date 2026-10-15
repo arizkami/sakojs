@@ -57,6 +57,9 @@ pub fn create<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object>
     "statAsync" => op_stat_async,
     "fetch" => op_fetch,
     "urlParse" => op_url_parse,
+    "shell" => op_shell,
+    "shellParse" => op_shell_parse,
+    "shellEscape" => op_shell_escape,
     "serve" => op_serve,
     "serverStop" => op_server_stop,
     "httpRespond" => op_http_respond,
@@ -295,6 +298,7 @@ op!(op_cwd(scope, _args, rv) {
 
 op!(op_chdir(scope, args, _rv) {
   let Some(p) = arg_string(scope, &args, 0) else { return };
+  state(scope).borrow_mut().cwd_cache = None;
   if let Err(err) = std::env::set_current_dir(&p) {
     throw(scope, io_err(err, "chdir", p));
   }
@@ -747,4 +751,112 @@ op!(op_serve_static_clear(scope, args, _rv) {
   if let Some(server) = state(scope).borrow().servers.get(&id) {
     server.clear_static();
   }
+});
+
+// -------------------------------------------------------------------- shell
+
+fn string_list(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> Vec<String> {
+  let Ok(arr) = v8::Local::<v8::Array>::try_from(v) else { return Vec::new() };
+  (0..arr.length()).map(|i| arr.get_index(scope, i).map(|v| v.to_rust_string_lossy(scope)).unwrap_or_default()).collect()
+}
+
+// shell(texts, values, cwd | undefined, [k, v, ...] | undefined, quiet)
+//   -> [exitCode, stdout, stderr], or a Promise of it when the script may
+//      spawn processes (it then runs on the thread pool).
+op!(op_shell(scope, args, rv) {
+  use crate::shell::{Job, Value};
+  let mut values = Vec::new();
+  if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(1)) {
+    for i in 0..arr.length() {
+      let v = arr.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
+      values.push(if v.is_array() {
+        Value::List(string_list(scope, v))
+      } else if v.is_array_buffer_view() || v.is_array_buffer() {
+        let Some(b) = arg_bytes(scope, v) else { return };
+        Value::Bytes(std::sync::Arc::new(b))
+      } else {
+        Value::Str(v.to_rust_string_lossy(scope))
+      });
+    }
+  }
+  let st = state(scope);
+  let cwd = match args.get(2) {
+    v if v.is_string() => {
+      let dir = std::path::PathBuf::from(v.to_rust_string_lossy(scope));
+      if dir.is_absolute() { crate::shell::normalize_path(&dir) } else { crate::shell::normalize_path(&process_cwd(&st).join(dir)) }
+    }
+    _ => process_cwd(&st),
+  };
+  let env = if args.get(3).is_array() {
+    let flat = string_list(scope, args.get(3));
+    Some(flat.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect())
+  } else {
+    None
+  };
+  let quiet = args.get(4).is_true();
+  // The script is a cached parse id (from shellParse) or the template texts.
+  let script = if let Some(id) = args.get(0).uint32_value(scope).filter(|_| args.get(0).is_number()) {
+    match st.borrow().shell_scripts.get(id as usize) {
+      Some(s) => s.clone(),
+      None => return throw(scope, OpError::Plain("Sako.$: unknown script".into())),
+    }
+  } else {
+    let texts = string_list(scope, args.get(0));
+    match crate::shell::parse_script(&texts, values.len()) {
+      Ok(s) => s,
+      Err(msg) => return throw(scope, OpError::Plain(format!("Sako.$: {msg}"))),
+    }
+  };
+  let job = Job::new(script, values, cwd, env);
+  if job.can_inline() {
+    let out = job.run(false);
+    if !quiet {
+      let mut s = st.borrow_mut();
+      if !out.stdout.is_empty() {
+        s.out.extend_from_slice(&out.stdout);
+        if s.stdout_tty || s.out.len() >= crate::OUT_BUF_LIMIT {
+          s.flush();
+        }
+      }
+      if !out.stderr.is_empty() {
+        s.flush();
+        let _ = std::io::stderr().write_all(&out.stderr);
+      }
+    }
+    let arr = pool::shell_result(scope, out);
+    rv.set(arr.into());
+  } else {
+    if !quiet {
+      // Keep ordering with earlier console output; the job prints live.
+      st.borrow_mut().flush();
+    }
+    let p = pool::spawn(scope, move || Ok(Payload::Shell(job.run(!quiet))));
+    rv.set(p.into());
+  }
+});
+
+// shellParse(texts, valueCount) -> script id, for reuse by one call site.
+op!(op_shell_parse(scope, args, rv) {
+  let texts = string_list(scope, args.get(0));
+  let nvals = args.get(1).uint32_value(scope).unwrap_or(0) as usize;
+  match crate::shell::parse_script(&texts, nvals) {
+    Ok(s) => {
+      let st = state(scope);
+      let mut st = st.borrow_mut();
+      st.shell_scripts.push(s);
+      rv.set_uint32((st.shell_scripts.len() - 1) as u32);
+    }
+    Err(msg) => throw(scope, OpError::Plain(format!("Sako.$: {msg}"))),
+  }
+});
+
+fn process_cwd(st: &crate::StateRc) -> std::path::PathBuf {
+  let mut s = st.borrow_mut();
+  s.cwd_cache.get_or_insert_with(|| std::env::current_dir().unwrap_or_default()).clone()
+}
+
+op!(op_shell_escape(scope, args, rv) {
+  let s = args.get(0).to_rust_string_lossy(scope);
+  let v = v8::String::new(scope, &crate::shell::escape(&s)).unwrap();
+  rv.set(v.into());
 });
