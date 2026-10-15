@@ -1,0 +1,22 @@
+const out = [];
+const log = (...a) => out.push(a.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" "));
+const u = new URL("https://user:pa ss@EXAMPLE.com:8080/a/../b/./c%20d?x=1&y=two#frag");
+for (const k of ["href", "origin", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"]) log(k, u[k]);
+log(new URL("../x?q", "http://h.com/a/b/c").href, new URL("//other.org/p", "https://h.com").href);
+log(new URL("http://ÿ.com/ä?ü=ö").href, new URL("http://[::1]:80/").href, new URL("file:///tmp/a b").href);
+log(URL.canParse("nope"), URL.canParse("/p", "http://h"), URL.parse("bad") === null);
+try { new URL("not a url"); } catch (e) { log(e.name, e.code); }
+u.pathname = "/new path"; u.search = "?a=1&a=2&b=x+y"; u.hash = "h2"; u.port = "443"; u.protocol = "http";
+log(u.href);
+u.searchParams.append("c", "a b&=?");
+log(u.href, u.search, u.searchParams.getAll("a"), u.searchParams.get("b"));
+u.searchParams.delete("a"); log(u.href);
+u.search = "?z=9"; log(u.searchParams.get("z"), u.searchParams.size);
+u.host = "foo.org:99"; u.hostname = "bar.org"; u.username = "me"; u.password = ""; log(u.href);
+u.href = "https://reset.example/"; log(u.href, u.searchParams.size);
+const sp = new URLSearchParams("?b=2&a=1&b=1&c=%zz&d=%C3%A9&e=+x+");
+sp.sort(); log(sp.toString(), [...sp.keys()], sp.get("c"), sp.get("d"), sp.get("e"));
+sp.set("b", "only"); log(sp.toString(), sp.has("a"), sp.has("a", "2"));
+log(new URLSearchParams({ x: "1", y: "!'()~*" }).toString(), new URLSearchParams([["k", "v"], ["k", "w"]]).toString());
+log(JSON.stringify({ u: new URL("http://a.b/c") }), String(new URL("http://a.b")));
+console.log(out.join("\n"));

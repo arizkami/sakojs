@@ -1,0 +1,21 @@
+true 127.0.0.1 true
+GET / -> 200 [text/plain;charset=UTF-8] static root
+1
+HEAD / -> 200 [text/plain;charset=UTF-8] 
+GET /item -> 200 [text/plain;charset=UTF-8] static get
+POST /item -> 201 [text/plain;charset=UTF-8] created thing
+DELETE /item -> 404 [text/plain;charset=UTF-8] fallback /item
+GET /users/42 -> 200 [application/json] {"id":"42"}
+GET /users/a%20b/posts/7 -> 200 [application/json] {"id":"a b","post":"7"}
+GET /users/42/ -> 404 [text/plain;charset=UTF-8] fallback /users/42/
+GET /files/a/b.txt -> 200 [text/plain;charset=UTF-8] file /files/a/b.txt
+PUT /headers -> 200 [application/json] {"custom":"yes","method":"PUT"}
+GET /async -> 200 [text/plain;charset=UTF-8] later
+GET /throw -> 500 [text/plain;charset=UTF-8] handled: handler failed
+GET /bytes -> 200 [application/octet-stream] ok
+GET /missing?x=1 -> 404 [text/plain;charset=UTF-8] fallback /missing
+300 concurrent: true
+GET / -> 200 [text/plain;charset=UTF-8] reloaded | GET /users/1 -> 404 [text/plain;charset=UTF-8] fallback /users/1
+second bind: EADDRINUSE
+TypeError
+stopped

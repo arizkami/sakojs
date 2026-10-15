@@ -1,0 +1,22 @@
+console.log("plain", 1, -0, 10n, true, null, undefined, Symbol("s"));
+console.log({ a: 1, b: "two", nested: { deep: { deeper: { deepest: 1 } } }, arr: [1, [2, [3, [4]]]] });
+console.log([1, , 3], new Array(5), [undefined, null]);
+console.log(new Map([["k", { v: 1 }]]), new Set(["x"]), new WeakMap());
+class A {}
+console.log(function named() {}, () => {}, A, class B extends A {}, async () => {});
+console.log(new Date(0), /re/gi, new Uint8Array([1, 2]), new ArrayBuffer(4));
+console.log(Promise.resolve(1), Promise.reject(new Error("r")).catch(() => {}) && 0, new Promise(() => {}));
+const circ = { name: "c" }; circ.self = circ; console.log(circ);
+console.log(Object.create(null), new (class Point { x = 1; y = 2 })());
+console.log(Array.from({ length: 30 }, (_, i) => i * 3));
+console.log("%s=%d %i %f %j %o %%", "x", 4.5, 4.5, "1.5", { j: 1 }, [1]);
+console.log({ "needs-quote": 1, valid_id: 2, [Symbol("sym")]: 3 }, "it's \"quoted\"");
+console.log(["it's"], { s: "line\nbreak" });
+console.log({ get g() { return 1; }, set s(v) {} });
+console.log(Object.assign(new Error("with props"), { code: "E1" }).code);
+console.table([{ a: 1, b: "x" }, { a: 2, c: true }]);
+console.group("group"); console.log("indented"); console.groupEnd(); console.log("not indented");
+console.count(); console.count(); console.count("other");
+console.assert(1 === 1, "not shown"); console.assert(false, "shown on stderr");
+process.stdout.write("no newline|"); process.stdout.write("done\n");
+console.log(Sako.inspect({ a: { b: { c: { d: {} } } } }, { depth: 0 }), Sako.format("%s!", "hi"));

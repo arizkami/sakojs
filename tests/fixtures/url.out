@@ -1,0 +1,25 @@
+href https://user:pa%20ss@example.com:8080/b/c%20d?x=1&y=two#frag
+origin https://example.com:8080
+protocol https:
+username user
+password pa%20ss
+host example.com:8080
+hostname example.com
+port 8080
+pathname /b/c%20d
+search ?x=1&y=two
+hash #frag
+http://h.com/a/x?q https://other.org/p
+http://xn--wda.com/%C3%A4?%C3%BC=%C3%B6 http://[::1]/ file:///tmp/a%20b
+false true true
+TypeError ERR_INVALID_URL
+http://user:pa%20ss@example.com/new%20path?a=1&a=2&b=x+y#h2
+http://user:pa%20ss@example.com/new%20path?a=1&a=2&b=x+y&c=a+b%26%3D%3F#h2 ?a=1&a=2&b=x+y&c=a+b%26%3D%3F ["1","2"] x y
+http://user:pa%20ss@example.com/new%20path?b=x+y&c=a+b%26%3D%3F#h2
+9 1
+http://me@bar.org:99/new%20path?z=9#h2
+https://reset.example/ 0
+a=1&b=2&b=1&c=%25zz&d=%C3%A9&e=+x+ ["a","b","b","c","d","e"] %zz é  x 
+a=1&b=only&c=%25zz&d=%C3%A9&e=+x+ true false
+x=1&y=%21%27%28%29%7E* k=v&k=w
+{"u":"http://a.b/c"} http://a.b/

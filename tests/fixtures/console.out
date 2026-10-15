@@ -1,0 +1,39 @@
+plain 1 -0 10n true null undefined Symbol(s)
+{
+  a: 1,
+  b: 'two',
+  nested: { deep: { deeper: [Object] } },
+  arr: [ 1, [ 2, [Array] ] ]
+}
+[ 1, <1 empty item>, 3 ] [ <5 empty items> ] [ undefined, null ]
+Map(1) { 'k' => { v: 1 } } Set(1) { 'x' } WeakMap { <items unknown> }
+[Function: named] [Function (anonymous)] [class A] [class B extends A] [AsyncFunction (anonymous)]
+1970-01-01T00:00:00.000Z /re/gi Uint8Array(2) [ 1, 2 ] ArrayBuffer { [Uint8Contents]: <00 00 00 00>, [byteLength]: 4 }
+Promise { 1 } 0 Promise { <pending> }
+<ref *1> { name: 'c', self: [Circular *1] }
+[Object: null prototype] {} Point { x: 1, y: 2 }
+[
+   0,  3,  6,  9, 12, 15, 18, 21, 24,
+  27, 30, 33, 36, 39, 42, 45, 48, 51,
+  54, 57, 60, 63, 66, 69, 72, 75, 78,
+  81, 84, 87
+]
+x=4.5 4 1.5 {"j":1} [ 1 ] %
+{ 'needs-quote': 1, valid_id: 2, Symbol(sym): 3 } it's "quoted"
+[ "it's" ] { s: 'line\nbreak' }
+{ g: [Getter], s: [Setter] }
+E1
+┌─────────┬───┬─────┬──────┐
+│ (index) │ a │ b   │ c    │
+├─────────┼───┼─────┼──────┤
+│ 0       │ 1 │ 'x' │      │
+│ 1       │ 2 │     │ true │
+└─────────┴───┴─────┴──────┘
+group
+  indented
+not indented
+default: 1
+default: 2
+other: 1
+no newline|done
+{ a: [Object] } hi!

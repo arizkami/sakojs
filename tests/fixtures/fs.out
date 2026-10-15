@@ -1,0 +1,9 @@
+hello world true false
+[ 1, 2, 3 ] hello world
+11 true false true
+a.txt:f b.bin:f sub:d
+50 true
+ENOENT open true
+ENOTDIR
+non-recursive remove: ENOTEMPTY
+removed: true

@@ -1,0 +1,7 @@
+h:ping,once,object,object
+dispatch returned false true
+abort event, reason: AbortError
+true
+threw AbortError
+why true
+timeout signal: TimeoutError

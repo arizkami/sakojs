@@ -1,0 +1,3 @@
+sync, nextTick, microtask, promise, timeout 0
+args x y, immediate, interval 1, interval 2, interval 3, timeout 10
+waited >= 29ms: true

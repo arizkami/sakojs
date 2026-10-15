@@ -1,0 +1,4 @@
+/target
+/bench/bigmod.js
+node_modules/
+!/tests/fixtures/node_modules/

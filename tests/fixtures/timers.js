@@ -1,0 +1,21 @@
+const order = [];
+setTimeout(() => order.push("timeout 10"), 10);
+setTimeout(() => order.push("timeout 0"), 0);
+setImmediate(() => order.push("immediate"));
+queueMicrotask(() => order.push("microtask"));
+process.nextTick(() => order.push("nextTick"));
+Promise.resolve().then(() => order.push("promise"));
+order.push("sync");
+const cleared = setTimeout(() => order.push("CLEARED - should not run"), 5);
+clearTimeout(cleared);
+let n = 0;
+const iv = setInterval(() => { order.push("interval " + ++n); if (n === 3) clearInterval(iv); }, 1);
+setTimeout((a, b) => order.push(`args ${a} ${b}`), 2, "x", "y");
+// An unref'd timer (AbortSignal.timeout) must not keep the process alive.
+AbortSignal.timeout(60_000);
+const t0 = performance.now();
+await new Promise((r) => setTimeout(r, 30));
+const waited = performance.now() - t0;
+console.log(order.slice(0, 5).join(", "));
+console.log(order.slice(5).sort().join(", "));
+console.log("waited >= 29ms:", waited >= 29);
