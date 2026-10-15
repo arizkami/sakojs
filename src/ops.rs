@@ -1,10 +1,9 @@
 //! Native functions exposed to the bootstrap as the `ops` object.
 
-use crate::pool::{self, FetchResponse, OpError, OpResult, Payload};
+use crate::pool::{self, OpError, OpResult, Payload};
 use crate::{state, State};
 use std::io::Write;
 use std::mem::MaybeUninit;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Args<'a> = v8::FunctionCallbackArguments<'a>;
@@ -58,6 +57,12 @@ pub fn create<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object>
     "fetch" => op_fetch,
     "urlParse" => op_url_parse,
     "shell" => op_shell,
+    "pgOpen" => op_pg_open,
+    "pgQuery" => op_pg_query,
+    "pgBegin" => op_pg_begin,
+    "pgFinish" => op_pg_finish,
+    "pgClose" => op_pg_close,
+    "mapStack" => op_map_stack,
     "shellParse" => op_shell_parse,
     "shellEscape" => op_shell_escape,
     "serve" => op_serve,
@@ -344,6 +349,7 @@ op!(op_set_hooks(scope, args, _rv) {
   let start_immediates = get(scope, 4);
   let run_immediate = get(scope, 5);
   let http_dispatch = get(scope, 6);
+  let enable_ts_stacks = get(scope, 7);
   let st = state(scope);
   let mut s = st.borrow_mut();
   s.dispatch = dispatch;
@@ -353,6 +359,7 @@ op!(op_set_hooks(scope, args, _rv) {
   s.start_immediates = start_immediates;
   s.run_immediate = run_immediate;
   s.http_dispatch = http_dispatch;
+  s.enable_ts_stacks = enable_ts_stacks;
 });
 
 
@@ -485,33 +492,8 @@ fs_op!(op_stat, op_stat_async, prep_stat);
 
 // -------------------------------------------------------------------- fetch
 
-fn agent_config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
-  ureq::Agent::config_builder()
-    .http_status_as_error(false)
-    .max_redirects(20)
-    .save_redirect_history(true)
-    .user_agent(format!("sako/{}", crate::VERSION))
-    // Keep enough idle keep-alive connections for highly concurrent clients;
-    // ureq's default (3 per host) forces reconnects under Promise.all.
-    .max_idle_connections(1024)
-    .max_idle_connections_per_host(256)
-}
-
-/// Shared agent with keep-alive connection pooling.
-fn agent() -> &'static ureq::Agent {
-  static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-  AGENT.get_or_init(|| agent_config().build().new_agent())
-}
-
-/// Agent that never reuses connections, used to retry after a pooled
-/// connection turned out to be dead.
-fn fresh_agent() -> &'static ureq::Agent {
-  static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-  AGENT.get_or_init(|| agent_config().max_idle_connections(0).max_idle_connections_per_host(0).build().new_agent())
-}
-
-// fetch(url, method, [k, v, k, v...], body | undefined) -> Promise<[status,
-// statusText, url, redirected, [k, v...], Uint8Array]>
+// fetch(url, method, [k, v, k, v...], body | undefined, redirect) ->
+// Promise<[status, statusText, url, redirected, [k, v...], Uint8Array]>
 op!(op_fetch(scope, args, rv) {
   let Some(url) = arg_string(scope, &args, 0) else { return };
   let Some(method) = arg_string(scope, &args, 1) else { return };
@@ -532,68 +514,18 @@ op!(op_fetch(scope, args, rv) {
     let Some(b) = arg_bytes(scope, body_arg) else { return };
     Some(b)
   };
-  // 0 = follow, 1 = manual (return the 3xx), 2 = error
-  let redirect = args.get(4).uint32_value(scope).unwrap_or(0);
-  let p = pool::spawn(scope, move || do_fetch(url, method, headers, body, redirect));
+  let redirect = match args.get(4).uint32_value(scope).unwrap_or(0) {
+    1 => sako_http::Redirect::Manual,
+    2 => sako_http::Redirect::Error,
+    _ => sako_http::Redirect::Follow,
+  };
+  sako_http::set_user_agent(format!("sako/{}", crate::VERSION));
+  let req = sako_http::FetchRequest { url, method, headers, body, redirect };
+  let p = pool::spawn(scope, move || {
+    sako_http::fetch(req).map(|r| Payload::Response(Box::new(r))).map_err(OpError::Type)
+  });
   rv.set(p.into());
 });
-
-fn is_stale_connection(e: &std::io::Error) -> bool {
-  use std::io::ErrorKind::*;
-  matches!(e.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe)
-}
-
-fn do_fetch(url: String, method: String, headers: Vec<(String, String)>, body: Option<Vec<u8>>, redirect: u32) -> OpResult {
-  use ureq::ResponseExt;
-  let fail = |e: &dyn std::fmt::Display| OpError::Type(format!("fetch failed: {e}"));
-  let send = |agent: &ureq::Agent| {
-    let mut req = ureq::http::Request::builder().method(method.as_str()).uri(&url);
-    for (k, v) in &headers {
-      req = req.header(k.as_str(), v.as_str());
-    }
-    // Per-request config: only needed when redirects must not be followed.
-    match &body {
-      Some(b) => {
-        let req = req.body(b.as_slice()).map_err(ureq::Error::from)?;
-        if redirect == 0 { agent.run(req) } else { agent.run(agent.configure_request(req).max_redirects(0).build()) }
-      }
-      None => {
-        let req = req.body(()).map_err(ureq::Error::from)?;
-        if redirect == 0 { agent.run(req) } else { agent.run(agent.configure_request(req).max_redirects(0).build()) }
-      }
-    }
-  };
-  // A pooled keep-alive connection may already be closed by the server. ureq
-  // also pools HTTP/1.0 connections the server is about to close, which can
-  // break the next redirect hop. Retry idempotent requests on fresh
-  // connections, as browsers do.
-  let idempotent = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "PUT" | "DELETE" | "TRACE");
-  let res = match send(agent()) {
-    Err(ureq::Error::Io(e)) if idempotent && is_stale_connection(&e) => send(fresh_agent()),
-    r => r,
-  };
-  let mut res = res.map_err(|e| fail(&e))?;
-  let status = res.status();
-  if redirect == 2 && status.is_redirection() {
-    return Err(OpError::Type("fetch failed: unexpected redirect".into()));
-  }
-  let final_url = res.get_uri().to_string();
-  let redirected = res.get_redirect_history().is_some_and(|h| h.len() > 1);
-  let headers = res
-    .headers()
-    .iter()
-    .map(|(k, v)| (k.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
-    .collect();
-  let body = res.body_mut().with_config().limit(u64::MAX).read_to_vec().map_err(|e| fail(&e))?;
-  Ok(Payload::Response(Box::new(FetchResponse {
-    status: status.as_u16(),
-    status_text: status.canonical_reason().unwrap_or("").to_string(),
-    url: final_url,
-    redirected,
-    headers,
-    body,
-  })))
-}
 
 // ---------------------------------------------------------------------- URL
 
@@ -673,6 +605,16 @@ op!(op_url_set(scope, args, rv) {
 
 // --------------------------------------------------------------------- HTTP
 
+/// Delivers server requests to the event loop.
+#[derive(Clone)]
+struct EventSink(std::sync::mpsc::Sender<pool::Event>);
+
+impl sako_http::RequestSink for EventSink {
+  fn send(&self, request: sako_http::HttpRequest) -> bool {
+    self.0.send(pool::Event::Http(Box::new(request))).is_ok()
+  }
+}
+
 // serve(serverId, hostname, port, reusePort) -> bound port
 op!(op_serve(scope, args, rv) {
   let id = args.get(0).uint32_value(scope).unwrap_or(0);
@@ -682,8 +624,8 @@ op!(op_serve(scope, args, rv) {
     return throw(scope, OpError::Type(format!("Invalid port: {port}")));
   };
   let reuse_port = args.get(3).is_true();
-  let events = state(scope).borrow().pool.events();
-  match crate::http::listen(id, &hostname, port, reuse_port, events) {
+  let events = EventSink(state(scope).borrow().pool.events());
+  match sako_http::listen(id, &hostname, port, reuse_port, events) {
     Ok((port, handle)) => {
       state(scope).borrow_mut().servers.insert(id, handle);
       rv.set_uint32(port as u32);
@@ -700,7 +642,7 @@ op!(op_server_stop(scope, args, _rv) {
 });
 
 /// Reads (status, [k, v, ...] | undefined, body) starting at argument `i`.
-fn arg_reply(scope: &mut v8::PinScope, args: &Args, i: i32) -> Option<crate::http::HttpReply> {
+fn arg_reply(scope: &mut v8::PinScope, args: &Args, i: i32) -> Option<sako_http::HttpReply> {
   let status = args.get(i).uint32_value(scope).unwrap_or(200) as u16;
   let mut headers = Vec::new();
   if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(i + 1)) {
@@ -724,7 +666,7 @@ fn arg_reply(scope: &mut v8::PinScope, args: &Args, i: i32) -> Option<crate::htt
   } else {
     arg_bytes(scope, body_arg)?
   };
-  Some(crate::http::HttpReply { status, headers, body })
+  Some(sako_http::HttpReply { status, headers, body })
 }
 
 // httpRespond(requestId, status, [k, v, ...] | undefined, body: string | ArrayBufferView | null)
@@ -855,8 +797,256 @@ fn process_cwd(st: &crate::StateRc) -> std::path::PathBuf {
   s.cwd_cache.get_or_insert_with(|| std::env::current_dir().unwrap_or_default()).clone()
 }
 
+// mapStack(stack) -> stack with TypeScript positions restored.
+op!(op_map_stack(scope, args, rv) {
+  let stack = args.get(0).to_rust_string_lossy(scope);
+  let mapped = crate::map_stack(&state(scope).borrow(), &stack);
+  let v = v8::String::new(scope, &mapped).unwrap();
+  rv.set(v.into());
+});
+
 op!(op_shell_escape(scope, args, rv) {
   let s = args.get(0).to_rust_string_lossy(scope);
   let v = v8::String::new(scope, &crate::shell::escape(&s)).unwrap();
   rv.set(v.into());
+});
+
+// --------------------------------------------------------------- PostgreSQL
+
+// pgOpen(url | undefined, max | undefined) -> pool id. No connection is made
+// until the first query.
+op!(op_pg_open(scope, args, rv) {
+  let url = args.get(0);
+  let config = if url.is_string() {
+    sako_pg::Config::parse(&url.to_rust_string_lossy(scope))
+  } else {
+    let env = ["DATABASE_URL", "POSTGRES_URL", "PGURL"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+    match env {
+      Some(u) => sako_pg::Config::parse(&u),
+      None => Ok(sako_pg::Config::from_env()),
+    }
+  };
+  let mut config = match config {
+    Ok(c) => c,
+    Err(e) => return throw(scope, OpError::Pg(e)),
+  };
+  if let Some(max) = args.get(1).uint32_value(scope).filter(|_| args.get(1).is_number()) {
+    config.max = (max as usize).max(1);
+  }
+  let st = state(scope);
+  let mut s = st.borrow_mut();
+  s.pg_next += 1;
+  let id = s.pg_next;
+  let pool = sako_pg::Pool::new(config);
+  s.pg_pools.insert(id, std::sync::Arc::new(PgPool { pool, queue: Default::default() }));
+  rv.set_uint32(id);
+});
+
+/// A `Sako.sql` pool: queries queue here; up to `max` drainer jobs each hold
+/// a connection and send whatever has queued up as one pipelined batch.
+pub struct PgPool {
+  pool: std::sync::Arc<sako_pg::Pool>,
+  queue: std::sync::Mutex<PgQueue>,
+}
+
+#[derive(Default)]
+struct PgQueue {
+  jobs: std::collections::VecDeque<PgJob>,
+  drainers: usize,
+}
+
+struct PgJob {
+  id: u32,
+  sql: String,
+  params: Vec<sako_pg::Param>,
+  types: Vec<u32>,
+  simple: bool,
+  values: bool,
+}
+
+const PG_BATCH: usize = 64;
+
+fn pg_drain(pg: std::sync::Arc<PgPool>, events: std::sync::mpsc::Sender<pool::Event>) {
+  let send = |job: &PgJob, r: Result<sako_pg::QueryResult, sako_pg::Error>| {
+    let _ = events.send(pool::Event::Op(job.id, r.map(|r| Payload::Pg(Box::new(r), job.values)).map_err(OpError::Pg)));
+  };
+  loop {
+    let mut conn = match pg.pool.get() {
+      Ok(c) => c,
+      Err(e) => {
+        // Can't connect: fail what is queued now and stop.
+        let mut q = pg.queue.lock().unwrap();
+        q.drainers -= 1;
+        let jobs: Vec<PgJob> = q.jobs.drain(..).collect();
+        drop(q);
+        for job in &jobs {
+          send(job, Err(sako_pg::Error::Io(e.to_string())));
+        }
+        return;
+      }
+    };
+    loop {
+      // Take a batch; simple-protocol queries run on their own.
+      let batch: Vec<PgJob> = {
+        let mut q = pg.queue.lock().unwrap();
+        if q.jobs.is_empty() {
+          q.drainers -= 1;
+          return; // connection goes back to the pool
+        }
+        let mut batch = Vec::new();
+        while batch.len() < PG_BATCH {
+          match q.jobs.front() {
+            Some(j) if j.simple && !batch.is_empty() => break,
+            Some(_) => {
+              let job = q.jobs.pop_front().unwrap();
+              let simple = job.simple;
+              batch.push(job);
+              if simple {
+                break;
+              }
+            }
+            None => break,
+          }
+        }
+        batch
+      };
+      if batch[0].simple {
+        let r = conn.simple_query(&batch[0].sql);
+        let broken = conn.broken;
+        send(&batch[0], r);
+        if broken {
+          break;
+        }
+        continue;
+      }
+      let queries: Vec<sako_pg::BatchQuery> =
+        batch.iter().map(|j| sako_pg::BatchQuery { sql: &j.sql, params: &j.params, types: &j.types }).collect();
+      match conn.query_batch(&queries) {
+        Ok(results) => {
+          for (job, r) in batch.iter().zip(results) {
+            send(job, r);
+          }
+        }
+        Err(e) => {
+          for job in &batch {
+            send(job, Err(sako_pg::Error::Io(e.to_string())));
+          }
+          break; // broken connection: get a new one
+        }
+      }
+    }
+  }
+}
+
+/// Query parameters: null/undefined -> NULL, Uint8Array -> bytea hex,
+/// anything else -> its string form (JS has already stringified).
+fn pg_params(scope: &mut v8::PinScope, v: v8::Local<v8::Value>) -> Option<Vec<sako_pg::Param>> {
+  let arr = v8::Local::<v8::Array>::try_from(v).ok()?;
+  let mut out = Vec::with_capacity(arr.length() as usize);
+  for i in 0..arr.length() {
+    let v = arr.get_index(scope, i)?;
+    out.push(if v.is_null_or_undefined() {
+      None
+    } else if v.is_array_buffer_view() || v.is_array_buffer() {
+      let bytes = arg_bytes(scope, v)?;
+      let mut hex = String::with_capacity(2 + bytes.len() * 2);
+      hex.push_str("\\x");
+      for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+      }
+      Some(hex)
+    } else {
+      Some(v.to_rust_string_lossy(scope))
+    });
+  }
+  Some(out)
+}
+
+// pgQuery(poolId, txId, sql, params, simple, values, types) -> Promise<[rows, command, count]>
+op!(op_pg_query(scope, args, rv) {
+  let pool_id = args.get(0).uint32_value(scope).unwrap_or(0);
+  let tx_id = args.get(1).uint32_value(scope).unwrap_or(0);
+  let sql = args.get(2).to_rust_string_lossy(scope);
+  let Some(params) = pg_params(scope, args.get(3)) else {
+    return throw_type_error(scope, "invalid query parameters");
+  };
+  let simple = args.get(4).is_true();
+  let values = args.get(5).is_true();
+  let types: Vec<u32> = match v8::Local::<v8::Array>::try_from(args.get(6)) {
+    Ok(arr) => (0..arr.length()).map(|i| arr.get_index(scope, i).and_then(|v| v.uint32_value(scope)).unwrap_or(0)).collect(),
+    Err(_) => Vec::new(),
+  };
+  let st = state(scope);
+  if tx_id != 0 {
+    // Transactions use their reserved connection directly.
+    let Some(tx) = st.borrow().pg_tx.get(&tx_id).cloned() else {
+      return throw(scope, OpError::Plain("transaction already finished".into()));
+    };
+    let p = pool::spawn(scope, move || {
+      let mut conn = tx.lock().unwrap();
+      let r = if simple { conn.simple_query(&sql) } else { conn.query_typed(&sql, &params, &types) };
+      r.map(|r| Payload::Pg(Box::new(r), values)).map_err(OpError::Pg)
+    });
+    return rv.set(p.into());
+  }
+  let Some(pg) = st.borrow().pg_pools.get(&pool_id).cloned() else {
+    return throw(scope, OpError::Pg(sako_pg::Error::PoolClosed));
+  };
+  let (id, promise, events) = pool::pending(scope);
+  let start = {
+    let mut q = pg.queue.lock().unwrap();
+    q.jobs.push_back(PgJob { id, sql, params, types, simple, values });
+    let start = q.drainers < pg.pool.config().max;
+    if start {
+      q.drainers += 1;
+    }
+    start
+  };
+  if start {
+    pool::submit_detached(scope, move || pg_drain(pg, events));
+  }
+  rv.set(promise.into());
+});
+
+// pgBegin(poolId, beginSql) -> Promise<txId>: reserves a connection.
+op!(op_pg_begin(scope, args, rv) {
+  let pool_id = args.get(0).uint32_value(scope).unwrap_or(0);
+  let begin = args.get(1).to_rust_string_lossy(scope);
+  let Some(pg) = state(scope).borrow().pg_pools.get(&pool_id).cloned() else {
+    return throw(scope, OpError::Pg(sako_pg::Error::PoolClosed));
+  };
+  let p = pool::spawn(scope, move || {
+    let mut conn = pg.pool.get().map_err(OpError::Pg)?;
+    conn.simple_query(&begin).map_err(OpError::Pg)?;
+    Ok(Payload::PgTransaction(Box::new(conn)))
+  });
+  rv.set(p.into());
+});
+
+// pgFinish(txId, commit) -> Promise: COMMIT or ROLLBACK, then release.
+op!(op_pg_finish(scope, args, rv) {
+  let tx_id = args.get(0).uint32_value(scope).unwrap_or(0);
+  let commit = args.get(1).is_true();
+  let Some(conn) = state(scope).borrow_mut().pg_tx.remove(&tx_id) else {
+    return throw(scope, OpError::Plain("transaction already finished".into()));
+  };
+  let p = pool::spawn(scope, move || {
+    let mut conn = conn.lock().unwrap();
+    let r = conn.simple_query(if commit { "COMMIT" } else { "ROLLBACK" });
+    r.map(|_| Payload::Undefined).map_err(OpError::Pg)
+  });
+  rv.set(p.into());
+});
+
+// pgClose(poolId) -> Promise: closes idle connections, refuses new queries.
+op!(op_pg_close(scope, args, rv) {
+  let pool_id = args.get(0).uint32_value(scope).unwrap_or(0);
+  let pg = state(scope).borrow_mut().pg_pools.remove(&pool_id);
+  let p = pool::spawn(scope, move || {
+    if let Some(pg) = pg {
+      pg.pool.close();
+    }
+    Ok(Payload::Undefined)
+  });
+  rv.set(p.into());
 });

@@ -1,0 +1,13 @@
+[package]
+name = "sako_pg"
+version = "0.1.0"
+edition = "2024"
+description = "PostgreSQL client for Sako: wire protocol, SCRAM/MD5 auth, prepared statement cache, pool"
+
+[dependencies]
+sha2 = "0.11.1"
+base64 = "0.23.1"
+md5 = "0.8"
+getrandom = "0.2"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.9"

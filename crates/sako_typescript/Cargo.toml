@@ -1,0 +1,8 @@
+[package]
+name = "sako_typescript"
+version = "0.1.0"
+edition = "2024"
+description = "TypeScript to JavaScript for Sako (type stripping and TS-only syntax lowering via oxc)"
+
+[dependencies]
+oxc = { version = "0.154.0", features = ["semantic", "transformer", "codegen"] }

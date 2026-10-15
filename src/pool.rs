@@ -18,24 +18,20 @@ pub enum Payload {
   Text(Vec<u8>),
   Stat { size: u64, is_file: bool, is_dir: bool, is_link: bool, mtime_ms: f64 },
   Dir(Vec<(String, bool, bool, bool)>),
-  Response(Box<FetchResponse>),
+  Response(Box<sako_http::FetchResponse>),
   /// `Sako.$` result: [exitCode, stdout, stderr].
   Shell(crate::shell::Output),
-}
-
-pub struct FetchResponse {
-  pub status: u16,
-  pub status_text: String,
-  pub url: String,
-  pub redirected: bool,
-  pub headers: Vec<(String, String)>,
-  pub body: Vec<u8>,
+  /// `Sako.sql` query result; the flag selects arrays instead of objects.
+  Pg(Box<sako_pg::QueryResult>, bool),
+  /// A connection reserved for a transaction (stored on the JS thread).
+  PgTransaction(Box<sako_pg::Pooled>),
 }
 
 pub enum OpError {
   Io { err: std::io::Error, syscall: &'static str, path: String },
   Type(String),
   Plain(String),
+  Pg(sako_pg::Error),
 }
 
 pub type OpResult = Result<Payload, OpError>;
@@ -45,7 +41,7 @@ pub enum Event {
   /// An async op finished on the thread pool.
   Op(u32, OpResult),
   /// An HTTP request arrived on a `Sako.serve()` server.
-  Http(Box<crate::http::HttpRequest>),
+  Http(Box<sako_http::HttpRequest>),
 }
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -145,6 +141,16 @@ pub fn spawn<'s>(
   scope: &mut v8::PinScope<'s, '_>,
   work: impl FnOnce() -> OpResult + Send + 'static,
 ) -> v8::Local<'s, v8::Promise> {
+  let (id, promise, tx) = pending(scope);
+  submit_detached(scope, move || {
+    let _ = tx.send(Event::Op(id, work()));
+  });
+  promise
+}
+
+/// Registers a promise that another thread settles by sending
+/// `Event::Op(id, result)` on the returned sender.
+pub fn pending<'s>(scope: &mut v8::PinScope<'s, '_>) -> (u32, v8::Local<'s, v8::Promise>, Sender<Event>) {
   let resolver = v8::PromiseResolver::new(scope).unwrap();
   let promise = resolver.get_promise(scope);
   let global = v8::Global::new(scope, resolver);
@@ -154,11 +160,12 @@ pub fn spawn<'s>(
   pool.next_id = pool.next_id.wrapping_add(1);
   let id = pool.next_id;
   pool.resolvers.insert(id, global);
-  let tx = pool.done_tx.clone();
-  pool.submit(Box::new(move || {
-    let _ = tx.send(Event::Op(id, work()));
-  }));
-  promise
+  (id, promise, pool.done_tx.clone())
+}
+
+/// Runs a job on the pool; it reports its own results (see [`pending`]).
+pub fn submit_detached(scope: &v8::PinScope, job: impl FnOnce() + Send + 'static) {
+  state(scope).borrow_mut().pool.submit(Box::new(job));
 }
 
 /// Settles the promise for a finished op. Returns false if it was unknown.
@@ -231,6 +238,15 @@ pub fn to_v8<'s>(scope: &mut v8::PinScope<'s, '_>, p: Payload) -> v8::Local<'s, 
       v8::Array::new_with_elements(scope, &items).into()
     }
     Payload::Shell(o) => shell_result(scope, o).into(),
+    Payload::Pg(r, _) => pg_result(scope, *r).into(),
+    Payload::PgTransaction(conn) => {
+      let st = crate::state(scope);
+      let mut s = st.borrow_mut();
+      s.pg_next += 1;
+      let id = s.pg_next;
+      s.pg_tx.insert(id, std::sync::Arc::new(std::sync::Mutex::new(*conn)));
+      v8::Integer::new_from_unsigned(scope, id).into()
+    }
     Payload::Response(r) => {
       let mut headers = Vec::with_capacity(r.headers.len() * 2);
       for (k, v) in &r.headers {
@@ -270,8 +286,155 @@ pub fn shell_result<'s>(scope: &mut v8::PinScope<'s, '_>, o: crate::shell::Outpu
   v8::Array::new_with_elements(scope, &vals)
 }
 
+fn pg_value<'s>(scope: &mut v8::PinScope<'s, '_>, v: sako_pg::Value) -> v8::Local<'s, v8::Value> {
+  use sako_pg::Value as V;
+  match v {
+    V::Null => v8::null(scope).into(),
+    V::Bool(b) => v8::Boolean::new(scope, b).into(),
+    V::Int(i) => v8::Integer::new(scope, i).into(),
+    V::Float(f) => v8::Number::new(scope, f).into(),
+    V::Text(s) => new_string(scope, s.as_bytes()).map_or_else(|| v8::null(scope).into(), Into::into),
+    V::Json(s) => {
+      let text = new_string(scope, s.as_bytes()).unwrap_or_else(|| v8::String::empty(scope));
+      v8::json::parse(scope, text).unwrap_or_else(|| text.into())
+    }
+    V::Bytes(b) => bytes_to_u8array(scope, b).into(),
+    V::Date(ms) => v8::Date::new(scope, ms).map_or_else(|| v8::null(scope).into(), Into::into),
+    V::Array(items) => {
+      let vals: Vec<v8::Local<v8::Value>> = items.into_iter().map(|i| pg_value(scope, i)).collect();
+      v8::Array::new_with_elements(scope, &vals).into()
+    }
+  }
+}
+
+/// One binary-format cell (see `sako_pg::types::prefers_binary`).
+fn pg_binary_cell<'s>(scope: &mut v8::PinScope<'s, '_>, type_oid: u32, raw: Option<&[u8]>) -> v8::Local<'s, v8::Value> {
+  use sako_pg::types::decode_binary;
+  match decode_binary(type_oid, raw) {
+    // Dates go to JS as epoch milliseconds (see pg_cell).
+    sako_pg::Value::Date(ms) => v8::Number::new(scope, ms).into(),
+    v => pg_value(scope, v),
+  }
+}
+
+/// One text-format cell, decoded straight into a V8 value.
+fn pg_cell<'s>(scope: &mut v8::PinScope<'s, '_>, type_oid: u32, raw: Option<&[u8]>) -> v8::Local<'s, v8::Value> {
+  use sako_pg::types::{decode, decode_bytea, element_oid, oid, parse_timestamp};
+  let Some(raw) = raw else { return v8::null(scope).into() };
+  let text = |scope: &mut v8::PinScope<'s, '_>| -> v8::Local<'s, v8::Value> {
+    new_string(scope, raw).map_or_else(|| v8::null(scope).into(), Into::into)
+  };
+  let str = || std::str::from_utf8(raw).ok();
+  match type_oid {
+    oid::BOOL => v8::Boolean::new(scope, raw == b"t").into(),
+    oid::INT2 | oid::INT4 => match str().and_then(|s| s.parse::<i32>().ok()) {
+      Some(i) => v8::Integer::new(scope, i).into(),
+      None => text(scope),
+    },
+    oid::OID => match str().and_then(|s| s.parse::<u32>().ok()) {
+      Some(i) => v8::Number::new(scope, i as f64).into(),
+      None => text(scope),
+    },
+    oid::FLOAT4 | oid::FLOAT8 => {
+      let f = match str() {
+        Some("Infinity") => f64::INFINITY,
+        Some("-Infinity") => f64::NEG_INFINITY,
+        s => s.and_then(|s| s.parse().ok()).unwrap_or(f64::NAN),
+      };
+      v8::Number::new(scope, f).into()
+    }
+    oid::JSON | oid::JSONB => {
+      let s = new_string(scope, raw).unwrap_or_else(|| v8::String::empty(scope));
+      v8::json::parse(scope, s).unwrap_or_else(|| s.into())
+    }
+    oid::BYTEA => match decode_bytea(raw) {
+      Some(b) => bytes_to_u8array(scope, b).into(),
+      None => text(scope),
+    },
+    // As epoch milliseconds: JS wraps them in `new Date()` (much cheaper
+    // than creating Dates through the C++ API).
+    oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ => match str().and_then(parse_timestamp) {
+      Some(ms) => v8::Number::new(scope, ms).into(),
+      None => text(scope),
+    },
+    oid::INT8 => text(scope),
+    t if element_oid(t).is_some() => pg_value(scope, decode(t, Some(raw))),
+    _ => text(scope),
+  }
+}
+
+/// [columnNames, flatValues, command, count, dateColumns]: row-major values
+/// in one array. JS turns them into row objects with a per-column-set literal
+/// constructor (V8's fastest way to create same-shaped objects), or arrays;
+/// `dateColumns` flags columns whose numbers become Dates.
+fn pg_result<'s>(scope: &mut v8::PinScope<'s, '_>, r: sako_pg::QueryResult) -> v8::Local<'s, v8::Array> {
+  let names: Vec<v8::Local<v8::Value>> = r
+    .columns
+    .iter()
+    .map(|c| v8::String::new_from_utf8(scope, c.name.as_bytes(), v8::NewStringType::Internalized).unwrap().into())
+    .collect();
+  let width = r.columns.len();
+  let binary: Vec<bool> = (0..width).map(|c| r.binary.get(c) == Some(&true)).collect();
+  let mut flat = Vec::with_capacity(r.cells.len());
+  for row in 0..r.row_count() {
+    for col in 0..width {
+      let oid = r.columns[col].type_oid;
+      flat.push(if binary[col] { pg_binary_cell(scope, oid, r.raw(row, col)) } else { pg_cell(scope, oid, r.raw(row, col)) });
+    }
+  }
+  use sako_pg::types::oid;
+  let dates: Vec<v8::Local<v8::Value>> = r
+    .columns
+    .iter()
+    .map(|c| v8::Boolean::new(scope, matches!(c.type_oid, oid::DATE | oid::TIMESTAMP | oid::TIMESTAMPTZ)).into())
+    .collect();
+  let out = [
+    v8::Array::new_with_elements(scope, &names).into(),
+    v8::Array::new_with_elements(scope, &flat).into(),
+    v8::String::new(scope, &r.command).unwrap().into(),
+    v8::Number::new(scope, r.count as f64).into(),
+    v8::Array::new_with_elements(scope, &dates).into(),
+  ];
+  v8::Array::new_with_elements(scope, &out)
+}
+
 pub fn error_to_v8<'s>(scope: &mut v8::PinScope<'s, '_>, e: OpError) -> v8::Local<'s, v8::Value> {
   match e {
+    OpError::Pg(e) => {
+      let m = v8::String::new(scope, &e.to_string()).unwrap();
+      let err = v8::Exception::error(scope, m);
+      if let Ok(obj) = v8::Local::<v8::Object>::try_from(err) {
+        let set = |k: &str, v: &str| {
+          let k = v8::String::new(scope, k).unwrap();
+          let v = v8::String::new(scope, v).unwrap();
+          obj.set(scope, k.into(), v.into());
+        };
+        set("name", "PostgresError");
+        match &e {
+          sako_pg::Error::Db(d) => {
+            set("code", &d.code);
+            set("severity", &d.severity);
+            for (k, v) in [
+              ("detail", &d.detail),
+              ("hint", &d.hint),
+              ("position", &d.position),
+              ("schema", &d.schema),
+              ("table", &d.table),
+              ("column", &d.column),
+              ("constraint", &d.constraint),
+            ] {
+              if let Some(v) = v {
+                set(k, v);
+              }
+            }
+          }
+          sako_pg::Error::PoolClosed => set("code", "ERR_POSTGRES_CONNECTION_CLOSED"),
+          sako_pg::Error::Auth(_) => set("code", "ERR_POSTGRES_AUTHENTICATION"),
+          _ => set("code", "ERR_POSTGRES_CONNECTION"),
+        }
+      }
+      err
+    }
     OpError::Type(msg) => {
       let m = v8::String::new(scope, &msg).unwrap();
       v8::Exception::type_error(scope, m)

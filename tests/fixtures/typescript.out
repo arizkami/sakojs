@@ -1,0 +1,5 @@
+[ 'circle(1) area=3.14', 'square(2) area=4.00' ]
+7.142 1 square 7
+3 cast object
+dynamic import: Base,Circle,Geometry,Kind,Square,explode
+RangeError shapes.ts:35:9)

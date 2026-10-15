@@ -1,13 +1,12 @@
-//! `Sako.serve()`: HTTP/1.1 server.
+//! HTTP/1.1 server behind `Sako.serve()`.
 //!
 //! Thread-per-core I/O: each I/O thread runs its own single-threaded Tokio
 //! runtime with its own `SO_REUSEPORT` listener, so the kernel spreads
 //! connections and there is no work stealing between threads. hyper parses
-//! requests there; each request goes to the JS thread over the event-loop
-//! channel. Replies come back through one queue per I/O thread, so a batch of
-//! responses costs a single cross-thread wake-up.
+//! requests there; each request is handed to a [`RequestSink`] (the runtime's
+//! event loop). Replies come back through one queue per I/O thread, so a
+//! batch of responses costs a single cross-thread wake-up.
 
-use crate::pool::Event;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -19,9 +18,14 @@ use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::ToSocketAddrs;
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot, watch};
+
+/// Receives requests that need a handler (everything but static routes).
+pub trait RequestSink: Clone + Send + 'static {
+  /// Returns false if the receiver is gone (the client then gets a 503).
+  fn send(&self, request: HttpRequest) -> bool;
+}
 
 pub struct HttpRequest {
   pub server: u32,
@@ -144,12 +148,12 @@ fn bind(addr: std::net::SocketAddr, reuse_port: bool) -> std::io::Result<std::ne
 
 /// Binds synchronously (so errors surface to JS immediately) and starts the
 /// I/O threads. Returns the bound port.
-pub fn listen(
+pub fn listen<S: RequestSink>(
   id: u32,
   hostname: &str,
   port: u16,
   reuse_port: bool,
-  events: Sender<Event>,
+  events: S,
 ) -> std::io::Result<(u16, ServerHandle)> {
   let mut addr = (hostname, port)
     .to_socket_addrs()?
@@ -189,10 +193,10 @@ pub fn listen(
   Ok((addr.port(), ServerHandle { shutdown: Some(shutdown_tx), routes }))
 }
 
-async fn accept_loop(
+async fn accept_loop<S: RequestSink>(
   id: u32,
   listener: std::net::TcpListener,
-  events: Sender<Event>,
+  events: S,
   routes: StaticRoutes,
   mut shutdown: watch::Receiver<bool>,
 ) {
@@ -217,7 +221,13 @@ async fn accept_loop(
   }
 }
 
-async fn serve_connection(id: u32, stream: tokio::net::TcpStream, events: Sender<Event>, routes: StaticRoutes, queue: ReplyQueue) {
+async fn serve_connection<S: RequestSink>(
+  id: u32,
+  stream: tokio::net::TcpStream,
+  events: S,
+  routes: StaticRoutes,
+  queue: ReplyQueue,
+) {
   let service = service_fn(move |req| handle(id, req, events.clone(), routes.clone(), queue.clone()));
   let _ = http1::Builder::new()
     .keep_alive(true)
@@ -232,10 +242,10 @@ fn plain(status: StatusCode, msg: &'static str) -> Response<Full<Bytes>> {
   res
 }
 
-async fn handle(
+async fn handle<S: RequestSink>(
   id: u32,
   req: Request<Incoming>,
-  events: Sender<Event>,
+  events: S,
   routes: StaticRoutes,
   queue: ReplyQueue,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -253,7 +263,7 @@ async fn handle(
   let (reply_tx, reply_rx) = oneshot::channel();
   let reply = ReplyTo { queue, tx: reply_tx };
   let request = HttpRequest { server: id, method: parts.method, url, headers: parts.headers, body, reply };
-  if events.send(Event::Http(Box::new(request))).is_err() {
+  if !events.send(request) {
     return Ok(plain(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"));
   }
   let Ok(reply) = reply_rx.await else {

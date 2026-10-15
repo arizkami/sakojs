@@ -6,9 +6,21 @@ library (no V8 compile needed).
 
 ```bash
 cargo build --release
-./target/release/sako examples/hello.js
-cargo test --release
+./target/release/sako examples/hello.js   # or a .ts file
+./target/release/sako add elysia          # npm packages
+cargo test --release --workspace
 ```
+
+The repository is a Cargo workspace. The runtime binary is the root crate,
+and its subsystems live in `crates/`:
+
+| crate | what it does |
+|---|---|
+| `sako_jslib` | The JS runtime library: `js/*.js` sources that `build.rs` turns into `bootstrap.js` |
+| `sako_http` | HTTP server (`Sako.serve`) and `fetch` client; independent of V8 |
+| `sako_typescript` | `.ts`/`.mts`/`.tsx` → JavaScript via oxc, with line maps for stack traces |
+| `sako_npm` | `sako install` / `add` / `remove`: registry resolution, global store, hard-linked `node_modules` |
+| `sako_pg` | PostgreSQL client behind `Sako.sql`: wire protocol, SCRAM/MD5/TLS, pipelining, pool |
 
 ```js
 // server.js: run with `sako server.js`
@@ -138,6 +150,41 @@ How to read this:
   thread), while Bun does socket I/O on its JS thread. Running hyper on the
   JS thread's own event loop would close most of that gap.
 
+### PostgreSQL: Sako.sql vs Bun.sql
+
+Same script under both runtimes, against a local PostgreSQL 17, with a pool
+of 10. Queries per second, higher is better. This machine is noisy, so the
+ranges are from three alternating runs.
+
+| workload | Sako.sql | Bun.sql |
+|---|--:|--:|
+| sequential `select ${i}::int4` | 40k–57k | 46k–53k |
+| 100 concurrent queries | 126k–372k | 134k–180k |
+| `select *` of 1000 rows × 4 columns | 2.7k–2.8k | 3.1k–3.7k |
+
+- **Concurrent queries:** Sako pipelines whatever has queued up on each
+  connection. Usually that's faster, but there's wide variance.
+- **Large results:** Bun is about 20% faster here. The raw Rust client does
+  4.2k queries/s on this query, so the gap is in handing results to JS, not
+  in the protocol.
+
+### Package installs: sako vs bun
+
+Same `package.json` (elysia, is-number, semver, nanoid, chalk; 21
+packages), warm global caches, median of 7 runs.
+
+| case | sako | bun |
+|---|--:|--:|
+| lockfile present, no `node_modules` | **8.2 ms** | 16.1 ms |
+| no lockfile, no `node_modules` | 17.0 ms | 16.5 ms |
+| everything installed (no-op) | **1.6 ms** | 2.0 ms |
+
+### TypeScript startup
+
+A small `.ts` program (imports, enums, generics, a JSON import) takes
+7.5 ms with a warm cache and 8.4 ms cold. Bun takes 9.3 ms for the same
+file.
+
 ### Shell: Sako.$ vs Bun.$
 
 Run `python3 bench/shell/run.py 3`. This is the best of 3 alternating runs
@@ -172,10 +219,13 @@ of `bench/shell/shell.js`, in microseconds per operation. Lower is better.
 ## Usage
 
 ```
-sako [options] <file.js> [args...]
+sako [options] <file.js|file.ts> [args...]
 sako -e <code>        evaluate code as an ES module
 sako -p <expr>        evaluate and print the result
 sako                  REPL (or run stdin when piped)
+sako install [--production]      install package.json dependencies
+sako add [-D] <pkg[@range]>...   add dependencies (devDependencies with -D)
+sako remove <pkg>...             remove dependencies
 
 --no-cache            disable the V8 code cache (or SAKO_NO_CACHE=1)
 --v8-flags=a,b        pass flags to V8 (or SAKO_V8_FLAGS="--a --b")
@@ -188,6 +238,39 @@ Entry files are always ES modules, so top-level `await` works.
 | `SAKO_HTTP_THREADS` | number of HTTP I/O threads (default: cores/4, min 1) |
 | `SAKO_CACHE_DIR` | code cache location (default `~/.cache/sako`) |
 | `SAKO_NO_CACHE=1` | disable the code cache |
+| `DATABASE_URL`, `PG*` | default connection for `Sako.sql` |
+| `SAKO_NPM_REGISTRY` | npm registry URL (default `https://registry.npmjs.org/`) |
+| `SAKO_NPM_CACHE` | package store (default `~/.cache/sako/npm`) |
+
+### TypeScript
+
+`.ts`, `.mts`, `.cts` and `.tsx` files run directly, including imports
+between them.
+
+- **Transpiling:** oxc strips the types and lowers TypeScript-only syntax
+  (`enum`, `namespace`, parameter properties). It does no type checking.
+- **Imports:** a `.js` specifier resolves to the `.ts` source, following
+  TypeScript's ESM convention.
+- **Caching:** transpiled output is cached next to the code cache.
+- **Stack traces:** `error.stack` shows TypeScript line and column numbers.
+
+### Packages
+
+`sako install` resolves `package.json` against the npm registry.
+
+- **Specs:** semver ranges, dist-tags, `npm:` aliases and `file:` links.
+- **Layout:** packages are hoisted like npm and nested only when versions
+  conflict. Optional and peer dependencies are handled, and `os`/`cpu`
+  limits are respected.
+- **Store:** tarballs are verified (sha512/sha1) and extracted once into a
+  global store, then hard-linked into `node_modules`.
+- **`.bin` links:** created for package commands.
+- **Metadata cache:** registry metadata is cached for 5 minutes and then
+  revalidated with an ETag.
+- **Lockfile:** `sako.lock` pins the tree. While `package.json`'s
+  dependencies are unchanged, installs never contact the registry.
+- **Lifecycle scripts:** scripts such as `postinstall` are not run, and the
+  installer lists the packages that have them.
 
 ## APIs
 
@@ -255,6 +338,27 @@ Entry files are always ES modules, so top-level `await` works.
     UTF-8.
   - **Exit codes:** a non-zero exit rejects with `ShellError` (`exitCode`,
     `stdout`, `stderr`).
+- **`Sako.sql` / `new Sako.SQL(url?, { max })`** is a PostgreSQL client,
+  modelled on `Bun.sql` and postgres.js:
+  - **Queries:** ``await sql`select * from users where id = ${id}` `` sends
+    `${...}` values as parameters, never spliced into the SQL. Booleans,
+    BigInts, Dates, bytes and plain objects (as `jsonb`) are sent with
+    their types.
+  - **Results:** an array of row objects with `count` and `command`;
+    `.values()` gives arrays instead. Values come back typed: numbers,
+    booleans, `Date`s, `Uint8Array`, parsed JSON and arrays. `int8` and
+    `numeric` come back as strings.
+  - **Helpers:** `sql(obj or rows)` inserts after `insert into t`, sets after
+    `update t set`, makes an `IN (…)` list from an array, and quotes a
+    string as an identifier. Queries can be nested as fragments. Also
+    `sql.unsafe(text, params?)`, `sql.json`, `sql.array`.
+  - **Transactions and lifecycle:** `sql.begin(async (tx) => …)` commits or
+    rolls back; `sql.end()` closes the pool.
+  - **Errors:** `PostgresError` carries `code`, `detail`, `constraint`, and
+    so on.
+  - **Connection:** `Sako.sql` connects using `DATABASE_URL`/`POSTGRES_URL`
+    or the `PG*` variables. TLS is used when the server offers it
+    (`sslmode=require` makes it mandatory).
 - **`Sako` file functions:** `readTextFile`, `readFile`, `writeTextFile`,
   `writeFile`, `exists`, `readDir`, `mkdir`, `remove`, `stat`. Each returns
   a promise and runs on the thread pool. Each also has a `*Sync` variant.
@@ -288,9 +392,15 @@ the process alive.
 
 ## Not implemented (yet)
 
-HTTPS and HTTP/2 serving, WebSocket, streaming bodies (`ReadableStream`),
-`Blob`, `FormData`, CommonJS `require`, `node:` built-in modules,
-TypeScript, and workers.
+- **Node compatibility:** CommonJS `require` and the `node:` built-in
+  modules. This matters now that npm packages install: many packages need
+  one or the other (for example `nanoid` imports `node:crypto`).
+- **Web and HTTP:** HTTPS and HTTP/2 serving, WebSocket, streaming bodies
+  (`ReadableStream`), `Blob` and `FormData`.
+- **Workers.**
+- **Packages:** git and tarball-URL dependencies, workspaces, and running
+  lifecycle scripts.
+- **TypeScript:** type checking (use `tsc --noEmit`).
 
 ## Tests
 
@@ -302,24 +412,32 @@ inside the test process. The serve fixture exercises `Sako.serve` against
 itself. To regenerate expectations, run
 `SAKO_UPDATE_EXPECT=1 cargo test --release`, then review the diff.
 
+Each crate has unit tests (`cargo test --release --workspace`).
+
+- **`sako_npm`:** its installer test runs against a fake registry served
+  from the test process, so it works offline.
+- **Postgres tests:** these need a server. Set
+  `SAKO_PG_TEST_URL=postgres://user:pass@host:port/db` to run
+  `crates/sako_pg/tests/live.rs` and the `postgres` fixture. Both are
+  skipped otherwise.
+
 ## Layout
 
-- `src/main.rs`: CLI, isolate setup, module loader, code cache, event loop
-  (timers, I/O completions, HTTP batches, immediates, nextTick), and error
-  reporting.
+- `src/main.rs`: CLI, isolate setup, module loader (with TypeScript), code
+  cache, event loop (timers, I/O completions, HTTP batches, immediates,
+  nextTick), and error reporting.
 - `src/ops.rs`: native functions exposed to JS (stdout, timers, encoding,
-  fs, fetch, URL, server).
+  fs, fetch, URL, server, shell, SQL).
 - `src/pool.rs`: worker thread pool, event channel, op results and their
   conversion to JS.
-- `src/shell/`: `Sako.$` parser (`parse.rs`), executor with expansion,
-  pipes and processes (`exec.rs`), and in-process commands
-  (`builtins.rs`).
-- `src/http.rs`: `Sako.serve` I/O threads (Tokio + hyper, `SO_REUSEPORT`)
-  and static routes.
-- `src/bootstrap.js`: JS globals. It must stay ASCII because it is loaded
-  as an external one-byte string, and a compile-time check enforces this.
-- `bench/`: runtime benchmarks and `run.py`.
-- `bench/shell/`: `Sako.$` vs `Bun.$` benchmark and `run.py`.
-- `bench/http/`: HTTP server benchmark (Sako, Bun.serve, Elysia) and
-  `run.py`.
+- `src/shell/`: `Sako.$` parser, executor and in-process commands.
+- `crates/sako_jslib/js/`: the JS globals, as ordered fragments of one
+  function. `build.rs` concatenates them into ASCII-only `bootstrap.js`.
+- `crates/sako_http/`: `Sako.serve` I/O threads (Tokio + hyper,
+  `SO_REUSEPORT`), static routes, and the `fetch` client.
+- `crates/sako_typescript/`: oxc-based transpiler and line maps.
+- `crates/sako_npm/`: registry, resolver, store and installer.
+- `crates/sako_pg/`: PostgreSQL wire protocol, auth, types and pool.
+- `bench/`: runtime benchmarks; `bench/shell/` (vs `Bun.$`) and
+  `bench/http/` (vs Bun.serve and Elysia).
 - `tests/`: fixture-based integration tests.

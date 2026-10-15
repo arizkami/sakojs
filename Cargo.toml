@@ -3,19 +3,20 @@ name = "sako"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/*"]
+
 [dependencies]
+sako_http = { path = "crates/sako_http" }
+sako_jslib = { path = "crates/sako_jslib" }
+sako_npm = { path = "crates/sako_npm" }
+sako_pg = { path = "crates/sako_pg" }
+sako_typescript = { path = "crates/sako_typescript" }
 v8 = "152.2.0"
-ureq = "3.4.2"
 url = "2.5.8"
-tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "sync", "macros"] }
-hyper = { version = "1.12.0", features = ["server", "http1"] }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
-http-body-util = "0.1.5"
-bytes = "1.12.1"
 regex = "1.13.1"
 libc = "0.2"
 mimalloc = { version = "0.1.52", default-features = false }
-socket2 = { version = "0.6.5", features = ["all"] }
 
 [profile.release]
 opt-level = 3

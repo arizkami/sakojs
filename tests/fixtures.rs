@@ -24,7 +24,11 @@ fn tmp_dir(name: &str) -> PathBuf {
 
 fn run_fixture(name: &str, expect_code: i32, expect_stderr: &str) {
   let dir = fixtures_dir();
-  let script = dir.join(format!("{name}.js"));
+  let script = ["js", "ts"]
+    .iter()
+    .map(|ext| dir.join(format!("{name}.{ext}")))
+    .find(|p| p.exists())
+    .unwrap_or_else(|| panic!("no fixture {name}.js or {name}.ts"));
   let expected_path = dir.join(format!("{name}.out"));
   let tmp = tmp_dir(name);
   let cache = tmp.join("cache");
@@ -81,6 +85,7 @@ fixtures! {
   fetch => (0, ""),
   serve => (0, ""),
   shell => (0, ""),
+  typescript => (0, ""),
   throw => (1, "error: Uncaught Error: boom\n    at inner ("),
   reject => (1, "error: Uncaught TypeError: unhandled"),
   tla => (13, "Top-level await promise never resolved"),
@@ -88,6 +93,17 @@ fixtures! {
   exit => (7, ""),
   exitcode => (3, ""),
   timer_throw => (1, "error: Uncaught RangeError: from timer"),
+}
+
+/// Needs a PostgreSQL server: set SAKO_PG_TEST_URL (for example
+/// postgres://user:pass@127.0.0.1:5432/postgres). Skipped otherwise.
+#[test]
+fn postgres() {
+  if std::env::var_os("SAKO_PG_TEST_URL").is_none() {
+    eprintln!("SAKO_PG_TEST_URL not set; skipping");
+    return;
+  }
+  run_fixture("postgres", 0, "");
 }
 
 #[test]

@@ -1,0 +1,27 @@
+{
+  n: 42,
+  s: "it's",
+  b: true,
+  f: 3.5,
+  big: '9007199254740993',
+  j: { a: [ 1, 2 ] },
+  bin: Uint8Array(2) [ 104, 105 ],
+  ts: 2020-01-02T03:04:05.000Z,
+  arr: [ 1, null, 3 ],
+  nothing: null
+}
+true true 2020-01-02T03:04:05.000Z
+[ { id: 1, name: 'ada' }, { id: 2, name: 'alan' } ] 2 INSERT
+updated 1 UPDATE
+[ { name: 'ada', age: 37 }, { name: 'alan', age: 41 } ]
+[ [ 'ada', 37 ], [ 'alan', 41 ] ]
+[ { name: 'alan' } ]
+1
+{ b: 2 }
+{ sum: 5 }
+true PostgresError 23505 people_name_key Key (name)=(ada) already exists.
+42601 syntax error at or near "selec" 1
+committed 3 3
+rolled back: abort! 0
+200 concurrent: true
+after end: ERR_POSTGRES_CONNECTION_CLOSED

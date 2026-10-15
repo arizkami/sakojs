@@ -1,0 +1,8 @@
+[package]
+name = "sako_jslib"
+version = "0.1.0"
+edition = "2024"
+description = "Sako's JavaScript runtime library: js/*.js built into bootstrap.js"
+build = "build.rs"
+
+[dependencies]

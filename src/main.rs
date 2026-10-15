@@ -10,7 +10,6 @@
 //! - The event loop is a binary heap of timers driven from Rust; callbacks
 //!   live on the JS side so there are no per-timer `Global` handles.
 
-mod http;
 mod ops;
 mod pool;
 mod shell;
@@ -29,9 +28,9 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const BOOTSTRAP: &str = include_str!("bootstrap.js");
-// Loaded as an external one-byte (Latin-1) string, so it must stay ASCII.
-const _: () = assert!(BOOTSTRAP.is_ascii(), "bootstrap.js must be ASCII; use \\u escapes");
+// JS runtime library, generated from crates/sako_jslib/js/*.js. It is loaded
+// as an external one-byte (Latin-1) string; sako_jslib guarantees ASCII.
+use sako_jslib::BOOTSTRAP;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const OUT_BUF_LIMIT: usize = 64 * 1024;
 
@@ -65,12 +64,19 @@ pub struct State {
   pub shell_scripts: Vec<shell::Parsed>,
   /// Cached process working directory (reset by `process.chdir`).
   pub cwd_cache: Option<PathBuf>,
-  pub servers: HashMap<u32, http::ServerHandle>,
-  http_pending: HashMap<u32, http::ReplyTo>,
+  /// Source maps of loaded TypeScript modules, for stack traces.
+  pub ts_maps: HashMap<PathBuf, sako_typescript::LineMap>,
+  /// `Sako.sql` connection pools and open transactions, by id.
+  pub pg_pools: HashMap<u32, std::sync::Arc<ops::PgPool>>,
+  pub pg_tx: HashMap<u32, std::sync::Arc<std::sync::Mutex<sako_pg::Pooled>>>,
+  pub pg_next: u32,
+  pub servers: HashMap<u32, sako_http::ServerHandle>,
+  http_pending: HashMap<u32, sako_http::ReplyTo>,
   /// Replies produced during this turn, delivered together by `flush_http`.
-  http_replies: Vec<(http::ReplyTo, http::HttpReply)>,
+  http_replies: Vec<(sako_http::ReplyTo, sako_http::HttpReply)>,
   http_next_id: u32,
   pub http_dispatch: Option<v8::Global<v8::Function>>,
+  pub enable_ts_stacks: Option<v8::Global<v8::Function>>,
 }
 
 pub type StateRc = Rc<RefCell<State>>;
@@ -109,11 +115,16 @@ impl State {
       pool: pool::Pool::new(),
       shell_scripts: Vec::new(),
       cwd_cache: None,
+      ts_maps: HashMap::new(),
+      pg_pools: HashMap::new(),
+      pg_tx: HashMap::new(),
+      pg_next: 0,
       servers: HashMap::new(),
       http_pending: HashMap::new(),
       http_replies: Vec::new(),
       http_next_id: 0,
       http_dispatch: None,
+      enable_ts_stacks: None,
     }
   }
 
@@ -145,10 +156,13 @@ fn usage() -> ! {
     "sako {VERSION} - a fast JavaScript runtime (V8 {})
 
 Usage:
-  sako [options] <file.js> [args...]
+  sako [options] <file.js|file.ts> [args...]
   sako -e <code>           evaluate code as an ES module
   sako -p <expr>           evaluate expression and print the result
   sako                     start a REPL (or run stdin when piped)
+  sako install [--production]      install package.json dependencies
+  sako add [-D] <pkg[@range]>...   add dependencies (devDependencies with -D)
+  sako remove <pkg>...             remove dependencies
 
 Options:
   --no-cache               disable the on-disk V8 code cache
@@ -210,6 +224,57 @@ fn parse_args() -> Options {
   opts
 }
 
+/// `sako install` / `add` / `remove`.
+fn package_command(cmd: &str, args: &[String]) -> i32 {
+  let start = Instant::now();
+  let dir = std::env::current_dir().unwrap_or_default();
+  let production = args.iter().any(|a| a == "--production" || a == "-p");
+  let dev = args.iter().any(|a| a == "-D" || a == "--dev" || a == "--save-dev");
+  let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
+  let opts = sako_npm::Options { dir, production };
+  println!("sako {cmd} v{VERSION}");
+  let result = match cmd {
+    "add" if names.is_empty() => Err("usage: sako add [-D] <package[@range]>...".to_string()),
+    "remove" | "rm" if names.is_empty() => Err("usage: sako remove <package>...".to_string()),
+    "add" => sako_npm::add(&opts, &names, dev),
+    "remove" | "rm" => sako_npm::remove(&opts, &names),
+    _ => sako_npm::install(&opts),
+  };
+  match result {
+    Ok(s) => {
+      for w in &s.warnings {
+        eprintln!("warn: {w}");
+      }
+      if s.up_to_date {
+        println!("\nChecked {} packages: node_modules is up to date [{:.0}ms]", s.packages, start.elapsed().as_secs_f64() * 1000.0);
+        return 0;
+      }
+      println!();
+      for p in &s.top_level {
+        println!("+ {p}");
+      }
+      let source = if s.from_lockfile { ", from sako.lock" } else { "" };
+      println!(
+        "\n{} packages installed ({} downloaded{source}) [{:.0}ms]",
+        s.packages,
+        s.downloaded,
+        start.elapsed().as_secs_f64() * 1000.0
+      );
+      if !s.scripts_skipped.is_empty() {
+        println!(
+          "note: install scripts were not run for: {}",
+          s.scripts_skipped.join(", ")
+        );
+      }
+      0
+    }
+    Err(e) => {
+      eprintln!("error: {e}");
+      1
+    }
+  }
+}
+
 fn fatal(msg: &str) -> ! {
   eprintln!("error: {msg}");
   std::process::exit(1)
@@ -231,6 +296,13 @@ fn cache_dir(no_cache: bool) -> Option<PathBuf> {
 }
 
 fn main() {
+  // Package manager subcommands don't need V8.
+  let args: Vec<String> = std::env::args().skip(1).collect();
+  if let Some(cmd) = args.first().map(String::as_str)
+    && matches!(cmd, "install" | "i" | "add" | "remove" | "rm")
+  {
+    std::process::exit(package_command(cmd, &args[1..]));
+  }
   let opts = parse_args();
 
   let mut flags = String::from("--harmony-import-attributes ");
@@ -579,7 +651,7 @@ fn handle_events(scope: &mut v8::PinScope, events: Vec<pool::Event>, main: Optio
 
 /// Hands a batch of requests to JS in one call. The batch is a flat array of
 /// [serverId, requestId, method, url, [k, v, ...], body | null] records.
-fn dispatch_http(scope: &mut v8::PinScope, batch: Vec<Box<http::HttpRequest>>) -> Option<i32> {
+fn dispatch_http(scope: &mut v8::PinScope, batch: Vec<Box<sako_http::HttpRequest>>) -> Option<i32> {
   let st = state(scope);
   let dispatch = st.borrow().http_dispatch.clone()?;
   let mut items: Vec<v8::Local<v8::Value>> = Vec::with_capacity(batch.len() * 6);
@@ -620,7 +692,7 @@ fn dispatch_http(scope: &mut v8::PinScope, batch: Vec<Box<http::HttpRequest>>) -
 }
 
 /// Queues a response for a request handed out by `dispatch_http`.
-pub fn http_respond(scope: &v8::PinScope, id: u32, reply: http::HttpReply) -> bool {
+pub fn http_respond(scope: &v8::PinScope, id: u32, reply: sako_http::HttpReply) -> bool {
   let st = state(scope);
   let mut s = st.borrow_mut();
   match s.http_pending.remove(&id) {
@@ -721,16 +793,20 @@ pub fn report_exception(tc: &mut v8::PinnedRef<v8::TryCatch<v8::HandleScope>>) {
     };
     print_error(tc, exception);
     // Syntax errors have no useful stack; show where the parser failed.
-    if is_syntax && let Some(message) = message {
+    // Only for parser errors that point into a script (a SyntaxError we
+    // threw ourselves, e.g. from the TypeScript compiler, has no location).
+    if is_syntax
+      && let Some(message) = message
+      && let Some(line) = message.get_line_number(tc).filter(|&l| l > 0)
+      && let Some(src) = message.get_source_line(tc).map(|s| s.to_rust_string_lossy(tc))
+    {
       let file = message
         .get_script_resource_name(tc)
         .map(|n| n.to_rust_string_lossy(tc))
         .unwrap_or_default();
-      let line = message.get_line_number(tc).unwrap_or(0);
-      let col = message.get_start_column() + 1;
-      let src = message.get_source_line(tc).map(|s| s.to_rust_string_lossy(tc)).unwrap_or_default();
-      let caret = " ".repeat(message.get_start_column());
-      eprintln!("    at {file}:{line}:{col}\n\n  {src}\n  {caret}^");
+      let start = message.get_start_column().min(src.len());
+      let caret = " ".repeat(start);
+      eprintln!("    at {file}:{line}:{}\n\n  {src}\n  {caret}^", start + 1);
     }
   }
 }
@@ -802,8 +878,25 @@ fn try_file(p: &Path) -> Option<PathBuf> {
   if p.is_file() {
     return Some(p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
   }
+  // TypeScript ESM imports name the output file ("./x.js") while the source
+  // is "./x.ts".
+  if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+    let ts_ext = match ext {
+      "js" => &["ts", "tsx"][..],
+      "mjs" => &["mts"][..],
+      "cjs" => &["cts"][..],
+      "jsx" => &["tsx"][..],
+      _ => &[][..],
+    };
+    for e in ts_ext {
+      let c = p.with_extension(e);
+      if c.is_file() {
+        return Some(c.canonicalize().unwrap_or(c));
+      }
+    }
+  }
   let s = p.as_os_str();
-  for ext in [".js", ".mjs", ".json"] {
+  for ext in [".js", ".mjs", ".json", ".ts", ".mts", ".tsx"] {
     let mut c = s.to_owned();
     c.push(ext);
     let c = PathBuf::from(c);
@@ -812,7 +905,7 @@ fn try_file(p: &Path) -> Option<PathBuf> {
     }
   }
   if p.is_dir() {
-    for idx in ["index.js", "index.mjs"] {
+    for idx in ["index.js", "index.mjs", "index.ts", "index.tsx"] {
       let c = p.join(idx);
       if c.is_file() {
         return Some(c.canonicalize().unwrap_or(c));
@@ -1024,7 +1117,94 @@ fn load_module<'s>(scope: &mut v8::PinScope<'s, '_>, path: &Path) -> Option<v8::
   } else {
     src
   };
+  let src = if sako_typescript::is_typescript(path) {
+    let cache_dir = st.borrow().cache_dir.clone();
+    match transpile_cached(cache_dir.as_deref(), path, &src) {
+      Ok((js, map)) => {
+        let first = st.borrow().ts_maps.is_empty();
+        st.borrow_mut().ts_maps.insert(path.to_path_buf(), map);
+        if first {
+          enable_ts_stacks(scope);
+        }
+        js
+      }
+      Err(msg) => {
+        let m = v8::String::new(scope, &format!("{}\n{msg}", path.display())).unwrap();
+        let e = v8::Exception::syntax_error(scope, m);
+        scope.throw_exception(e);
+        return None;
+      }
+    }
+  } else {
+    src
+  };
   compile_module(scope, path, src, true)
+}
+
+/// Installs `Error.prepareStackTrace` so `error.stack` reports TypeScript
+/// positions (once, when the first TypeScript module loads).
+fn enable_ts_stacks(scope: &mut v8::PinScope) {
+  let Some(hook) = state(scope).borrow().enable_ts_stacks.clone() else { return };
+  let f = v8::Local::new(scope, hook);
+  let undefined = v8::undefined(scope).into();
+  let _ = f.call(scope, undefined, &[]);
+}
+
+/// Bumped when TypeScript output changes, to invalidate cached transpiles.
+const TS_CACHE_VERSION: u32 = 1;
+
+/// Transpiles TypeScript, reusing the on-disk result when the source and
+/// path are unchanged.
+fn transpile_cached(
+  cache_dir: Option<&Path>,
+  path: &Path,
+  src: &str,
+) -> Result<(String, sako_typescript::LineMap), String> {
+  let key = cache_dir.map(|d| {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    TS_CACHE_VERSION.hash(&mut h);
+    path.hash(&mut h);
+    src.hash(&mut h);
+    d.join(format!("ts-{:016x}", h.finish()))
+  });
+  if let Some(key) = &key
+    && let (Ok(js), Ok(map)) = (std::fs::read_to_string(key.with_extension("js")), std::fs::read(key.with_extension("map")))
+    && let Some(map) = sako_typescript::LineMap::from_bytes(&map)
+  {
+    return Ok((js, map));
+  }
+  let out = sako_typescript::transpile(src, path)?;
+  if let Some(key) = key {
+    if let Some(dir) = key.parent() {
+      let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = |ext: &str| key.with_extension(format!("{ext}.tmp{}", std::process::id()));
+    if std::fs::write(tmp("map"), out.line_map.to_bytes()).is_ok() {
+      let _ = std::fs::rename(tmp("map"), key.with_extension("map"));
+    }
+    if std::fs::write(tmp("js"), &out.code).is_ok() {
+      let _ = std::fs::rename(tmp("js"), key.with_extension("js"));
+    }
+  }
+  Ok((out.code, out.line_map))
+}
+
+/// Rewrites `file.ts:line:col` positions in a stack trace from generated
+/// JavaScript back to the TypeScript source.
+pub fn map_stack(st: &State, stack: &str) -> String {
+  use std::sync::OnceLock;
+  static RE: OnceLock<regex::Regex> = OnceLock::new();
+  let re = RE.get_or_init(|| regex::Regex::new(r"([^\s(]+\.(?:ts|tsx|mts|cts)):(\d+):(\d+)").unwrap());
+  re.replace_all(stack, |c: &regex::Captures| {
+    let file = &c[1];
+    let line: u32 = c[2].parse().unwrap_or(0);
+    let col: u32 = c[3].parse().unwrap_or(0);
+    match st.ts_maps.get(Path::new(file)).and_then(|m| m.lookup(line.saturating_sub(1), col.saturating_sub(1))) {
+      Some((l, c)) => format!("{file}:{}:{}", l + 1, c + 1),
+      None => c[0].to_string(),
+    }
+  })
+  .into_owned()
 }
 
 fn module_path(scope: &v8::PinScope, module: v8::Local<v8::Module>) -> Option<PathBuf> {
